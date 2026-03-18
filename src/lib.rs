@@ -47,9 +47,10 @@ impl io::Write for CapturingWriter {
 pub struct EbbTerminal {
     terminal: Terminal,
     output: Arc<Mutex<Vec<u8>>>,
-    #[allow(dead_code)]
     alerts: Arc<Mutex<AlertQueue>>,
     freed: bool,
+    /// Number of scrollback lines already committed to the Emacs buffer.
+    last_scrollback_count: usize,
 }
 
 impl emacs::Transfer for EbbTerminal {
@@ -91,6 +92,7 @@ impl EbbTerminal {
             output,
             alerts,
             freed: false,
+            last_scrollback_count: 0,
         }
     }
 
@@ -346,12 +348,59 @@ fn send_paste(term: &mut EbbTerminal, text: String) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Render the terminal screen into the current Emacs buffer with faces.
-/// Erases the buffer, inserts styled text, positions cursor.
+/// The buffer layout is:
+///   [scrollback lines]  -- permanent, above display region
+///   [display region]    -- rows x cols, updated each frame
+/// New scrollback lines are inserted above the display region.
+/// The display region is erased and rewritten each frame.
 /// Must be called within inhibit-read-only / inhibit-modification-hooks.
 #[defun]
 fn render<'a>(env: &'a Env, term_val: Value<'a>) -> Result<()> {
-    let term = term_val.into_ref::<EbbTerminal>()?;
-    render::render_to_buffer(env, &term)
+    let mut term = term_val.into_ref_mut::<EbbTerminal>()?;
+    render::render_to_buffer(env, &mut term)
+}
+
+// ---------------------------------------------------------------------------
+// Defuns: Alert queries
+// ---------------------------------------------------------------------------
+
+/// Check for and return a pending title change, or nil.
+/// Calling this clears the pending title.
+#[defun]
+fn poll_title(term: &EbbTerminal) -> Result<Option<String>> {
+    if term.freed {
+        return Ok(None);
+    }
+    let mut q = term.alerts.lock().unwrap();
+    Ok(q.title.take())
+}
+
+/// Check for and return a pending CWD change, or nil.
+/// Calling this clears the pending CWD flag.
+#[defun]
+fn poll_cwd(term: &EbbTerminal) -> Result<Option<String>> {
+    if term.freed {
+        return Ok(None);
+    }
+    let mut q = term.alerts.lock().unwrap();
+    if q.cwd_changed {
+        q.cwd_changed = false;
+        Ok(term.terminal.get_current_dir().map(|u| u.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Check for and clear the bell flag.
+#[defun]
+fn poll_bell(term: &EbbTerminal) -> Result<bool> {
+    if term.freed {
+        return Ok(false);
+    }
+    let mut q = term.alerts.lock().unwrap();
+    let bell = q.bell;
+    q.bell = false;
+    Ok(bell)
 }
 
 // ---------------------------------------------------------------------------

@@ -8,11 +8,19 @@ use crate::EbbTerminal;
 
 /// Render the terminal screen into the current Emacs buffer.
 ///
-/// Erases the buffer, inserts styled text with face properties for each row,
-/// then positions the cursor. Returns nil.
+/// Buffer layout:
+///   [scrollback lines with faces] ← permanent, above display region
+///   [display line 0]              ← start of display region
+///   [display line 1]
+///   ...
+///   [display line rows-1]         ← end of display region
 ///
-/// Must be called from Elisp within inhibit-read-only / inhibit-modification-hooks.
-pub fn render_to_buffer(env: &Env, term: &EbbTerminal) -> Result<()> {
+/// On each call:
+/// 1. Insert any new scrollback lines above the display region
+/// 2. Erase the display region
+/// 3. Re-render visible rows with faces
+/// 4. Position cursor
+pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     if term.freed {
         return Ok(());
     }
@@ -21,11 +29,49 @@ pub fn render_to_buffer(env: &Env, term: &EbbTerminal) -> Result<()> {
     let rows = screen.physical_rows;
     let cols = screen.physical_cols;
     let palette = term.terminal.palette();
+    let current_scrollback = screen.scrollback_rows();
 
-    // Erase buffer
-    env.call("erase-buffer", [])?;
+    // --- Step 1: Insert new scrollback lines ---
+    let new_scrollback = current_scrollback.saturating_sub(term.last_scrollback_count);
+    if new_scrollback > 0 {
+        // New scrollback lines are the lines just above the visible area.
+        // They are at physical indices: (total - rows - new_scrollback) .. (total - rows)
+        // But using scrollback_rows count: phys index
+        //   old_scrollback_count .. current_scrollback
+        let scroll_start = term.last_scrollback_count;
+        let scroll_end = current_scrollback;
 
-    // Render each visible row
+        // Go to the start of the display region (beginning of buffer for now,
+        // or after existing scrollback)
+        env.call("goto-char", (env.call("point-min", [])?,))?;
+        // Skip past existing scrollback lines
+        if term.last_scrollback_count > 0 {
+            env.call("forward-line", (term.last_scrollback_count as i64,))?;
+        }
+
+        // Insert new scrollback lines at this position
+        for sb_idx in scroll_start..scroll_end {
+            let lines = screen.lines_in_phys_range(sb_idx..sb_idx + 1);
+            if let Some(line) = lines.first() {
+                render_line(env, line, cols, &palette)?;
+                env.call("insert", ("\n",))?;
+            }
+        }
+
+        term.last_scrollback_count = current_scrollback;
+    }
+
+    // --- Step 2: Erase display region ---
+    // The display region starts after scrollback lines.
+    env.call("goto-char", (env.call("point-min", [])?,))?;
+    if term.last_scrollback_count > 0 {
+        env.call("forward-line", (term.last_scrollback_count as i64,))?;
+    }
+    let display_start = env.call("point", [])?;
+    let point_max = env.call("point-max", [])?;
+    env.call("delete-region", (display_start, point_max))?;
+
+    // --- Step 3: Render visible rows ---
     for vis_row in 0..rows {
         let stable = screen.visible_row_to_stable_row(vis_row as i64);
         if let Some(phys) = screen.stable_row_to_phys(stable) {
@@ -39,9 +85,10 @@ pub fn render_to_buffer(env: &Env, term: &EbbTerminal) -> Result<()> {
         }
     }
 
-    // Position cursor
+    // --- Step 4: Position cursor ---
     let cursor = term.terminal.cursor_pos();
-    env.call("goto-char", (env.call("point-min", [])?,))?;
+    // Cursor is relative to the display region
+    env.call("goto-char", (display_start,))?;
     if cursor.y > 0 {
         env.call("forward-line", (cursor.y as i64,))?;
     }
@@ -126,7 +173,7 @@ fn render_line(
             env.call("insert", (text.as_str(),))?;
         } else {
             // Build face plist
-            let face_str = build_face_string(&attrs, palette);
+            let face_str = build_face_string(attrs, palette);
             let start = env.call("point", [])?;
             env.call("insert", (text.as_str(),))?;
             let end = env.call("point", [])?;
@@ -144,39 +191,32 @@ fn render_line(
 fn build_face_string(attrs: &CellAttributes, palette: &ColorPalette) -> String {
     let mut parts = Vec::new();
 
-    // Foreground
     if let Some(hex) = resolve_color(attrs.foreground(), palette) {
         parts.push(format!(":foreground \"{}\"", hex));
     }
 
-    // Background
     if let Some(hex) = resolve_color(attrs.background(), palette) {
         parts.push(format!(":background \"{}\"", hex));
     }
 
-    // Bold / half-bright
     match attrs.intensity() {
         Intensity::Bold => parts.push(":weight bold".to_string()),
         Intensity::Half => parts.push(":weight light".to_string()),
         Intensity::Normal => {}
     }
 
-    // Italic
     if attrs.italic() {
         parts.push(":slant italic".to_string());
     }
 
-    // Underline
     if attrs.underline() != wezterm_escape_parser::csi::Underline::None {
         parts.push(":underline t".to_string());
     }
 
-    // Strikethrough
     if attrs.strikethrough() {
         parts.push(":strike-through t".to_string());
     }
 
-    // Reverse video
     if attrs.reverse() {
         parts.push(":inverse-video t".to_string());
     }

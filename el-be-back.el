@@ -188,7 +188,9 @@
             (buffer-undo-list t))
         (ebb--render-screen))
       ;; Drain terminal responses and send to PTY
-      (ebb--drain-and-send))))
+      (ebb--drain-and-send)
+      ;; Process title/CWD/bell alerts
+      (ebb--process-alerts))))
 
 (defun ebb--render-screen ()
   "Render the terminal screen into the current buffer.
@@ -204,6 +206,27 @@ and positions the cursor."
     (let ((response (ebb--drain-output ebb--terminal)))
       (when response
         (process-send-string ebb--process response)))))
+
+(defun ebb--process-alerts ()
+  "Process pending alerts (title, CWD, bell) from the terminal."
+  (when ebb--terminal
+    ;; Title change
+    (let ((title (ebb--poll-title ebb--terminal)))
+      (when title
+        (rename-buffer (format "*ebb: %s*" title) t)))
+    ;; CWD change
+    (let ((cwd (ebb--poll-cwd ebb--terminal)))
+      (when cwd
+        ;; Strip file:// prefix and hostname if present
+        (let ((dir (if (string-prefix-p "file://" cwd)
+                       (replace-regexp-in-string "^file://[^/]*" "" cwd)
+                     cwd)))
+          (when (file-directory-p dir)
+            (setq-local default-directory
+                        (file-name-as-directory dir))))))
+    ;; Bell
+    (when (ebb--poll-bell ebb--terminal)
+      (ding t))))
 
 (defun ebb--process-sentinel (process event)
   "Handle PROCESS state change EVENT."
