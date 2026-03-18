@@ -117,6 +117,71 @@
 (defvar-local ebb--first-chunk-time nil
   "Timestamp of the first pending output chunk.")
 
+(defvar-local ebb--copy-mode nil
+  "Non-nil when copy mode is active (terminal output paused).")
+
+;;; --- Hyperlink support ---
+
+(defvar ebb-hyperlink-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'ebb-follow-link-at-mouse)
+    (define-key map [mouse-2] #'ebb-follow-link-at-mouse)
+    (define-key map (kbd "RET") #'ebb-follow-link-at-point)
+    map)
+  "Keymap active on OSC 8 hyperlinks in the terminal buffer.")
+
+(defun ebb-follow-link-at-point ()
+  "Follow the hyperlink at point."
+  (interactive)
+  (let ((url (get-text-property (point) 'ebb-url)))
+    (if url
+        (browse-url url)
+      (message "No link at point"))))
+
+(defun ebb-follow-link-at-mouse (event)
+  "Follow the hyperlink at the mouse click EVENT."
+  (interactive "e")
+  (let* ((pos (posn-point (event-start event)))
+         (url (and pos (get-text-property pos 'ebb-url))))
+    (if url
+        (browse-url url)
+      (message "No link at click position"))))
+
+;;; --- Copy mode ---
+
+(defvar ebb-copy-mode-map
+  (let ((map (make-sparse-keymap)))
+    ;; In copy mode, standard Emacs navigation works.
+    ;; Only bind the exit key.
+    (define-key map (kbd "C-c C-c") #'ebb-copy-mode-exit)
+    (define-key map (kbd "q") #'ebb-copy-mode-exit)
+    map)
+  "Keymap for copy mode (terminal paused, Emacs navigation).")
+
+(define-minor-mode ebb-copy-mode
+  "Minor mode for navigating terminal output.
+Terminal output is paused; standard Emacs keys work for navigation,
+search, and copying."
+  :lighter " Copy"
+  :keymap ebb-copy-mode-map
+  (if ebb-copy-mode
+      (progn
+        (setq ebb--copy-mode t)
+        ;; Disable semi-char mode while in copy mode
+        (when (bound-and-true-p ebb-semi-char-mode)
+          (ebb-semi-char-mode -1))
+        (message "Copy mode: navigate with Emacs keys, q or C-c C-c to exit"))
+    (setq ebb--copy-mode nil)
+    ;; Re-enable semi-char mode
+    (ebb-semi-char-mode 1)
+    ;; Flush any output that arrived while paused
+    (ebb--flush-output)))
+
+(defun ebb-copy-mode-exit ()
+  "Exit copy mode and resume terminal."
+  (interactive)
+  (ebb-copy-mode -1))
+
 ;;; --- Major mode ---
 
 (define-derived-mode ebb-mode fundamental-mode "EBB"
@@ -141,6 +206,7 @@
   (when (buffer-live-p (process-buffer process))
     (with-current-buffer (process-buffer process)
       (when (and ebb--terminal (not (string-empty-p output)))
+        ;; Always queue the output (even in copy mode, so we don't lose data)
         (push output ebb--pending-chunks)
         (unless ebb--first-chunk-time
           (setq ebb--first-chunk-time (current-time)))
@@ -149,18 +215,20 @@
           (cancel-timer ebb--render-timer)
           (setq ebb--render-timer nil))
         ;; Schedule render
-        (let ((elapsed (float-time
-                        (time-subtract nil ebb--first-chunk-time))))
-          (if (>= elapsed ebb-maximum-latency)
-              ;; Past max latency -- render immediately
-              (ebb--flush-output)
-            ;; Schedule within bounds
-            (setq ebb--render-timer
-                  (run-with-timer
-                   (min (- ebb-maximum-latency elapsed)
-                        ebb-minimum-latency)
-                   nil #'ebb--flush-output-in-buffer
-                   (current-buffer)))))))))
+        ;; Don't schedule render in copy mode -- just queue
+        (unless ebb--copy-mode
+          (let ((elapsed (float-time
+                          (time-subtract nil ebb--first-chunk-time))))
+            (if (>= elapsed ebb-maximum-latency)
+                ;; Past max latency -- render immediately
+                (ebb--flush-output)
+              ;; Schedule within bounds
+              (setq ebb--render-timer
+                    (run-with-timer
+                     (min (- ebb-maximum-latency elapsed)
+                          ebb-minimum-latency)
+                     nil #'ebb--flush-output-in-buffer
+                     (current-buffer))))))))))
 
 (defun ebb--flush-output-in-buffer (buffer)
   "Flush output in BUFFER if it is still alive."
@@ -370,6 +438,8 @@ Falls back to raw send for unrecognized keys."
     (define-key map (kbd "C-_") (lambda () (interactive) (ebb--send-key "_" nil t nil)))
     ;; C-c C-c sends interrupt
     (define-key map (kbd "C-c C-c") (lambda () (interactive) (ebb--send-key "c" nil t nil)))
+    ;; C-c C-k enters copy mode
+    (define-key map (kbd "C-c C-k") #'ebb-copy-mode)
     ;; Preserved Emacs keys (NOT forwarded):
     ;; C-c (prefix), C-x (prefix), C-g, C-h, M-x, C-u are inherited from ebb-mode-map
     map)
@@ -383,6 +453,7 @@ Falls back to raw send for unrecognized keys."
 ;; --- ebb-mode-map: base keymap (emacs mode) ---
 ;; Standard Emacs keys work. Only special ebb commands are bound.
 (define-key ebb-mode-map (kbd "C-c C-j") #'ebb-semi-char-mode)
+(define-key ebb-mode-map (kbd "C-c C-k") #'ebb-copy-mode)
 
 ;;; --- Entry point ---
 

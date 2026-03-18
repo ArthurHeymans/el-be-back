@@ -99,6 +99,13 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     Ok(())
 }
 
+/// A styled run of text: text content, cell attributes, and optional hyperlink URI.
+struct StyledRun {
+    text: String,
+    attrs: CellAttributes,
+    hyperlink_uri: Option<String>,
+}
+
 /// Render a single line by accumulating style runs and inserting with faces.
 fn render_line(
     env: &Env,
@@ -106,22 +113,25 @@ fn render_line(
     cols: usize,
     palette: &ColorPalette,
 ) -> Result<()> {
-    // Collect runs: sequences of cells with identical attributes
-    let mut runs: Vec<(String, CellAttributes)> = Vec::new();
+    // Collect runs: sequences of cells with identical attributes + hyperlink
+    let mut runs: Vec<StyledRun> = Vec::new();
     let mut current_text = String::new();
     let mut current_attrs: Option<CellAttributes> = None;
+    let mut current_link: Option<String> = None;
 
     for col in 0..cols {
         if let Some(cell) = line.get_cell(col) {
             let attrs = cell.attrs().clone();
+            let link_uri = attrs.hyperlink().map(|h| h.uri().to_string());
 
-            let same = current_attrs.as_ref().map_or(false, |ca| {
+            let same_style = current_attrs.as_ref().map_or(false, |ca| {
                 ca.attribute_bits_equal(&attrs)
                     && ca.foreground() == attrs.foreground()
                     && ca.background() == attrs.background()
             });
+            let same_link = current_link == link_uri;
 
-            if same {
+            if same_style && same_link {
                 let s = cell.str();
                 if s.is_empty() {
                     current_text.push(' ');
@@ -132,10 +142,15 @@ fn render_line(
                 // Flush previous run
                 if !current_text.is_empty() {
                     if let Some(a) = current_attrs.take() {
-                        runs.push((std::mem::take(&mut current_text), a));
+                        runs.push(StyledRun {
+                            text: std::mem::take(&mut current_text),
+                            attrs: a,
+                            hyperlink_uri: current_link.take(),
+                        });
                     }
                 }
                 current_attrs = Some(attrs);
+                current_link = link_uri;
                 let s = cell.str();
                 if s.is_empty() {
                     current_text.push(' ');
@@ -144,43 +159,64 @@ fn render_line(
                 }
             }
         } else {
-            // Past end of line data -- space with current attrs
             current_text.push(' ');
         }
     }
 
     // Flush final run
     if !current_text.is_empty() {
-        if let Some(a) = current_attrs.take() {
-            runs.push((current_text, a));
-        } else {
-            runs.push((current_text, CellAttributes::default()));
-        }
+        runs.push(StyledRun {
+            text: current_text,
+            attrs: current_attrs.unwrap_or_default(),
+            hyperlink_uri: current_link,
+        });
     }
 
-    // Insert each run with face properties
-    for (text, attrs) in &runs {
-        let has_style = attrs.foreground() != ColorAttribute::Default
-            || attrs.background() != ColorAttribute::Default
-            || attrs.intensity() != Intensity::Normal
-            || attrs.italic()
-            || attrs.underline() != wezterm_escape_parser::csi::Underline::None
-            || attrs.strikethrough()
-            || attrs.reverse();
+    // Insert each run with face properties and hyperlink buttons
+    let face_sym = env.intern("face")?;
+    let help_echo_sym = env.intern("help-echo")?;
+    let mouse_face_sym = env.intern("mouse-face")?;
+    let highlight_sym = env.intern("highlight")?;
+    let ebb_url_sym = env.intern("ebb-url")?;
+    let keymap_sym = env.intern("keymap")?;
 
-        if !has_style {
-            // Default style - just insert
-            env.call("insert", (text.as_str(),))?;
-        } else {
-            // Build face plist
-            let face_str = build_face_string(attrs, palette);
-            let start = env.call("point", [])?;
-            env.call("insert", (text.as_str(),))?;
-            let end = env.call("point", [])?;
-            // Apply face via (put-text-property START END 'face FACE)
+    for run in &runs {
+        let has_style = run.attrs.foreground() != ColorAttribute::Default
+            || run.attrs.background() != ColorAttribute::Default
+            || run.attrs.intensity() != Intensity::Normal
+            || run.attrs.italic()
+            || run.attrs.underline() != wezterm_escape_parser::csi::Underline::None
+            || run.attrs.strikethrough()
+            || run.attrs.reverse();
+
+        let start = env.call("point", [])?;
+        env.call("insert", (run.text.as_str(),))?;
+        let end = env.call("point", [])?;
+
+        // Apply face
+        if has_style {
+            let face_str = build_face_string(&run.attrs, palette);
             let face_val = env.call("read", (face_str.as_str(),))?;
-            let face_sym = env.intern("face")?;
             env.call("put-text-property", (start, end, face_sym, face_val))?;
+        }
+
+        // Apply hyperlink properties
+        if let Some(uri) = &run.hyperlink_uri {
+            // Store the URL as a text property
+            env.call("put-text-property", (start, end, ebb_url_sym, uri.as_str()))?;
+            // Add help-echo (tooltip on hover)
+            env.call(
+                "put-text-property",
+                (start, end, help_echo_sym, uri.as_str()),
+            )?;
+            // Add mouse-face for hover highlight
+            env.call(
+                "put-text-property",
+                (start, end, mouse_face_sym, highlight_sym),
+            )?;
+            // Add keymap for click action
+            let km = env.call("symbol-value", (env.intern("ebb-hyperlink-map")?,))?;
+            env.call("put-text-property", (start, end, keymap_sym, km))?;
         }
     }
 
