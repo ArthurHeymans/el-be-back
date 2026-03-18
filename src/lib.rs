@@ -114,6 +114,10 @@ impl EbbTerminal {
                 if let Some(line) = lines.first() {
                     for col in 0..cols {
                         if let Some(cell) = line.get_cell(col) {
+                            // Skip continuation cells (wide char placeholders)
+                            if cell.width() == 0 {
+                                continue;
+                            }
                             let s = cell.str();
                             if s.is_empty() {
                                 text.push(' ');

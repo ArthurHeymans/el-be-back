@@ -121,6 +121,12 @@ fn render_line(
 
     for col in 0..cols {
         if let Some(cell) = line.get_cell(col) {
+            // Skip continuation cells (width 0) -- the wide character from the
+            // previous cell already occupies the right visual width in Emacs.
+            if cell.width() == 0 {
+                continue;
+            }
+
             let attrs = cell.attrs().clone();
             let link_uri = attrs.hyperlink().map(|h| h.uri().to_string());
 
