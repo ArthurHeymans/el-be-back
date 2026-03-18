@@ -184,6 +184,12 @@ search, and copying."
 
 ;;; --- Major mode ---
 
+(defcustom ebb-max-scrollback-lines 10000
+  "Maximum number of scrollback lines to keep in the buffer.
+Lines beyond this limit are deleted from the top of the buffer."
+  :type 'integer
+  :group 'el-be-back)
+
 (define-derived-mode ebb-mode fundamental-mode "EBB"
   "Major mode for el-be-back terminal emulator."
   (buffer-disable-undo)
@@ -196,8 +202,28 @@ search, and copying."
   (setq-local right-margin-width 0)
   ;; We manage faces ourselves
   (setq-local font-lock-defaults '(nil t))
+  ;; Header line showing terminal title
+  (setq-local header-line-format
+              '(:eval (ebb--header-line)))
   (add-hook 'kill-buffer-hook #'ebb--kill-buffer-hook nil t)
   (add-hook 'window-size-change-functions #'ebb--window-size-change))
+
+(defun ebb--header-line ()
+  "Generate the header line for the terminal buffer."
+  (let ((title (and ebb--terminal (ebb--get-title ebb--terminal)))
+        (cwd (and ebb--terminal (ebb--get-cwd ebb--terminal)))
+        (size (format "%dx%d"
+                      (if ebb--terminal (ebb--get-rows ebb--terminal) 0)
+                      (if ebb--terminal (ebb--get-cols ebb--terminal) 0))))
+    (concat " EBB"
+            (when ebb--copy-mode " [COPY]")
+            (when title (format " | %s" title))
+            (when cwd
+              (let ((dir (if (string-prefix-p "file://" cwd)
+                             (replace-regexp-in-string "^file://[^/]*" "" cwd)
+                           cwd)))
+                (format " | %s" (abbreviate-file-name dir))))
+            (format " | %s" size))))
 
 ;;; --- Process management ---
 
@@ -263,10 +289,23 @@ search, and copying."
 (defun ebb--render-screen ()
   "Render the terminal screen into the current buffer.
 Must be called within the performance-trinity let bindings.
-The Rust render function erases the buffer, inserts styled text,
-and positions the cursor."
+The Rust render function handles scrollback insertion and display region update."
   (when ebb--terminal
-    (ebb--render ebb--terminal)))
+    (ebb--render ebb--terminal)
+    ;; Truncate scrollback if over limit
+    (ebb--truncate-scrollback)))
+
+(defun ebb--truncate-scrollback ()
+  "Delete old scrollback lines beyond `ebb-max-scrollback-lines'."
+  (let ((total-lines (count-lines (point-min) (point-max)))
+        (term-rows (if ebb--terminal (ebb--get-rows ebb--terminal) 24)))
+    (let ((scrollback-lines (- total-lines term-rows)))
+      (when (> scrollback-lines ebb-max-scrollback-lines)
+        (let ((excess (- scrollback-lines ebb-max-scrollback-lines)))
+          (save-excursion
+            (goto-char (point-min))
+            (forward-line excess)
+            (delete-region (point-min) (point))))))))
 
 (defun ebb--drain-and-send ()
   "Drain captured terminal output and send to the PTY."
@@ -383,6 +422,16 @@ Falls back to raw send for unrecognized keys."
     (when key-name
       (ebb--send-key key-name shift ctrl meta))))
 
+(defun ebb-yank ()
+  "Paste the kill ring content into the terminal.
+Uses bracketed paste if the terminal has it enabled."
+  (interactive)
+  (when (and ebb--terminal ebb--process (process-live-p ebb--process))
+    (let ((text (current-kill 0)))
+      (when text
+        (ebb--send-paste ebb--terminal text)
+        (ebb--drain-and-send)))))
+
 ;; --- Semi-char mode keymap ---
 ;; Most keys are forwarded; a few Emacs prefix keys are preserved.
 
@@ -432,7 +481,7 @@ Falls back to raw send for unrecognized keys."
     (define-key map (kbd "C-r") (lambda () (interactive) (ebb--send-key "r" nil t nil)))
     (define-key map (kbd "C-t") (lambda () (interactive) (ebb--send-key "t" nil t nil)))
     (define-key map (kbd "C-w") (lambda () (interactive) (ebb--send-key "w" nil t nil)))
-    (define-key map (kbd "C-y") (lambda () (interactive) (ebb--send-key "y" nil t nil)))
+    (define-key map (kbd "C-y") #'ebb-yank)
     (define-key map (kbd "C-z") (lambda () (interactive) (ebb--send-key "z" nil t nil)))
     (define-key map (kbd "C-\\") (lambda () (interactive) (ebb--send-key "\\" nil t nil)))
     (define-key map (kbd "C-_") (lambda () (interactive) (ebb--send-key "_" nil t nil)))
