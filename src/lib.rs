@@ -1,0 +1,365 @@
+mod config;
+mod input;
+mod render;
+
+use std::io;
+use std::sync::{Arc, Mutex};
+
+use emacs::{defun, Env, Result, Value};
+use wezterm_term::{Terminal, TerminalSize};
+
+use config::{AlertQueue, EbbAlertSink, EbbConfig};
+
+emacs::plugin_is_GPL_compatible!();
+
+#[emacs::module(name = "ebb-module", defun_prefix = "ebb", separator = "--")]
+fn init(env: &Env) -> Result<()> {
+    env.message("[ebb] module loaded")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CapturingWriter: collects bytes written by wezterm-term's ThreadedWriter.
+// ---------------------------------------------------------------------------
+
+struct CapturingWriter {
+    buf: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for CapturingWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf
+            .lock()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
+            .extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EbbTerminal: wraps wezterm-term::Terminal and associated state.
+// ---------------------------------------------------------------------------
+
+pub struct EbbTerminal {
+    terminal: Terminal,
+    output: Arc<Mutex<Vec<u8>>>,
+    #[allow(dead_code)]
+    alerts: Arc<Mutex<AlertQueue>>,
+    freed: bool,
+}
+
+impl emacs::Transfer for EbbTerminal {
+    fn type_name() -> &'static str {
+        "EbbTerminal"
+    }
+}
+
+impl EbbTerminal {
+    fn new(rows: usize, cols: usize, scrollback: usize) -> Self {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let alerts = Arc::new(Mutex::new(AlertQueue::default()));
+
+        let writer = CapturingWriter {
+            buf: Arc::clone(&output),
+        };
+
+        let config = Arc::new(EbbConfig {
+            scrollback_size: scrollback,
+        });
+
+        let size = TerminalSize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 0,
+        };
+
+        let mut terminal = Terminal::new(size, config, "el-be-back", "0.1.0", Box::new(writer));
+
+        let alert_sink = EbbAlertSink {
+            queue: Arc::clone(&alerts),
+        };
+        terminal.set_notification_handler(Box::new(alert_sink));
+
+        EbbTerminal {
+            terminal,
+            output,
+            alerts,
+            freed: false,
+        }
+    }
+
+    fn drain_output_bytes(&self) -> Vec<u8> {
+        let mut buf = self.output.lock().unwrap();
+        std::mem::take(&mut *buf)
+    }
+
+    fn screen_text(&self) -> String {
+        let screen = self.terminal.screen();
+        let rows = screen.physical_rows;
+        let cols = screen.physical_cols;
+        let mut text = String::with_capacity((cols + 1) * rows);
+
+        for vis_row in 0..rows {
+            let stable = screen.visible_row_to_stable_row(vis_row as i64);
+            if let Some(phys) = screen.stable_row_to_phys(stable) {
+                let lines = screen.lines_in_phys_range(phys..phys + 1);
+                if let Some(line) = lines.first() {
+                    for col in 0..cols {
+                        if let Some(cell) = line.get_cell(col) {
+                            let s = cell.str();
+                            if s.is_empty() {
+                                text.push(' ');
+                            } else {
+                                text.push_str(s);
+                            }
+                        } else {
+                            text.push(' ');
+                        }
+                    }
+                } else {
+                    for _ in 0..cols {
+                        text.push(' ');
+                    }
+                }
+            } else {
+                for _ in 0..cols {
+                    text.push(' ');
+                }
+            }
+            text.push('\n');
+        }
+        text
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Defuns: Lifecycle
+// ---------------------------------------------------------------------------
+
+/// Create a new terminal instance. Returns an opaque user-ptr.
+#[defun(user_ptr)]
+fn new(_env: &Env, rows: i64, cols: i64, scrollback: i64) -> Result<EbbTerminal> {
+    Ok(EbbTerminal::new(
+        rows.max(1) as usize,
+        cols.max(1) as usize,
+        scrollback.max(0) as usize,
+    ))
+}
+
+/// Explicitly free a terminal instance.
+#[defun]
+fn free(term: &mut EbbTerminal) -> Result<()> {
+    term.freed = true;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Defuns: I/O
+// ---------------------------------------------------------------------------
+
+/// Feed raw bytes from the PTY into the terminal's VT parser.
+#[defun]
+fn feed(term: &mut EbbTerminal, bytes: String) -> Result<()> {
+    if term.freed {
+        return Ok(());
+    }
+    term.terminal.advance_bytes(bytes);
+    Ok(())
+}
+
+/// Drain captured output bytes (terminal responses, key encodings).
+/// Returns a string or nil if empty.
+#[defun]
+fn drain_output(term: &EbbTerminal) -> Result<Option<String>> {
+    if term.freed {
+        return Ok(None);
+    }
+    let bytes = term.drain_output_bytes();
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+}
+
+/// Return the visible screen content as a plain text string (debug/render).
+#[defun]
+fn content(term: &EbbTerminal) -> Result<String> {
+    if term.freed {
+        return Ok(String::new());
+    }
+    Ok(term.screen_text())
+}
+
+// ---------------------------------------------------------------------------
+// Defuns: State queries
+// ---------------------------------------------------------------------------
+
+/// Return terminal rows.
+#[defun]
+fn get_rows(term: &EbbTerminal) -> Result<i64> {
+    if term.freed {
+        return Ok(0);
+    }
+    Ok(term.terminal.get_size().rows as i64)
+}
+
+/// Return terminal cols.
+#[defun]
+fn get_cols(term: &EbbTerminal) -> Result<i64> {
+    if term.freed {
+        return Ok(0);
+    }
+    Ok(term.terminal.get_size().cols as i64)
+}
+
+/// Return cursor row (0-based).
+#[defun]
+fn cursor_row(term: &EbbTerminal) -> Result<i64> {
+    if term.freed {
+        return Ok(0);
+    }
+    Ok(term.terminal.cursor_pos().y as i64)
+}
+
+/// Return cursor column (0-based).
+#[defun]
+fn cursor_col(term: &EbbTerminal) -> Result<i64> {
+    if term.freed {
+        return Ok(0);
+    }
+    Ok(term.terminal.cursor_pos().x as i64)
+}
+
+/// Return the terminal title (from OSC 2) or nil.
+#[defun]
+fn get_title(term: &EbbTerminal) -> Result<Option<String>> {
+    if term.freed {
+        return Ok(None);
+    }
+    let title = term.terminal.get_title();
+    if title.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(title.to_string()))
+    }
+}
+
+/// Return the current working directory (from OSC 7) or nil.
+#[defun]
+fn get_cwd(term: &EbbTerminal) -> Result<Option<String>> {
+    if term.freed {
+        return Ok(None);
+    }
+    Ok(term.terminal.get_current_dir().map(|u| u.to_string()))
+}
+
+/// Check if alternate screen is active.
+#[defun]
+fn is_alt_screen(term: &EbbTerminal) -> Result<bool> {
+    if term.freed {
+        return Ok(false);
+    }
+    Ok(term.terminal.is_alt_screen_active())
+}
+
+/// Check if the terminal has grabbed the mouse.
+#[defun]
+fn is_mouse_grabbed(term: &EbbTerminal) -> Result<bool> {
+    if term.freed {
+        return Ok(false);
+    }
+    Ok(term.terminal.is_mouse_grabbed())
+}
+
+/// Check if bracketed paste mode is enabled.
+#[defun]
+fn bracketed_paste_enabled(term: &EbbTerminal) -> Result<bool> {
+    if term.freed {
+        return Ok(false);
+    }
+    Ok(term.terminal.bracketed_paste_enabled())
+}
+
+/// Resize the terminal.
+#[defun]
+fn resize(term: &mut EbbTerminal, rows: i64, cols: i64) -> Result<()> {
+    if term.freed {
+        return Ok(());
+    }
+    let size = TerminalSize {
+        rows: rows.max(1) as usize,
+        cols: cols.max(1) as usize,
+        pixel_width: 0,
+        pixel_height: 0,
+        dpi: 0,
+    };
+    term.terminal.resize(size);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Defuns: Input
+// ---------------------------------------------------------------------------
+
+/// Send a key press to the terminal.
+/// KEY_NAME is a string like "a", "return", "up", "f1", etc.
+/// SHIFT, CTRL, META are non-nil for modifier keys.
+/// Returns t if the key was handled, nil if unknown.
+#[defun]
+fn key_down(
+    term: &mut EbbTerminal,
+    key_name: String,
+    shift: Option<i64>,
+    ctrl: Option<i64>,
+    meta: Option<i64>,
+) -> Result<bool> {
+    input::key_down(
+        term,
+        &key_name,
+        shift.is_some(),
+        ctrl.is_some(),
+        meta.is_some(),
+    )
+}
+
+/// Send a paste to the terminal (with bracketed paste wrapping if enabled).
+#[defun]
+fn send_paste(term: &mut EbbTerminal, text: String) -> Result<()> {
+    if term.freed {
+        return Ok(());
+    }
+    term.terminal
+        .send_paste(&text)
+        .map_err(|e| anyhow::anyhow!("send_paste error: {}", e))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Defuns: Rendering
+// ---------------------------------------------------------------------------
+
+/// Render the terminal screen into the current Emacs buffer with faces.
+/// Erases the buffer, inserts styled text, positions cursor.
+/// Must be called within inhibit-read-only / inhibit-modification-hooks.
+#[defun]
+fn render<'a>(env: &'a Env, term_val: Value<'a>) -> Result<()> {
+    let term = term_val.into_ref::<EbbTerminal>()?;
+    render::render_to_buffer(env, &term)
+}
+
+// ---------------------------------------------------------------------------
+// Defuns: Version
+// ---------------------------------------------------------------------------
+
+/// Return the el-be-back version string.
+#[defun]
+fn version(_env: &Env) -> Result<&'static str> {
+    Ok("0.1.0")
+}
