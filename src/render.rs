@@ -8,18 +8,9 @@ use crate::EbbTerminal;
 
 /// Render the terminal screen into the current Emacs buffer.
 ///
-/// Buffer layout:
-///   [scrollback lines with faces] ← permanent, above display region
-///   [display line 0]              ← start of display region
-///   [display line 1]
-///   ...
-///   [display line rows-1]         ← end of display region
-///
-/// On each call:
-/// 1. Insert any new scrollback lines above the display region
-/// 2. Erase the display region
-/// 3. Re-render visible rows with faces
-/// 4. Position cursor
+/// Erases the display region and re-renders all visible rows with faces.
+/// Tracks cursor position during rendering for accurate placement
+/// despite character width mismatches between wezterm and Emacs.
 pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     if term.freed {
         return Ok(());
@@ -29,50 +20,11 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     let rows = screen.physical_rows;
     let cols = screen.physical_cols;
     let palette = term.terminal.palette();
-    let current_scrollback = screen.scrollback_rows();
-
-    // --- Step 1: Insert new scrollback lines ---
-    let new_scrollback = current_scrollback.saturating_sub(term.last_scrollback_count);
-    if new_scrollback > 0 {
-        // New scrollback lines are the lines just above the visible area.
-        // They are at physical indices: (total - rows - new_scrollback) .. (total - rows)
-        // But using scrollback_rows count: phys index
-        //   old_scrollback_count .. current_scrollback
-        let scroll_start = term.last_scrollback_count;
-        let scroll_end = current_scrollback;
-
-        // Go to the start of the display region (beginning of buffer for now,
-        // or after existing scrollback)
-        env.call("goto-char", (env.call("point-min", [])?,))?;
-        // Skip past existing scrollback lines
-        if term.last_scrollback_count > 0 {
-            env.call("forward-line", (term.last_scrollback_count as i64,))?;
-        }
-
-        // Insert new scrollback lines at this position
-        for sb_idx in scroll_start..scroll_end {
-            let lines = screen.lines_in_phys_range(sb_idx..sb_idx + 1);
-            if let Some(line) = lines.first() {
-                render_line(env, line, cols, &palette)?;
-                env.call("insert", ("\n",))?;
-            }
-        }
-
-        term.last_scrollback_count = current_scrollback;
-    }
-
-    // --- Step 2: Erase display region ---
-    // The display region starts after scrollback lines.
-    env.call("goto-char", (env.call("point-min", [])?,))?;
-    if term.last_scrollback_count > 0 {
-        env.call("forward-line", (term.last_scrollback_count as i64,))?;
-    }
-    let display_start = env.call("point", [])?;
-    let point_max = env.call("point-max", [])?;
-    env.call("delete-region", (display_start, point_max))?;
-
-    // --- Step 3: Render visible rows, tracking cursor position ---
     let cursor = term.terminal.cursor_pos();
+
+    // Erase buffer and re-render visible rows
+    env.call("erase-buffer", [])?;
+
     let mut cursor_buf_pos: Option<i64> = None;
 
     for vis_row in 0..rows {
@@ -99,20 +51,17 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
         }
     }
 
-    // --- Step 4: Position cursor ---
+    // Position cursor
     if let Some(pos) = cursor_buf_pos {
         env.call("goto-char", (pos,))?;
     } else {
-        // Fallback: use display_start
-        env.call("goto-char", (display_start,))?;
+        env.call("goto-char", (env.call("point-min", [])?,))?;
     }
 
     Ok(())
 }
 
 /// Render a line and return the buffer position corresponding to `cursor_col`.
-/// This is used for the cursor row to get accurate cursor placement despite
-/// character width mismatches between wezterm and Emacs.
 fn render_line_with_cursor(
     env: &Env,
     line: &wezterm_surface::Line,
@@ -120,63 +69,36 @@ fn render_line_with_cursor(
     palette: &ColorPalette,
     cursor_col: i64,
 ) -> Result<i64> {
-    // First, build a mapping: wezterm cell column -> character index in the
-    // rendered string. Then render the line and use the mapping to find the
-    // buffer position.
-
-    // Collect the rendered characters and their cell column origins
-    let mut chars_with_cols: Vec<(usize, String)> = Vec::new(); // (cell_col, char_str)
+    // Build mapping: cell column -> character index in rendered output
+    let mut char_entries: Vec<usize> = Vec::new(); // cell_col for each rendered char
     for col in 0..cols {
         if let Some(cell) = line.get_cell(col) {
             if cell.width() == 0 {
-                continue; // skip continuation cells
+                continue;
             }
-            let s = cell.str();
-            if s.is_empty() {
-                chars_with_cols.push((col, " ".to_string()));
-            } else {
-                chars_with_cols.push((col, s.to_string()));
-            }
+            char_entries.push(col);
         } else {
-            chars_with_cols.push((col, " ".to_string()));
+            char_entries.push(col);
         }
     }
 
     // Find which character index the cursor falls on
-    let mut cursor_char_idx = chars_with_cols.len(); // default: end of line
-    for (i, (cell_col, _)) in chars_with_cols.iter().enumerate() {
-        if *cell_col >= cursor_col as usize {
-            cursor_char_idx = i;
-            break;
-        }
-    }
+    let cursor_char_idx = char_entries
+        .iter()
+        .position(|&col| col >= cursor_col as usize)
+        .unwrap_or(char_entries.len());
 
-    // Now render the line normally and record point at the cursor position
+    // Render the line
     let line_start = env.call("point", [])?.into_rust::<i64>()?;
     render_line(env, line, cols, palette)?;
+
+    // Calculate cursor position: count characters up to cursor_char_idx
+    let cursor_pos = line_start + cursor_char_idx as i64;
     let line_end = env.call("point", [])?.into_rust::<i64>()?;
-
-    // Calculate cursor buffer position: line_start + character offset
-    // We need to count characters (not visual columns) up to cursor_char_idx
-    let mut char_offset: i64 = 0;
-    let _line_text_len = line_end - line_start;
-    // Count actual characters inserted
-    let total_chars: usize = chars_with_cols.iter().map(|(_, s)| s.chars().count()).sum();
-
-    if total_chars > 0 && cursor_char_idx <= chars_with_cols.len() {
-        let chars_before: usize = chars_with_cols[..cursor_char_idx]
-            .iter()
-            .map(|(_, s)| s.chars().count())
-            .sum();
-        char_offset = chars_before as i64;
-    }
-
-    // Clamp to line bounds
-    let cursor_pos = (line_start + char_offset).min(line_end).max(line_start);
-    Ok(cursor_pos)
+    Ok(cursor_pos.min(line_end).max(line_start))
 }
 
-/// A styled run of text: text content, cell attributes, and optional hyperlink URI.
+/// A styled run of text with optional hyperlink.
 struct StyledRun {
     text: String,
     attrs: CellAttributes,
@@ -190,7 +112,6 @@ fn render_line(
     cols: usize,
     palette: &ColorPalette,
 ) -> Result<()> {
-    // Collect runs: sequences of cells with identical attributes + hyperlink
     let mut runs: Vec<StyledRun> = Vec::new();
     let mut current_text = String::new();
     let mut current_attrs: Option<CellAttributes> = None;
@@ -198,8 +119,6 @@ fn render_line(
 
     for col in 0..cols {
         if let Some(cell) = line.get_cell(col) {
-            // Skip continuation cells (width 0) -- the wide character from the
-            // previous cell already occupies the right visual width in Emacs.
             if cell.width() == 0 {
                 continue;
             }
@@ -222,7 +141,6 @@ fn render_line(
                     current_text.push_str(s);
                 }
             } else {
-                // Flush previous run
                 if !current_text.is_empty() {
                     if let Some(a) = current_attrs.take() {
                         runs.push(StyledRun {
@@ -246,7 +164,6 @@ fn render_line(
         }
     }
 
-    // Flush final run
     if !current_text.is_empty() {
         runs.push(StyledRun {
             text: current_text,
@@ -255,7 +172,7 @@ fn render_line(
         });
     }
 
-    // Insert each run with face properties and hyperlink buttons
+    // Insert runs with face properties
     let face_sym = env.intern("face")?;
     let help_echo_sym = env.intern("help-echo")?;
     let mouse_face_sym = env.intern("mouse-face")?;
@@ -276,28 +193,22 @@ fn render_line(
         env.call("insert", (run.text.as_str(),))?;
         let end = env.call("point", [])?;
 
-        // Apply face
         if has_style {
             let face_str = build_face_string(&run.attrs, palette);
             let face_val = env.call("read", (face_str.as_str(),))?;
             env.call("put-text-property", (start, end, face_sym, face_val))?;
         }
 
-        // Apply hyperlink properties
         if let Some(uri) = &run.hyperlink_uri {
-            // Store the URL as a text property
             env.call("put-text-property", (start, end, ebb_url_sym, uri.as_str()))?;
-            // Add help-echo (tooltip on hover)
             env.call(
                 "put-text-property",
                 (start, end, help_echo_sym, uri.as_str()),
             )?;
-            // Add mouse-face for hover highlight
             env.call(
                 "put-text-property",
                 (start, end, mouse_face_sym, highlight_sym),
             )?;
-            // Add keymap for click action
             let km = env.call("symbol-value", (env.intern("ebb-hyperlink-map")?,))?;
             env.call("put-text-property", (start, end, keymap_sym, km))?;
         }
@@ -306,36 +217,30 @@ fn render_line(
     Ok(())
 }
 
-/// Build an Emacs face plist string like "(:foreground \"#ff0000\" :weight bold)"
+/// Build an Emacs face plist string.
 fn build_face_string(attrs: &CellAttributes, palette: &ColorPalette) -> String {
     let mut parts = Vec::new();
 
     if let Some(hex) = resolve_color(attrs.foreground(), palette) {
         parts.push(format!(":foreground \"{}\"", hex));
     }
-
     if let Some(hex) = resolve_color(attrs.background(), palette) {
         parts.push(format!(":background \"{}\"", hex));
     }
-
     match attrs.intensity() {
         Intensity::Bold => parts.push(":weight bold".to_string()),
         Intensity::Half => parts.push(":weight light".to_string()),
         Intensity::Normal => {}
     }
-
     if attrs.italic() {
         parts.push(":slant italic".to_string());
     }
-
     if attrs.underline() != wezterm_escape_parser::csi::Underline::None {
         parts.push(":underline t".to_string());
     }
-
     if attrs.strikethrough() {
         parts.push(":strike-through t".to_string());
     }
-
     if attrs.reverse() {
         parts.push(":inverse-video t".to_string());
     }
@@ -343,7 +248,6 @@ fn build_face_string(attrs: &CellAttributes, palette: &ColorPalette) -> String {
     format!("({})", parts.join(" "))
 }
 
-/// Resolve a ColorAttribute to a hex string like "#rrggbb".
 fn resolve_color(attr: ColorAttribute, palette: &ColorPalette) -> Option<String> {
     match attr {
         ColorAttribute::Default => None,
@@ -356,7 +260,6 @@ fn resolve_color(attr: ColorAttribute, palette: &ColorPalette) -> Option<String>
     }
 }
 
-/// Convert SrgbaTuple (0.0-1.0 floats) to "#rrggbb" hex string.
 fn srgba_to_hex(color: SrgbaTuple) -> String {
     let r = (color.0 * 255.0).round() as u8;
     let g = (color.1 * 255.0).round() as u8;

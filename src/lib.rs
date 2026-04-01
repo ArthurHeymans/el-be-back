@@ -49,8 +49,6 @@ pub struct EbbTerminal {
     output: Arc<Mutex<Vec<u8>>>,
     alerts: Arc<Mutex<AlertQueue>>,
     freed: bool,
-    /// Number of scrollback lines already committed to the Emacs buffer.
-    last_scrollback_count: usize,
 }
 
 impl emacs::Transfer for EbbTerminal {
@@ -92,7 +90,6 @@ impl EbbTerminal {
             output,
             alerts,
             freed: false,
-            last_scrollback_count: 0,
         }
     }
 

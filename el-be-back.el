@@ -302,23 +302,9 @@ Lines beyond this limit are deleted from the top of the buffer."
 (defun ebb--render-screen ()
   "Render the terminal screen into the current buffer.
 Must be called within the performance-trinity let bindings.
-The Rust render function handles scrollback insertion and display region update."
+The Rust render function erases the buffer and re-renders all visible rows."
   (when ebb--terminal
-    (ebb--render ebb--terminal)
-    ;; Truncate scrollback if over limit
-    (ebb--truncate-scrollback)))
-
-(defun ebb--truncate-scrollback ()
-  "Delete old scrollback lines beyond `ebb-max-scrollback-lines'."
-  (let ((total-lines (count-lines (point-min) (point-max)))
-        (term-rows (if ebb--terminal (ebb--get-rows ebb--terminal) 24)))
-    (let ((scrollback-lines (- total-lines term-rows)))
-      (when (> scrollback-lines ebb-max-scrollback-lines)
-        (let ((excess (- scrollback-lines ebb-max-scrollback-lines)))
-          (save-excursion
-            (goto-char (point-min))
-            (forward-line excess)
-            (delete-region (point-min) (point))))))))
+    (ebb--render ebb--terminal)))
 
 (defun ebb--drain-and-send ()
   "Drain captured terminal output and send to the PTY."
