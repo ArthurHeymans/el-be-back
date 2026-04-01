@@ -198,6 +198,8 @@ Lines beyond this limit are deleted from the top of the buffer."
   (buffer-disable-undo)
   (setq-local buffer-read-only t)
   (setq-local truncate-lines t)
+  ;; Larger PTY read buffer -- fewer process-filter calls during heavy output.
+  (setq-local read-process-output-max (* 64 1024))
   (setq-local scroll-conservatively 101)
   (setq-local scroll-margin 0)
   (setq-local hscroll-margin 0)
@@ -277,34 +279,63 @@ Lines beyond this limit are deleted from the top of the buffer."
       (ebb--flush-output))))
 
 (defun ebb--flush-output ()
-  "Process all pending output chunks and render."
+  "Process all pending output chunks and render.
+Drains as much immediately available PTY data as possible before
+rendering, so that a single render covers the maximum amount of
+output.  This prevents render overhead from throttling throughput."
   ;; Cancel pending timer
   (when ebb--render-timer
     (cancel-timer ebb--render-timer)
     (setq ebb--render-timer nil))
   (when (and ebb--terminal ebb--pending-chunks)
+    ;; Feed current pending chunks.
     (let ((chunks (nreverse ebb--pending-chunks)))
       (setq ebb--pending-chunks nil
             ebb--first-chunk-time nil)
-      ;; Feed all chunks to the terminal in one call
-      (ebb--feed ebb--terminal (apply #'concat chunks))
-      ;; Render the screen
-      (let ((inhibit-read-only t)
-            (inhibit-modification-hooks t)
-            (inhibit-quit t)
-            (buffer-undo-list t))
-        (ebb--render-screen))
-      ;; Drain terminal responses and send to PTY
-      (ebb--drain-and-send)
-      ;; Process title/CWD/bell alerts
-      (ebb--process-alerts))))
+      (ebb--feed ebb--terminal (apply #'concat chunks)))
+    ;; Drain any immediately available additional data before rendering.
+    ;; Each accept-process-output call runs the process filter which
+    ;; queues more chunks.  We feed them and repeat until there is no
+    ;; more data or we've spent ebb-maximum-latency total.
+    (let ((deadline (+ (float-time) ebb-maximum-latency)))
+      (while (and ebb--process
+                  (process-live-p ebb--process)
+                  (< (float-time) deadline)
+                  (accept-process-output ebb--process 0 nil t)
+                  ebb--pending-chunks)
+        (when ebb--render-timer
+          (cancel-timer ebb--render-timer)
+          (setq ebb--render-timer nil))
+        (let ((chunks (nreverse ebb--pending-chunks)))
+          (setq ebb--pending-chunks nil
+                ebb--first-chunk-time nil)
+          (ebb--feed ebb--terminal (apply #'concat chunks)))))
+    ;; Render the final screen state once.
+    (let ((inhibit-read-only t)
+          (inhibit-modification-hooks t)
+          (inhibit-quit t)
+          (buffer-undo-list t))
+      (ebb--render-screen))
+    ;; Drain terminal responses and send to PTY
+    (ebb--drain-and-send)
+    ;; Process title/CWD/bell alerts
+    (ebb--process-alerts)))
 
 (defun ebb--render-screen ()
   "Render the terminal screen into the current buffer.
 Must be called within the performance-trinity let bindings.
-The Rust render function erases the buffer and re-renders all visible rows."
+The Rust render function updates scrollback and display rows."
   (when ebb--terminal
-    (ebb--render ebb--terminal)))
+    (ebb--render ebb--terminal)
+    ;; Pin the window to show the display region (the last `rows' lines
+    ;; of the buffer), like a real terminal screen.  Scrollback above is
+    ;; only visible in copy-mode.
+    (unless ebb-copy-mode
+      (let ((rows (ebb--get-rows ebb--terminal)))
+        (save-excursion
+          (goto-char (point-max))
+          (forward-line (- (1- rows)))
+          (set-window-start (selected-window) (point) t))))))
 
 (defun ebb--drain-and-send ()
   "Drain captured terminal output and send to the PTY."
