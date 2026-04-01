@@ -389,15 +389,15 @@ The Rust render function handles scrollback insertion and display region update.
 (defun ebb--send-key (key-name &optional shift ctrl meta)
   "Send KEY-NAME to the terminal via wezterm key encoding.
 KEY-NAME is a string like \"a\", \"return\", \"up\", etc.
-Falls back to raw send for unrecognized keys."
+Encodes synchronously and sends directly to PTY."
   (when (and ebb--terminal ebb--process (process-live-p ebb--process))
-    ;; Pass 1 for true, nil for false (Rust expects Option<i64>)
-    (ebb--key-down ebb--terminal key-name
-                   (if shift 1 nil)
-                   (if ctrl 1 nil)
-                   (if meta 1 nil))
-    ;; Drain encoded key bytes and send to PTY
-    (ebb--drain-and-send)))
+    ;; Encode key synchronously (bypasses async ThreadedWriter)
+    (let ((encoded (ebb--encode-key ebb--terminal key-name
+                                    (if shift 1 nil)
+                                    (if ctrl 1 nil)
+                                    (if meta 1 nil))))
+      (when encoded
+        (process-send-string ebb--process encoded)))))
 
 (defun ebb-self-input ()
   "Send the last input event to the terminal."

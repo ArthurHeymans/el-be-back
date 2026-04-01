@@ -314,19 +314,18 @@ fn resize(term: &mut EbbTerminal, rows: i64, cols: i64) -> Result<()> {
 // Defuns: Input
 // ---------------------------------------------------------------------------
 
-/// Send a key press to the terminal.
-/// KEY_NAME is a string like "a", "return", "up", "f1", etc.
-/// SHIFT, CTRL, META are non-nil for modifier keys.
-/// Returns t if the key was handled, nil if unknown.
+/// Encode a key press and return the bytes to send to the PTY.
+/// Returns the encoded string, or nil if the key is unknown.
+/// This is synchronous -- bypasses the async ThreadedWriter.
 #[defun]
-fn key_down(
-    term: &mut EbbTerminal,
+fn encode_key(
+    term: &EbbTerminal,
     key_name: String,
     shift: Option<i64>,
     ctrl: Option<i64>,
     meta: Option<i64>,
-) -> Result<bool> {
-    input::key_down(
+) -> Result<Option<String>> {
+    input::encode_key(
         term,
         &key_name,
         shift.is_some(),

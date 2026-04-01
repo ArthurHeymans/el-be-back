@@ -71,13 +71,27 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     let point_max = env.call("point-max", [])?;
     env.call("delete-region", (display_start, point_max))?;
 
-    // --- Step 3: Render visible rows ---
+    // --- Step 3: Render visible rows, tracking cursor position ---
+    let cursor = term.terminal.cursor_pos();
+    let mut cursor_buf_pos: Option<i64> = None;
+
     for vis_row in 0..rows {
+        let is_cursor_row = vis_row as i64 == cursor.y;
         let stable = screen.visible_row_to_stable_row(vis_row as i64);
         if let Some(phys) = screen.stable_row_to_phys(stable) {
             let lines = screen.lines_in_phys_range(phys..phys + 1);
             if let Some(line) = lines.first() {
-                render_line(env, line, cols, &palette)?;
+                if is_cursor_row {
+                    cursor_buf_pos = Some(render_line_with_cursor(
+                        env,
+                        line,
+                        cols,
+                        &palette,
+                        cursor.x as i64,
+                    )?);
+                } else {
+                    render_line(env, line, cols, &palette)?;
+                }
             }
         }
         if vis_row < rows - 1 {
@@ -86,17 +100,80 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     }
 
     // --- Step 4: Position cursor ---
-    let cursor = term.terminal.cursor_pos();
-    // Cursor is relative to the display region
-    env.call("goto-char", (display_start,))?;
-    if cursor.y > 0 {
-        env.call("forward-line", (cursor.y as i64,))?;
-    }
-    if cursor.x > 0 {
-        env.call("move-to-column", (cursor.x as i64,))?;
+    if let Some(pos) = cursor_buf_pos {
+        env.call("goto-char", (pos,))?;
+    } else {
+        // Fallback: use display_start
+        env.call("goto-char", (display_start,))?;
     }
 
     Ok(())
+}
+
+/// Render a line and return the buffer position corresponding to `cursor_col`.
+/// This is used for the cursor row to get accurate cursor placement despite
+/// character width mismatches between wezterm and Emacs.
+fn render_line_with_cursor(
+    env: &Env,
+    line: &wezterm_surface::Line,
+    cols: usize,
+    palette: &ColorPalette,
+    cursor_col: i64,
+) -> Result<i64> {
+    // First, build a mapping: wezterm cell column -> character index in the
+    // rendered string. Then render the line and use the mapping to find the
+    // buffer position.
+
+    // Collect the rendered characters and their cell column origins
+    let mut chars_with_cols: Vec<(usize, String)> = Vec::new(); // (cell_col, char_str)
+    for col in 0..cols {
+        if let Some(cell) = line.get_cell(col) {
+            if cell.width() == 0 {
+                continue; // skip continuation cells
+            }
+            let s = cell.str();
+            if s.is_empty() {
+                chars_with_cols.push((col, " ".to_string()));
+            } else {
+                chars_with_cols.push((col, s.to_string()));
+            }
+        } else {
+            chars_with_cols.push((col, " ".to_string()));
+        }
+    }
+
+    // Find which character index the cursor falls on
+    let mut cursor_char_idx = chars_with_cols.len(); // default: end of line
+    for (i, (cell_col, _)) in chars_with_cols.iter().enumerate() {
+        if *cell_col >= cursor_col as usize {
+            cursor_char_idx = i;
+            break;
+        }
+    }
+
+    // Now render the line normally and record point at the cursor position
+    let line_start = env.call("point", [])?.into_rust::<i64>()?;
+    render_line(env, line, cols, palette)?;
+    let line_end = env.call("point", [])?.into_rust::<i64>()?;
+
+    // Calculate cursor buffer position: line_start + character offset
+    // We need to count characters (not visual columns) up to cursor_char_idx
+    let mut char_offset: i64 = 0;
+    let _line_text_len = line_end - line_start;
+    // Count actual characters inserted
+    let total_chars: usize = chars_with_cols.iter().map(|(_, s)| s.chars().count()).sum();
+
+    if total_chars > 0 && cursor_char_idx <= chars_with_cols.len() {
+        let chars_before: usize = chars_with_cols[..cursor_char_idx]
+            .iter()
+            .map(|(_, s)| s.chars().count())
+            .sum();
+        char_offset = chars_before as i64;
+    }
+
+    // Clamp to line bounds
+    let cursor_pos = (line_start + char_offset).min(line_end).max(line_start);
+    Ok(cursor_pos)
 }
 
 /// A styled run of text: text content, cell attributes, and optional hyperlink URI.
