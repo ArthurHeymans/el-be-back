@@ -123,6 +123,10 @@
 (defvar-local ebb--copy-mode nil
   "Non-nil when copy mode is active (terminal output paused).")
 
+(defvar-local ebb--remote-prefix nil
+  "TRAMP remote prefix for SSH sessions (e.g. \"/rpc:root@host:\").
+When non-nil, CWD changes from OSC 7 are converted to TRAMP paths.")
+
 ;;; --- Hyperlink support ---
 
 (defvar ebb-hyperlink-map
@@ -235,9 +239,12 @@ Lines beyond this limit are deleted from the top of the buffer."
             (when ebb--copy-mode " [COPY]")
             (when title (format " | %s" title))
             (when cwd
-              (let ((dir (if (string-prefix-p "file://" cwd)
-                             (replace-regexp-in-string "^file://[^/]*" "" cwd)
-                           cwd)))
+              (let* ((path (if (string-prefix-p "file://" cwd)
+                               (replace-regexp-in-string "^file://[^/]*" "" cwd)
+                             cwd))
+                     (dir (if ebb--remote-prefix
+                              (concat ebb--remote-prefix path)
+                            path)))
                 (format " | %s" (abbreviate-file-name dir))))
             (format " | %s" size))))
 
@@ -355,10 +362,14 @@ The Rust render function updates scrollback and display rows."
     (let ((cwd (ebb--poll-cwd ebb--terminal)))
       (when cwd
         ;; Strip file:// prefix and hostname if present
-        (let ((dir (if (string-prefix-p "file://" cwd)
-                       (replace-regexp-in-string "^file://[^/]*" "" cwd)
-                     cwd)))
-          (when (file-directory-p dir)
+        (let* ((path (if (string-prefix-p "file://" cwd)
+                         (replace-regexp-in-string "^file://[^/]*" "" cwd)
+                       cwd))
+               ;; For SSH sessions, convert the remote path to a TRAMP path.
+               (dir (if ebb--remote-prefix
+                        (concat ebb--remote-prefix path)
+                      path)))
+          (when (or ebb--remote-prefix (file-directory-p dir))
             (setq-local default-directory
                         (file-name-as-directory dir))))))
     ;; Bell
@@ -583,6 +594,8 @@ opens an SSH session to the remote host instead of a local shell."
       (let ((rows (max 1 (window-body-height)))
             (cols (max 1 (window-body-width))))
         (setq ebb--terminal (ebb--new rows cols ebb-max-scrollback))
+        ;; Remember the TRAMP prefix for remote CWD tracking.
+        (setq ebb--remote-prefix (file-remote-p default-directory))
         (let ((process-environment
                (append
                 (list (concat "TERM=" ebb-term-environment-variable)
@@ -598,6 +611,18 @@ opens an SSH session to the remote host instead of a local shell."
                  :filter #'ebb--process-filter
                  :sentinel #'ebb--process-sentinel
                  :connection-type 'pty)))
+        ;; For SSH sessions, inject PROMPT_COMMAND for directory tracking
+        ;; after the remote shell starts.  Leading space keeps it out of
+        ;; shell history.
+        (when ebb--remote-prefix
+          (let ((proc ebb--process))
+            (run-at-time 1 nil
+              (lambda ()
+                (when (process-live-p proc)
+                  (process-send-string proc
+                    (concat
+                     " PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\033\\\\\\\\\" \"$(hostname)\" \"$(pwd)\"'\n"
+                     " clear\n")))))))
         ;; Enter semi-char mode by default
         (ebb-semi-char-mode 1)))
     (pop-to-buffer-same-window buf)))
@@ -641,13 +666,15 @@ connecting to the remote host."
               (push (if (numberp port) (number-to-string port) port)
                     ssh-args))
             (push (if user (format "%s@%s" user host) host) ssh-args)
-            (when (and localname
-                       (not (string= localname "/"))
-                       (not (string= localname "")))
+            ;; Build a remote command: cd to directory and start login shell.
+            (let ((cd-cmd (if (and localname
+                                   (not (string= localname "/"))
+                                   (not (string= localname "")))
+                              (format "cd %s; " (shell-quote-argument localname))
+                            "")))
               (setq ssh-args
                     (append ssh-args
-                            (list (format "cd %s && exec $SHELL -l"
-                                          (shell-quote-argument localname))))))
+                            (list (format "%sexec $SHELL -l" cd-cmd)))))
             `("/usr/bin/env" "sh" "-c"
               ,(format "stty rows %d columns %d sane 2>/dev/null; exec \"$@\""
                        rows cols)
