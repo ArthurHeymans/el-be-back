@@ -56,6 +56,13 @@
   :type 'boolean
   :group 'el-be-back)
 
+(defcustom ebb-tramp-method "sshx"
+  "TRAMP method to use when constructing paths for remote hosts.
+Used when the shell reports a CWD on an unknown remote host
+\(e.g. after typing `ssh host' inside ebb)."
+  :type 'string
+  :group 'el-be-back)
+
 ;;; --- Module loading ---
 
 (defconst ebb--module-name "ebb-module"
@@ -126,6 +133,28 @@
 (defvar-local ebb--remote-prefix nil
   "TRAMP remote prefix for SSH sessions (e.g. \"/rpc:root@host:\").
 When non-nil, CWD changes from OSC 7 are converted to TRAMP paths.")
+
+;;; --- CWD resolution ---
+
+(defun ebb--resolve-cwd (cwd)
+  "Convert an OSC 7 CWD URL to a local or TRAMP path.
+CWD is typically file://hostname/path.  Compares the hostname to
+the local machine; if different, constructs a TRAMP path (using
+`ebb--remote-prefix' when available, or /ssh:host: otherwise)."
+  (let* ((hostname (and (string-match "^file://\\([^/]*\\)" cwd)
+                        (match-string 1 cwd)))
+         (path (if (string-prefix-p "file://" cwd)
+                   (replace-regexp-in-string "^file://[^/]*" "" cwd)
+                 cwd))
+         (local-host-p (or (null hostname)
+                           (string= hostname "")
+                           (string-equal hostname (system-name))
+                           (string-equal hostname
+                                         (car (split-string (system-name) "\\."))))))
+    (cond
+     (local-host-p path)
+     (ebb--remote-prefix (concat ebb--remote-prefix path))
+     (t (format "/%s:%s:%s" ebb-tramp-method hostname path)))))
 
 ;;; --- Hyperlink support ---
 
@@ -239,13 +268,8 @@ Lines beyond this limit are deleted from the top of the buffer."
             (when ebb--copy-mode " [COPY]")
             (when title (format " | %s" title))
             (when cwd
-              (let* ((path (if (string-prefix-p "file://" cwd)
-                               (replace-regexp-in-string "^file://[^/]*" "" cwd)
-                             cwd))
-                     (dir (if ebb--remote-prefix
-                              (concat ebb--remote-prefix path)
-                            path)))
-                (format " | %s" (abbreviate-file-name dir))))
+              (format " | %s" (abbreviate-file-name
+                                (ebb--resolve-cwd cwd))))
             (format " | %s" size))))
 
 ;;; --- Process management ---
@@ -358,18 +382,11 @@ The Rust render function updates scrollback and display rows."
     (let ((title (ebb--poll-title ebb--terminal)))
       (when title
         (rename-buffer (format "*ebb: %s*" title) t)))
-    ;; CWD change
+    ;; CWD change -- resolve OSC 7 URL to local or TRAMP path.
     (let ((cwd (ebb--poll-cwd ebb--terminal)))
       (when cwd
-        ;; Strip file:// prefix and hostname if present
-        (let* ((path (if (string-prefix-p "file://" cwd)
-                         (replace-regexp-in-string "^file://[^/]*" "" cwd)
-                       cwd))
-               ;; For SSH sessions, convert the remote path to a TRAMP path.
-               (dir (if ebb--remote-prefix
-                        (concat ebb--remote-prefix path)
-                      path)))
-          (when (or ebb--remote-prefix (file-directory-p dir))
+        (let ((dir (ebb--resolve-cwd cwd)))
+          (when (or (file-remote-p dir) (file-directory-p dir))
             (setq-local default-directory
                         (file-name-as-directory dir))))))
     ;; Bell
