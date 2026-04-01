@@ -297,27 +297,112 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     } else {
         // ---- Incremental render ----
 
-        // 1) Insert any new scrollback lines above the display region.
         let new_sb = (cur_first_vis_stable - *last_first_vis_stable).max(0) as usize;
-        if new_sb > 0 {
-            // Navigate to the boundary between scrollback and display.
-            env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
-            env.call(&syms.forward_line, (*scrollback_in_buffer as i64,))?;
 
-            // The newest scrollback lines sit at the END of the scrollback
-            // region: phys indices (scrollback_count - new_sb) .. scrollback_count.
-            let start_phys = scrollback_count.saturating_sub(new_sb);
-            for phys in start_phys..scrollback_count {
-                let lines = screen.lines_in_phys_range(phys..phys + 1);
-                if let Some(line) = lines.first() {
-                    render_line(env, line, cols, &palette, syms)?;
-                }
-                env.call(&syms.insert, ("\n",))?;
-            }
+        if new_sb > 0 && new_sb < rows {
+            // -- Scroll optimisation: promote + append --
+            // The top `new_sb` display lines naturally become scrollback:
+            // their content is already correct, just move the boundary.
             *scrollback_in_buffer += new_sb;
+
+            // Append the `new_sb` new lines at the bottom of the display
+            // region.  The middle lines stay untouched.
+            env.call(&syms.goto_char, (env.call(&syms.point_max, [])?,))?;
+            for i in 0..new_sb {
+                let vis_row = rows - new_sb + i;
+                env.call(&syms.insert, ("\n",))?;
+                let stable = screen.visible_row_to_stable_row(vis_row as i64);
+                if let Some(phys) = screen.stable_row_to_phys(stable) {
+                    let lines = screen.lines_in_phys_range(phys..phys + 1);
+                    if let Some(line) = lines.first() {
+                        render_line(env, line, cols, &palette, syms)?;
+                    }
+                }
+            }
+
+            // Check for in-place changes in the kept (shifted) rows.
+            let kept_rows = rows - new_sb;
+            if kept_rows > 0 {
+                let first_kept = cur_first_vis_stable;
+                let last_kept = screen.visible_row_to_stable_row((kept_rows - 1) as i64);
+                let dirty = screen.get_changed_stable_rows(first_kept..last_kept + 1, *last_seqno);
+                if !dirty.is_empty() {
+                    incremental_render_display(
+                        env,
+                        screen,
+                        rows,
+                        cols,
+                        &palette,
+                        syms,
+                        &dirty,
+                        first_kept,
+                        *scrollback_in_buffer,
+                    )?;
+                }
+            }
+        } else if new_sb >= rows {
+            // -- Scrolled past entire screen --
+            // Old display lines become scrollback.
+            *scrollback_in_buffer += rows;
+
+            // Lines that scrolled through without ever being displayed
+            // ("missed") need to be added as scrollback too.
+            let missed = new_sb - rows;
+            if missed > 0 {
+                env.call(&syms.goto_char, (env.call(&syms.point_max, [])?,))?;
+                let start_phys = scrollback_count.saturating_sub(missed);
+                let mut sb = String::new();
+                for phys in start_phys..scrollback_count {
+                    let lines = screen.lines_in_phys_range(phys..phys + 1);
+                    if let Some(line) = lines.first() {
+                        sb.push('\n');
+                        sb.push_str(&line.as_str());
+                    }
+                }
+                if !sb.is_empty() {
+                    env.call(&syms.insert, (sb.as_str(),))?;
+                }
+                *scrollback_in_buffer += missed;
+            }
+
+            // Append a fresh display region.
+            env.call(&syms.goto_char, (env.call(&syms.point_max, [])?,))?;
+            env.call(&syms.insert, ("\n",))?;
+            render_display_rows(env, screen, rows, cols, &palette, syms)?;
+        } else {
+            // -- No scrolling: incremental dirty-row updates --
+            let first_stable = cur_first_vis_stable;
+            let last_stable = screen.visible_row_to_stable_row((rows - 1) as i64);
+            let dirty = screen.get_changed_stable_rows(first_stable..last_stable + 1, *last_seqno);
+
+            if !dirty.is_empty() {
+                if dirty.len() > rows / 2 {
+                    redraw_display_region(
+                        env,
+                        screen,
+                        rows,
+                        cols,
+                        &palette,
+                        syms,
+                        *scrollback_in_buffer,
+                    )?;
+                } else {
+                    incremental_render_display(
+                        env,
+                        screen,
+                        rows,
+                        cols,
+                        &palette,
+                        syms,
+                        &dirty,
+                        first_stable,
+                        *scrollback_in_buffer,
+                    )?;
+                }
+            }
         }
 
-        // 2) Trim scrollback if over the limit.
+        // Trim scrollback if over the limit.
         if *scrollback_in_buffer > max_scrollback {
             let excess = *scrollback_in_buffer - max_scrollback;
             env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
@@ -325,38 +410,6 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
             let cut = env.call(&syms.point, [])?;
             env.call(&syms.delete_region, (env.call(&syms.point_min, [])?, cut))?;
             *scrollback_in_buffer = max_scrollback;
-        }
-
-        // 3) Update dirty visible rows in the display region.
-        let first_stable = cur_first_vis_stable;
-        let last_stable = screen.visible_row_to_stable_row((rows - 1) as i64);
-        let dirty = screen.get_changed_stable_rows(first_stable..last_stable + 1, *last_seqno);
-
-        if !dirty.is_empty() {
-            if dirty.len() > rows / 2 {
-                // Redraw the entire display region (keep scrollback).
-                redraw_display_region(
-                    env,
-                    screen,
-                    rows,
-                    cols,
-                    &palette,
-                    syms,
-                    *scrollback_in_buffer,
-                )?;
-            } else {
-                incremental_render_display(
-                    env,
-                    screen,
-                    rows,
-                    cols,
-                    &palette,
-                    syms,
-                    &dirty,
-                    first_stable,
-                    *scrollback_in_buffer,
-                )?;
-            }
         }
     }
 
