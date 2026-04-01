@@ -249,11 +249,10 @@ search, and copying."
   (setq-local header-line-format
               '(:eval (ebb--header-line)))
   (add-hook 'kill-buffer-hook #'ebb--kill-buffer-hook nil t)
-  ;; Global hook (not buffer-local) -- add-hook is idempotent, so
-  ;; multiple ebb buffers won't duplicate it.
-  (add-hook 'window-size-change-functions #'ebb--window-size-change)
-  ;; Remove the hook when no ebb buffers remain.
-  (add-hook 'kill-buffer-hook #'ebb--maybe-remove-resize-hook nil t))
+  ;; Buffer-local: fires only for windows showing this buffer, receives
+  ;; the window as argument, and is automatically removed when the
+  ;; buffer is killed.
+  (add-hook 'window-state-change-functions #'ebb--window-state-change nil t))
 
 (defun ebb--header-line ()
   "Generate the header line for the terminal buffer."
@@ -419,40 +418,26 @@ When the process exits, kill the buffer."
     (ebb--free ebb--terminal)
     (setq ebb--terminal nil)))
 
-(defun ebb--maybe-remove-resize-hook ()
-  "Remove the resize hook when no ebb buffers remain."
-  (unless (cl-some (lambda (buf)
-                     (and (not (eq buf (current-buffer)))
-                          (buffer-live-p buf)
-                          (eq (buffer-local-value 'major-mode buf)
-                              'ebb-mode)))
-                   (buffer-list))
-    (remove-hook 'window-size-change-functions #'ebb--window-size-change)))
-
 ;;; --- Resize handling ---
 
-(defun ebb--window-size-change (frame)
-  "Handle window resize for terminal buffers in FRAME."
-  (dolist (window (window-list frame))
-    (let ((buf (window-buffer window)))
-      (when (and (buffer-live-p buf)
-                 (eq (buffer-local-value 'major-mode buf) 'ebb-mode)
-                 (buffer-local-value 'ebb--terminal buf))
-        (with-current-buffer buf
-            (let ((rows (window-body-height window))
-                (cols (window-body-width window))
-                (cur-rows (ebb--get-rows ebb--terminal))
-                (cur-cols (ebb--get-cols ebb--terminal)))
-            (when (or (/= rows cur-rows)
-                      (/= cols cur-cols))
-              (ebb--resize ebb--terminal rows cols)
-              (when (process-live-p ebb--process)
-                (set-process-window-size ebb--process rows cols))
-              ;; Re-render after resize
-              (let ((inhibit-read-only t)
-                    (inhibit-modification-hooks t)
-                    (buffer-undo-list t))
-                (ebb--render-screen window)))))))))
+(defun ebb--window-state-change (window)
+  "Handle state change (including resize) for WINDOW.
+This is a buffer-local `window-state-change-functions' hook, so it
+fires only for windows displaying this ebb buffer."
+  (when (and ebb--terminal (window-live-p window))
+    (let ((rows (window-body-height window))
+          (cols (window-body-width window))
+          (cur-rows (ebb--get-rows ebb--terminal))
+          (cur-cols (ebb--get-cols ebb--terminal)))
+      (when (or (/= rows cur-rows)
+                (/= cols cur-cols))
+        (ebb--resize ebb--terminal rows cols)
+        (when (and ebb--process (process-live-p ebb--process))
+          (set-process-window-size ebb--process rows cols))
+        (let ((inhibit-read-only t)
+              (inhibit-modification-hooks t)
+              (buffer-undo-list t))
+          (ebb--render-screen window))))))
 
 ;;; --- Input handling ---
 
