@@ -95,6 +95,7 @@
       (copy-file src dst t)
       (message "[ebb] Module compiled successfully."))))
 
+(add-to-list 'load-path ebb--directory)
 (unless (require 'ebb-module nil t)
   (if ebb-always-compile-module
       (progn
