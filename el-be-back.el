@@ -572,7 +572,9 @@ Uses bracketed paste if the terminal has it enabled."
 
 ;;;###autoload
 (defun ebb ()
-  "Start a terminal."
+  "Start a terminal.
+When `default-directory' is a remote TRAMP path (e.g. /ssh:host:/path/),
+opens an SSH session to the remote host instead of a local shell."
   (interactive)
   (let* ((buf (generate-new-buffer "*ebb*")))
     (with-current-buffer buf
@@ -581,9 +583,6 @@ Uses bracketed paste if the terminal has it enabled."
       (let ((rows (max 1 (window-body-height)))
             (cols (max 1 (window-body-width))))
         (setq ebb--terminal (ebb--new rows cols ebb-max-scrollback))
-        ;; Start shell process.
-        ;; Like eat, wrap the command with `stty sane` to initialize PTY
-        ;; settings (erase=^?, echo, etc.) before launching the shell.
         (let ((process-environment
                (append
                 (list (concat "TERM=" ebb-term-environment-variable)
@@ -595,17 +594,64 @@ Uses bracketed paste if the terminal has it enabled."
                 (make-process
                  :name "ebb"
                  :buffer buf
-                 :command `("/usr/bin/env" "sh" "-c"
-                            ,(format "stty -nl echo rows %d columns %d sane 2>/dev/null; exec \"$@\""
-                                     rows cols)
-                            "--"
-                            ,ebb-shell-name "-l")
+                 :command (ebb--build-shell-command rows cols)
                  :filter #'ebb--process-filter
                  :sentinel #'ebb--process-sentinel
                  :connection-type 'pty)))
         ;; Enter semi-char mode by default
         (ebb-semi-char-mode 1)))
     (pop-to-buffer-same-window buf)))
+
+(defun ebb--build-shell-command (rows cols)
+  "Build the command list to start a shell.
+For local directories, starts `ebb-shell-name' with stty initialisation.
+For remote TRAMP directories (ssh/sshx/scp), starts a local ssh process
+connecting to the remote host."
+  (let ((remote (file-remote-p default-directory)))
+    (if (not remote)
+        ;; Local shell
+        `("/usr/bin/env" "sh" "-c"
+          ,(format "stty -nl echo rows %d columns %d sane 2>/dev/null; exec \"$@\""
+                   rows cols)
+          "--" ,ebb-shell-name "-l")
+      ;; Remote: start a local ssh command to the remote host.
+      ;; TRAMP's make-process with :file-handler doesn't provide a proper
+      ;; PTY, so terminal emulators must use a local ssh client instead.
+      (require 'tramp)
+      (let* ((dissected (tramp-dissect-file-name default-directory))
+             (method (tramp-file-name-method dissected))
+             (user (tramp-file-name-user dissected))
+             (host (tramp-file-name-host dissected))
+             (port (tramp-file-name-port dissected))
+             (localname (tramp-file-name-localname dissected)))
+        (if (member method '("sudo" "su" "doas"))
+            ;; Local privilege escalation: open a local shell.
+            `("/usr/bin/env" "sh" "-c"
+              ,(format "stty -nl echo rows %d columns %d sane 2>/dev/null; exec \"$@\""
+                       rows cols)
+              "--" ,ebb-shell-name "-l")
+          ;; Any other remote method with a host: connect via SSH.
+          ;; This covers ssh, sshx, scp, rsync, and custom methods
+          ;; like tramp-rpc that ultimately reach the host over SSH.
+          ;; Wrap with stty to set PTY dimensions so the SSH client
+          ;; negotiates the correct terminal size with the remote.
+          (let ((ssh-args (list "-t")))
+            (when port
+              (push "-p" ssh-args)
+              (push (if (numberp port) (number-to-string port) port)
+                    ssh-args))
+            (push (if user (format "%s@%s" user host) host) ssh-args)
+            (when (and localname
+                       (not (string= localname "/"))
+                       (not (string= localname "")))
+              (setq ssh-args
+                    (append ssh-args
+                            (list (format "cd %s && exec $SHELL -l"
+                                          (shell-quote-argument localname))))))
+            `("/usr/bin/env" "sh" "-c"
+              ,(format "stty rows %d columns %d sane 2>/dev/null; exec \"$@\""
+                       rows cols)
+              "--" "ssh" ,@ssh-args)))))))
 
 ;;; --- Public API ---
 
