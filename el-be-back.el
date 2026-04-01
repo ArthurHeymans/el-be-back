@@ -387,10 +387,10 @@ The Rust render function erases the buffer and re-renders all visible rows."
 
 (defconst ebb--simple-key-bytes
   '(("return"    . "\r")
-    ("backspace" . "\x08")
+    ("backspace" . "\x7f")
     ("tab"       . "\t")
     ("escape"    . "\x1b")
-    ("DEL"       . "\x08")
+    ("DEL"       . "\x7f")
     ("delete"    . "\x1b[3~")
     ("deletechar" . "\x1b[3~")
     ("RET"       . "\r")
@@ -546,24 +546,28 @@ Uses bracketed paste if the terminal has it enabled."
       (let ((rows (max 1 (window-body-height)))
             (cols (max 1 (window-body-width))))
         (setq ebb--terminal (ebb--new rows cols ebb-max-scrollback))
-        ;; Start shell process
+        ;; Start shell process.
+        ;; Like eat, wrap the command with `stty sane` to initialize PTY
+        ;; settings (erase=^?, echo, etc.) before launching the shell.
         (let ((process-environment
                (append
                 (list (concat "TERM=" ebb-term-environment-variable)
                       "COLORTERM=truecolor"
                       (format "INSIDE_EMACS=%s,ebb" emacs-version))
-                process-environment)))
+                process-environment))
+              (inhibit-eol-conversion t))
           (setq ebb--process
                 (make-process
                  :name "ebb"
                  :buffer buf
-                 :command (list ebb-shell-name "-l")
-                 :coding 'binary
+                 :command `("/usr/bin/env" "sh" "-c"
+                            ,(format "stty -nl echo rows %d columns %d sane 2>/dev/null; exec \"$@\""
+                                     rows cols)
+                            "--"
+                            ,ebb-shell-name "-l")
                  :filter #'ebb--process-filter
                  :sentinel #'ebb--process-sentinel
                  :connection-type 'pty)))
-        ;; Set initial PTY size
-        (set-process-window-size ebb--process rows cols)
         ;; Enter semi-char mode by default
         (ebb-semi-char-mode 1)))
     (pop-to-buffer-same-window buf)))
