@@ -1,5 +1,5 @@
 use emacs::Result;
-use termwiz::input::{KeyCode, KeyCodeEncodeModes, KeyboardEncoding, Modifiers};
+use termwiz::input::{KeyCode, KeyCodeEncodeModes, Modifiers};
 
 use crate::EbbTerminal;
 

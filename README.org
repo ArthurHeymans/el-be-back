@@ -1,0 +1,109 @@
+#+TITLE: el-be-back
+#+AUTHOR: Arthur
+
+A terminal emulator for Emacs built on [[https://github.com/wez/wezterm][wezterm]]'s terminal emulation
+engine, exposed as a Rust dynamic module.
+
+* Overview
+
+el-be-back (ebb) wraps =wezterm-term= -- the same VT state machine that
+powers the WezTerm terminal emulator -- as an Emacs dynamic module.
+Terminal state lives in Rust; rendering and input routing happen in
+Elisp.
+
+The goal is maximum terminal compatibility (programs that work in
+Alacritty/Kitty/WezTerm should work identically here) combined with
+deep Emacs integration (searchable scrollback, navigable prompts,
+clickable hyperlinks, copy mode).
+
+* Features
+
+- *Full VT terminal emulation* via wezterm-term (cursor, SGR, scroll
+  regions, alternate screen, text reflow on resize)
+- *True color* and 256-color palette support
+- *OSC 8 hyperlinks* -- clickable links with mouse-face highlighting
+- *Kitty keyboard protocol* and *kitty graphics protocol* (enabled in
+  terminal configuration)
+- *Incremental rendering* -- only dirty rows are redrawn; pre-interned
+  symbols eliminate FFI overhead
+- *Latency-bounded output batching* (8ms min / 33ms max) with
+  aggressive PTY drain for maximum throughput
+- *Scrollback* with configurable limit, searchable with =C-s=
+- *Copy mode* -- pause terminal, navigate with standard Emacs keys
+- *TRAMP integration* -- =M-x ebb= on a remote directory opens an SSH
+  session with automatic directory tracking
+- *Semi-char mode* -- most keys forwarded to terminal, Emacs prefix
+  keys preserved (=C-x=, =C-c=, =C-g=, =C-h=, =M-x=)
+
+* Requirements
+
+- Emacs 29.1+ with dynamic module support
+- Rust toolchain (nightly, for building the module)
+- A C compiler (for the =emacs= crate's bindings)
+
+* Installation
+
+#+begin_src sh
+git clone <repo-url> el_be_back
+cd el_be_back
+./build.sh
+#+end_src
+
+Or with Nix:
+
+#+begin_src sh
+nix develop    # enters a shell with the Rust toolchain
+./build.sh
+#+end_src
+
+Then in Emacs:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/el_be_back")
+(require 'el-be-back)
+#+end_src
+
+The module auto-compiles on first load if =ebb-always-compile-module= is
+non-nil (the default).
+
+* Usage
+
+- =M-x ebb= -- start a terminal (local shell, or SSH if
+  =default-directory= is a TRAMP remote path)
+- =C-c C-j= -- enter semi-char mode (most keys forwarded to terminal)
+- =C-c C-k= -- enter copy mode (pause terminal, Emacs navigation)
+- =q= or =C-c C-c= -- exit copy mode
+- =C-c C-c= (in semi-char mode) -- send =C-c= to the terminal
+- =C-y= -- yank from kill ring (bracketed paste if supported)
+
+* Configuration
+
+#+begin_src emacs-lisp
+(setq ebb-shell-name "/bin/zsh")              ; default: $SHELL
+(setq ebb-term-environment-variable "xterm-256color") ; TERM value
+(setq ebb-max-scrollback 10000)               ; scrollback line limit
+(setq ebb-minimum-latency 0.008)              ; min redraw interval (s)
+(setq ebb-maximum-latency 0.033)              ; max redraw interval (s)
+#+end_src
+
+* How it works
+
+See [[file:DESIGN.md][DESIGN.md]] for the full architecture, data flow, and API
+documentation.
+
+The short version: Emacs owns the PTY via =make-process=. The process
+filter queues output chunks; a timer feeds them to the Rust module which
+runs wezterm-term's VT parser and state machine. The Rust render
+function directly manipulates the Emacs buffer via FFI (=insert=,
+=delete-region=, =propertize=) with pre-interned symbols. Key input is
+encoded synchronously in Rust and sent to the PTY.
+
+* Prior art
+
+- [[https://github.com/akermu/emacs-libvterm][emacs-libvterm (vterm)]] -- C dynamic module wrapping libvterm
+- [[https://codeberg.org/akib/emacs-eat][emacs-eat (eat)]] -- pure Elisp terminal emulator
+- [[https://github.com/nicholascc/emacs-libgterm][emacs-libgterm (gterm)]] -- Zig dynamic module wrapping ghostty-vt
+
+* License
+
+GPLv3. See [[file:LICENSE][LICENSE]].

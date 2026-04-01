@@ -13,6 +13,8 @@ use config::{AlertQueue, EbbAlertSink, EbbConfig};
 
 emacs::plugin_is_GPL_compatible!();
 
+const VERSION: &str = "0.1.0";
+
 #[emacs::module(name = "ebb-module", defun_prefix = "ebb", separator = "--")]
 fn init(env: &Env) -> Result<()> {
     render::init_syms(env)?;
@@ -46,7 +48,7 @@ impl io::Write for CapturingWriter {
 // EbbTerminal: wraps wezterm-term::Terminal and associated state.
 // ---------------------------------------------------------------------------
 
-pub struct EbbTerminal {
+pub(crate) struct EbbTerminal {
     terminal: Terminal,
     output: Arc<Mutex<Vec<u8>>>,
     alerts: Arc<Mutex<AlertQueue>>,
@@ -89,7 +91,7 @@ impl EbbTerminal {
             dpi: 0,
         };
 
-        let mut terminal = Terminal::new(size, config, "el-be-back", "0.1.0", Box::new(writer));
+        let mut terminal = Terminal::new(size, config, "el-be-back", VERSION, Box::new(writer));
 
         let alert_sink = EbbAlertSink {
             queue: Arc::clone(&alerts),
@@ -470,5 +472,5 @@ fn poll_bell(term: &EbbTerminal) -> Result<bool> {
 /// Return the el-be-back version string.
 #[defun]
 fn version(_env: &Env) -> Result<&'static str> {
-    Ok("0.1.0")
+    Ok(VERSION)
 }

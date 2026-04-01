@@ -4,4 +4,8 @@
 *.elc
 /.direnv/
 /result
-!.envrc
+
+# Emacs temporaries
+*~
+\#*\#
+.\#*

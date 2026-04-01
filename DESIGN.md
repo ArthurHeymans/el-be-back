@@ -142,13 +142,15 @@ Emacs `make-process` strips carriage returns from PTY output by default.
 Real terminals expect `\r\n` for newlines; stripping `\r` breaks cursor
 positioning.
 
-Solution: set the process coding system to binary:
+Solution: bind `inhibit-eol-conversion` to `t` around `make-process`:
 ```elisp
-(set-process-coding-system proc 'binary 'binary)
+(let ((inhibit-eol-conversion t))
+  (make-process ...))
 ```
 
-This preserves raw bytes. The VT parser in wezterm-term handles `\r` and
-`\n` correctly.
+This preserves `\r` in PTY output without switching to full binary coding
+(which caused issues with multibyte character handling in practice). The
+VT parser in wezterm-term handles `\r` and `\n` correctly.
 
 ## Data Flow
 
@@ -156,27 +158,29 @@ This preserves raw bytes. The VT parser in wezterm-term handles `\r` and
 
 ```
 1. Shell writes to PTY
-2. Emacs process filter receives bytes (binary coding)
+2. Emacs process filter receives bytes (inhibit-eol-conversion preserves CR)
 3. Elisp pushes bytes onto ebb--pending-chunks
 4. Elisp schedules render timer (8ms min, 33ms max since first chunk)
-5. Timer fires:
-   a. Feed all queued chunks to Rust: ebb--feed(term, bytes)
+5. Timer fires (ebb--flush-output):
+   a. Concat and feed all queued chunks to Rust: ebb--feed(term, bytes)
    b. Rust calls terminal.advance_bytes(bytes)
       - VT parser decodes escape sequences
       - State machine updates screen (cursor, cells, attributes)
       - Terminal may generate response bytes (DA, DECRQM, etc.)
         -> written to CapturingWriter via ThreadedWriter
-   c. Rust marks terminal dirty (seqno incremented)
-   d. Elisp calls ebb--render(term) in Rust
-      - Rust queries screen.get_changed_stable_rows(range, last_seqno)
-      - For each dirty row: iterate cells, accumulate style runs
-      - Directly manipulate Emacs buffer via FFI:
-        goto-char, delete-region, insert, put-text-property
-      - Return cursor position
+   c. Aggressive drain loop: call accept-process-output repeatedly
+      to pull all immediately available PTY data before rendering.
+      Each call triggers the process filter which queues more chunks.
+      Loop continues until no more data or ebb-maximum-latency elapsed.
+      This ensures one render covers the maximum amount of output.
+   d. Elisp calls ebb--render(term) in Rust (within performance trinity)
+      - Rust handles scrollback promotion, dirty-row detection,
+        incremental or full redraw, and cursor positioning
+      - See Rendering section for details
    e. Elisp calls ebb--drain-output(term)
       - Drains CapturingWriter buffer
       - Sends bytes to PTY via process-send-string (responses)
-   f. Elisp positions cursor and syncs scroll
+   f. Elisp processes alerts (title, CWD, bell) via poll functions
 ```
 
 ### Input path (user -> shell)
@@ -184,15 +188,20 @@ This preserves raw bytes. The VT parser in wezterm-term handles `\r` and
 ```
 1. User presses key in Emacs
 2. Keymap routes to ebb-self-input
-3. Elisp calls ebb--key-down(term, key-name, shift, ctrl, meta)
-4. Rust translates to termwiz KeyCode + Modifiers
-5. Rust calls terminal.key_down(keycode, mods)
-   - Terminal reads its mode state (DECCKM, keyboard encoding, etc.)
-   - Calls KeyCode::encode() with the correct modes
-   - Writes encoded bytes to internal writer -> CapturingWriter
-6. Elisp calls ebb--drain-output(term)
-7. Elisp sends bytes to PTY via process-send-string
+3. Elisp extracts event modifiers and basic type
+4. Elisp calls ebb--send-key which tries a fallback chain:
+   a. ebb--encode-key(term, key-name, shift, ctrl, meta)
+      - Rust translates to termwiz KeyCode + Modifiers
+      - Calls KeyCode::encode() synchronously (bypasses ThreadedWriter)
+      - Returns encoded escape sequence string
+   b. Fallback: simple key byte table (ebb--simple-key-bytes alist)
+   c. Fallback: ctrl+letter -> control character (C-a = 0x01, etc.)
+   d. Fallback: plain character
+5. Elisp sends encoded bytes to PTY via process-send-string
 ```
+
+The synchronous encoding path avoids the latency of routing through the
+ThreadedWriter's mpsc channel. Key input goes directly to the PTY.
 
 ## Rust Module API
 
@@ -227,19 +236,16 @@ Drain the CapturingWriter buffer. Returns captured bytes as a unibyte
 string, or nil if empty. Elisp sends these to the PTY.
 
 ```
-ebb--key-down (term key-name shift ctrl meta) -> nil
+ebb--encode-key (term key-name shift ctrl meta) -> string-or-nil
 ```
-Send a key press. `key-name` is a string like `"a"`, `"return"`, `"up"`,
-`"f1"`. Modifier booleans indicate shift/ctrl/meta state. Calls
-`terminal.key_down()` which encodes using the terminal's current keyboard
-mode and writes to the CapturingWriter.
+Encode a key press and return the bytes to send to the PTY. This is
+synchronous -- bypasses the async ThreadedWriter by calling
+`KeyCode::encode()` directly. `key-name` is a string like `"a"`,
+`"return"`, `"up"`, `"f1"`. Modifier args are integers (truthy) or nil.
+Returns the encoded escape sequence, or nil if the key is unknown.
 
-```
-ebb--mouse-event (term x y button mods is-press) -> nil
-```
-Send a mouse event. `x` and `y` are 0-based cell coordinates. `button`
-is an integer (1=left, 2=middle, 3=right, 4=wheel-up, 5=wheel-down).
-`mods` is a bitfield. `is-press` distinguishes press from release.
+Elisp wraps this with a fallback chain: Rust encoder -> simple key byte
+table -> ctrl+letter encoding -> plain character.
 
 ```
 ebb--send-paste (term text) -> nil
@@ -250,11 +256,12 @@ Send text as a paste. If bracketed paste mode is enabled, wraps in
 ### Rendering
 
 ```
-ebb--render (term) -> (row . col)
+ebb--render (term) -> nil
 ```
-Render dirty rows into the current Emacs buffer. Directly manipulates
-the buffer via FFI (insert, delete-region, put-text-property). Returns
-the cursor position as (row . col) for Elisp to position point.
+Render dirty rows into the current Emacs buffer and position the cursor.
+Directly manipulates the buffer via FFI (insert, delete-region,
+propertize, goto-char). Manages scrollback promotion and cursor
+positioning internally.
 
 This function is called from Elisp within the performance trinity:
 ```elisp
@@ -266,56 +273,86 @@ This function is called from Elisp within the performance trinity:
 ```
 
 The Rust implementation:
-1. Calls `screen.get_changed_stable_rows(visible_range, last_seqno)`
-2. For each dirty row:
-   a. Navigate to the row position in the buffer
-   b. Delete the old line content
-   c. Iterate cells: `screen.line_mut(phys_row).cells()`
-   d. Accumulate style runs (consecutive cells with same CellAttributes)
-   e. For each run: call `(insert text)` then `(put-text-property ...)`
-      with a face plist built from the CellAttributes
-3. Handle line wrapping: cells with `wrapped()` attribute get a newline
-   with `ebb-wrap-line` text property
-4. Update internal `last_seqno`
-5. Return cursor position
+1. On first render or resize: erase buffer and do a full redraw
+   (scrollback as plain text, display rows with full styling)
+2. On incremental render:
+   a. Detect new scrollback lines by comparing `first_visible_stable_row`
+   b. If lines scrolled: promote old display lines to scrollback,
+      append new bottom lines (scroll optimisation avoids full redraw)
+   c. For in-place changes: call `screen.get_changed_stable_rows()`
+   d. If fewer than half the rows are dirty: update only those rows
+   e. Otherwise: erase and redraw the entire display region
+3. For each dirty row:
+   a. Collect styled runs (consecutive cells with same CellAttributes)
+   b. Build face plists from pre-interned symbols (no string formatting)
+   c. Use `(propertize text 'face plist ...)` for styled runs
+   d. Single `(insert ...)` call per line for all runs
+   e. OSC 8 hyperlinks get `ebb-url`, `help-echo`, `mouse-face`, and
+      `keymap` text properties
+4. Trim scrollback if over `max_scrollback` limit
+5. Position cursor in the display region
+6. Update internal `last_seqno`, `last_rows`, `last_first_vis_stable`
 
 ### State Queries
 
 ```
-ebb--cursor-info (term) -> (row col shape visible)
+ebb--cursor-row (term) -> integer
 ```
-Get cursor state. `shape` is a symbol: `box`, `bar`, `underline`,
-`hollow`. `visible` is t or nil.
+Get the cursor row (0-based).
 
 ```
-ebb--get-title (term) -> string
+ebb--cursor-col (term) -> integer
 ```
-Get the terminal title (set by OSC 2).
+Get the cursor column (0-based).
+
+```
+ebb--get-title (term) -> string-or-nil
+```
+Get the terminal title (set by OSC 2), or nil if empty.
 
 ```
 ebb--get-cwd (term) -> string-or-nil
 ```
-Get the current working directory (set by OSC 7).
+Get the current working directory (set by OSC 7), or nil.
 
 ```
-ebb--get-size (term) -> (rows . cols)
+ebb--get-rows (term) -> integer
+ebb--get-cols (term) -> integer
 ```
 Get the current terminal dimensions.
 
 ```
-ebb--is-alt-screen-p (term) -> bool
+ebb--is-alt-screen (term) -> bool
 ```
 Check if the alternate screen buffer is active.
 
 ```
-ebb--is-mouse-grabbed-p (term) -> bool
+ebb--is-mouse-grabbed (term) -> bool
 ```
 Check if the terminal has grabbed the mouse (any mouse tracking mode).
 
 ```
-ebb--bracketed-paste-p (term) -> bool
+ebb--bracketed-paste-enabled (term) -> bool
 ```
 Check if bracketed paste mode is enabled.
+
+### Alerts (poll-based)
+
+```
+ebb--poll-title (term) -> string-or-nil
+```
+Return and clear a pending title change, or nil.
+
+```
+ebb--poll-cwd (term) -> string-or-nil
+```
+Return and clear a pending CWD change, or nil. Reads the URL from
+the terminal when the `cwd_changed` flag is set.
+
+```
+ebb--poll-bell (term) -> bool
+```
+Check for and clear the bell flag.
 
 ### Control
 
@@ -325,15 +362,14 @@ ebb--resize (term rows cols) -> nil
 Resize the terminal. wezterm-term handles text reflow automatically.
 
 ```
-ebb--scrollback-count (term) -> integer
+ebb--content (term) -> string
 ```
-Number of scrollback lines above the visible screen.
+Return the visible screen content as plain text (debug/testing).
 
 ```
-ebb--get-scrollback-line (term index) -> string
+ebb--version () -> string
 ```
-Get a scrollback line as a propertized string. Used when syncing
-scrollback to the Emacs buffer.
+Return the el-be-back version string.
 
 ## Rust Internal Design
 
@@ -342,12 +378,21 @@ scrollback to the Emacs buffer.
 ```rust
 use std::sync::{Arc, Mutex};
 use wezterm_term::{Terminal, TerminalSize};
+use wezterm_surface::SequenceNo;
 
-struct EbbTerminal {
+pub(crate) struct EbbTerminal {
     terminal: Terminal,
-    output: Arc<Mutex<Vec<u8>>>,  // shared with CapturingWriter
-    last_seqno: SequenceNo,
+    output: Arc<Mutex<Vec<u8>>>,       // shared with CapturingWriter
     alerts: Arc<Mutex<AlertQueue>>,
+    last_seqno: SequenceNo,
+    last_rows: usize,
+    /// StableRowIndex of the first visible line at last render.
+    /// Used to detect how many new lines scrolled into scrollback.
+    last_first_vis_stable: isize,
+    /// Number of scrollback lines currently in the Emacs buffer.
+    scrollback_in_buffer: usize,
+    /// Maximum scrollback lines to keep in the buffer.
+    max_scrollback: usize,
     freed: bool,
 }
 ```
@@ -401,10 +446,11 @@ impl TerminalConfiguration for EbbConfig {
 ### EbbAlertSink (AlertHandler)
 
 ```rust
+#[derive(Debug, Default)]
 struct AlertQueue {
     title: Option<String>,
-    cwd: Option<Url>,
     bell: bool,
+    cwd_changed: bool,
 }
 
 struct EbbAlertSink {
@@ -413,16 +459,21 @@ struct EbbAlertSink {
 
 impl AlertHandler for EbbAlertSink {
     fn alert(&mut self, alert: Alert) {
-        let mut q = self.queue.lock().unwrap();
-        match alert {
-            Alert::WindowTitleChanged(t) => q.title = Some(t),
-            Alert::CurrentWorkingDirectoryChanged => { /* read from terminal */ }
-            Alert::Bell => q.bell = true,
-            _ => {}
+        if let Ok(mut q) = self.queue.lock() {
+            match alert {
+                Alert::WindowTitleChanged(t) => q.title = Some(t),
+                Alert::CurrentWorkingDirectoryChanged => q.cwd_changed = true,
+                Alert::Bell => q.bell = true,
+                _ => {}
+            }
         }
     }
 }
 ```
+
+The `if let Ok(...)` pattern silently swallows poisoned mutexes, which
+is more robust than `unwrap()` in a dynamic module (avoids panicking
+into C/Emacs).
 
 ### Face Construction
 
@@ -467,38 +518,25 @@ Performance optimization: pre-intern all keyword symbols (`:foreground`,
 `:background`, `:weight`, etc.) as `GlobalRef` values at module init time.
 This avoids repeated `env.intern()` calls during rendering.
 
-### Key Translation
+### Key Encoding
 
-Mapping Emacs key name strings to termwiz `KeyCode`:
+Key input is encoded synchronously via `ebb--encode-key`, bypassing
+the ThreadedWriter entirely. The Rust function calls
+`KeyCode::encode()` directly and returns the escape sequence as a
+string for Elisp to send to the PTY.
 
-```rust
-fn translate_key(name: &str) -> Option<KeyCode> {
-    match name {
-        "return" => Some(KeyCode::Enter),
-        "backspace" => Some(KeyCode::Backspace),
-        "tab" => Some(KeyCode::Tab),
-        "escape" => Some(KeyCode::Escape),
-        "up" => Some(KeyCode::UpArrow),
-        "down" => Some(KeyCode::DownArrow),
-        "left" => Some(KeyCode::LeftArrow),
-        "right" => Some(KeyCode::RightArrow),
-        "home" => Some(KeyCode::Home),
-        "end" => Some(KeyCode::End),
-        "prior" => Some(KeyCode::PageUp),    // Emacs name for PageUp
-        "next" => Some(KeyCode::PageDown),   // Emacs name for PageDown
-        "insert" => Some(KeyCode::Insert),
-        "delete" => Some(KeyCode::Delete),
-        "f1" ..= "f12" => {
-            let n: u8 = name[1..].parse().ok()?;
-            Some(KeyCode::Function(n))
-        }
-        s if s.len() == 1 => {
-            Some(KeyCode::Char(s.chars().next()?))
-        }
-        _ => None,
-    }
-}
-```
+Known limitation: `application_cursor_keys` is hardcoded to `false`
+because the terminal's DECCKM state is not exposed through the public
+wezterm-term API. Programs that enable DECCKM (vim, less, tmux) may
+receive incorrect cursor key sequences. A future fix would read the
+mode from internal terminal state or use `key_down()` through the
+writer.
+
+Elisp wraps the Rust encoder in a fallback chain (`ebb--send-key`):
+1. Rust `ebb--encode-key` (handles CSI sequences, function keys, etc.)
+2. `ebb--simple-key-bytes` alist (return, backspace, tab, escape, etc.)
+3. Ctrl+letter -> control character (C-a = 0x01, C-z = 0x1a)
+4. Plain character passthrough
 
 ## Elisp Layer Design
 
@@ -580,32 +618,43 @@ Copied from eat's battle-tested approach:
                  (current-buffer))))))))
 
 (defun ebb--flush-output ()
-  "Process all pending output and render."
+  "Process all pending output chunks and render.
+Drains as much immediately available PTY data as possible before
+rendering, so that a single render covers the maximum amount of
+output.  This prevents render overhead from throttling throughput."
   (when ebb--render-timer
     (cancel-timer ebb--render-timer)
     (setq ebb--render-timer nil))
-  (let ((chunks (nreverse ebb--pending-chunks)))
-    (setq ebb--pending-chunks nil
-          ebb--first-chunk-time nil)
-    ;; Feed all chunks to the terminal
-    (dolist (chunk chunks)
-      (ebb--feed ebb--terminal chunk))
-    ;; Render with the performance trinity
+  (when (and ebb--terminal ebb--pending-chunks)
+    ;; Feed current pending chunks.
+    (let ((chunks (nreverse ebb--pending-chunks)))
+      (setq ebb--pending-chunks nil
+            ebb--first-chunk-time nil)
+      (ebb--feed ebb--terminal (apply #'concat chunks)))
+    ;; Drain any immediately available additional data before rendering.
+    (let ((deadline (+ (float-time) ebb-maximum-latency)))
+      (while (and ebb--process
+                  (process-live-p ebb--process)
+                  (< (float-time) deadline)
+                  (accept-process-output ebb--process 0 nil t)
+                  ebb--pending-chunks)
+        (when ebb--render-timer
+          (cancel-timer ebb--render-timer)
+          (setq ebb--render-timer nil))
+        (let ((chunks (nreverse ebb--pending-chunks)))
+          (setq ebb--pending-chunks nil
+                ebb--first-chunk-time nil)
+          (ebb--feed ebb--terminal (apply #'concat chunks)))))
+    ;; Render the final screen state once.
     (let ((inhibit-read-only t)
           (inhibit-modification-hooks t)
           (inhibit-quit t)
           (buffer-undo-list t))
-      (save-restriction
-        (widen)
-        (let ((cursor-pos (ebb--render ebb--terminal)))
-          ;; Position cursor
-          (ebb--sync-cursor cursor-pos)
-          ;; Sync scroll
-          (ebb--sync-scroll))))
+      (ebb--render-screen))
     ;; Drain terminal responses and send to PTY
-    (let ((response (ebb--drain-output ebb--terminal)))
-      (when response
-        (process-send-string ebb--process response)))))
+    (ebb--drain-and-send)
+    ;; Process title/CWD/bell alerts
+    (ebb--process-alerts)))
 ```
 
 ### Process Management
@@ -626,36 +675,35 @@ Copied from eat's battle-tested approach:
   :type 'integer :group 'el-be-back)
 
 (defun ebb ()
-  "Start a terminal."
+  "Start a terminal.
+When `default-directory' is a remote TRAMP path (e.g. /ssh:host:/path/),
+opens an SSH session to the remote host instead of a local shell."
   (interactive)
-  (let* ((buf (generate-new-buffer "*ebb*"))
-         (rows (window-body-height))
-         (cols (window-body-width)))
+  (let* ((buf (generate-new-buffer "*ebb*")))
     (with-current-buffer buf
       (ebb-mode)
-      ;; Create terminal
-      (setq ebb--terminal (ebb--new rows cols ebb-max-scrollback))
-      ;; Initialize buffer with blank lines
-      (ebb--init-buffer rows cols)
-      ;; Start shell process
-      (let ((process-environment
-             (append
-              (list (concat "TERM=" ebb-term-environment-variable)
-                    "COLORTERM=truecolor"
-                    (concat "INSIDE_EMACS=" emacs-version ",ebb"))
-              process-environment)))
-        (setq ebb--process
-              (make-process
-               :name "ebb"
-               :buffer buf
-               :command (list ebb-shell-name "-l")
-               :coding 'binary
-               :filter #'ebb--process-filter
-               :sentinel #'ebb--process-sentinel
-               :connection-type 'pty)))
-      ;; Enter semi-char mode by default
-      (ebb-semi-char-mode 1))
-    (pop-to-buffer buf)))
+      (let ((rows (max 1 (window-body-height)))
+            (cols (max 1 (window-body-width))))
+        (setq ebb--terminal (ebb--new rows cols ebb-max-scrollback))
+        ;; Remember TRAMP prefix for remote CWD tracking.
+        (setq ebb--remote-prefix (file-remote-p default-directory))
+        (let ((process-environment
+               (append
+                (list (concat "TERM=" ebb-term-environment-variable)
+                      "COLORTERM=truecolor"
+                      (format "INSIDE_EMACS=%s,ebb" emacs-version))
+                process-environment))
+              (inhibit-eol-conversion t))
+          (setq ebb--process
+                (make-process
+                 :name "ebb"
+                 :buffer buf
+                 :command (ebb--build-shell-command rows cols)
+                 :filter #'ebb--process-filter
+                 :sentinel #'ebb--process-sentinel
+                 :connection-type 'pty)))
+        (ebb-semi-char-mode 1)))
+    (pop-to-buffer-same-window buf)))
 ```
 
 ### Resize Handling
@@ -686,16 +734,20 @@ Copied from eat's battle-tested approach:
 ```
 el_be_back/
 +-- Cargo.toml                  # Rust cdylib crate
++-- Cargo.lock                  # Pinned dependency versions
 +-- src/
 |   +-- lib.rs                  # Module init, EbbTerminal, defuns
 |   +-- render.rs               # Dirty row rendering, face construction
-|   +-- input.rs                # Key/mouse translation
+|   +-- input.rs                # Key translation (synchronous encoding)
 |   +-- config.rs               # TerminalConfiguration, AlertHandler
 +-- el-be-back.el               # Elisp layer
 +-- build.sh                    # Build script
++-- flake.nix                   # Nix flake for reproducible toolchain
++-- flake.lock                  # Nix flake lock
++-- .envrc                      # direnv integration (loads flake)
 +-- DESIGN.md                   # This file
-+-- test/
-    +-- el-be-back-tests.el     # ERT tests
++-- LICENSE                     # GPLv3
++-- README.org                  # Project readme
 ```
 
 ## Implementation Phases
@@ -864,7 +916,25 @@ OSC 52 Clipboard:
 
 ### Phase 7: Emacs Integration
 
-Shell Integration:
+TRAMP Support (implemented):
+- When `default-directory` is a remote TRAMP path, `ebb` starts a
+  local SSH client connecting to the remote host
+- Supports ssh, sshx, scp, rsync methods; falls back to local shell
+  for sudo/su/doas
+- Injects PROMPT_COMMAND for dynamic directory tracking via OSC 7
+- CWD changes on remote hosts are resolved to TRAMP paths
+  (e.g. `file://remotehost/tmp` -> `/sshx:remotehost:/tmp`)
+- Configurable TRAMP method via `ebb-tramp-method`
+
+Copy Mode (implemented):
+- `C-c C-k` enters copy mode:
+  - Pauses terminal output (queued but not fed/rendered)
+  - Buffer becomes navigable with standard Emacs keys
+  - isearch, mark, region, M-w all work
+- `q` or `C-c C-c` exits: re-enables semi-char mode, flushes
+  any output that arrived while paused
+
+Shell Integration (planned):
 - Support OSC 133 (semantic zones from wezterm-term):
   - Prompt start/end markers as text properties
   - Command output boundaries
@@ -872,19 +942,12 @@ Shell Integration:
 - Prompt navigation: M-p / M-n jump between prompts
 - Command output narrowing
 
-Copy Mode:
-- C-c C-c enters copy mode:
-  - Pause terminal (queue but don't feed)
-  - Buffer becomes normal read-only Emacs buffer
-  - isearch, mark, region, M-w all work
-- C-c C-c exits: resume terminal, restore cursor
-
-Line Mode:
+Line Mode (planned):
 - Comint-like line editing
 - Standard Emacs editing + history ring
 - Send on RET
 
-Eshell Integration:
+Eshell Integration (planned):
 - ebb-eshell-mode: use ebb for terminal-capable Eshell programs
 - Advise eshell-gather-process-output
 

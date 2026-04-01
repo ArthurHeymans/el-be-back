@@ -220,12 +220,6 @@ search, and copying."
 
 ;;; --- Major mode ---
 
-(defcustom ebb-max-scrollback-lines 10000
-  "Maximum number of scrollback lines to keep in the buffer.
-Lines beyond this limit are deleted from the top of the buffer."
-  :type 'integer
-  :group 'el-be-back)
-
 (define-derived-mode ebb-mode fundamental-mode "EBB"
   "Major mode for el-be-back terminal emulator."
   (buffer-disable-undo)
