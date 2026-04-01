@@ -458,14 +458,16 @@ When the process exits, kill the buffer."
 (defun ebb--send-key (key-name &optional shift ctrl meta)
   "Send KEY-NAME to the terminal via wezterm key encoding.
 KEY-NAME is a string like \"a\", \"return\", \"up\", etc.
-Encodes synchronously and sends directly to PTY."
+Uses terminal.key_down() which reads all internal mode state
+\(DECCKM, newline mode, keyboard encoding) for correct output."
   (when (and ebb--terminal ebb--process (process-live-p ebb--process))
     (let ((encoded (or
-                    ;; Try Rust encoder first (handles CSI sequences, function keys, etc.)
-                    (let ((result (ebb--encode-key ebb--terminal key-name
-                                                  (if shift 1 nil)
-                                                  (if ctrl 1 nil)
-                                                  (if meta 1 nil))))
+                    ;; Primary: terminal.key_down() -- reads DECCKM,
+                    ;; newline mode, etc. from internal terminal state.
+                    (let ((result (ebb--key-down ebb--terminal key-name
+                                                (if shift 1 nil)
+                                                (if ctrl 1 nil)
+                                                (if meta 1 nil))))
                       (and result (not (string-empty-p result)) result))
                     ;; Fallback: simple key byte table
                     (let ((entry (assoc key-name ebb--simple-key-bytes)))

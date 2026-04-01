@@ -1,5 +1,5 @@
 use emacs::Result;
-use termwiz::input::{KeyCode, KeyCodeEncodeModes, Modifiers};
+use termwiz::input::{KeyCode, Modifiers};
 
 use crate::EbbTerminal;
 
@@ -53,13 +53,18 @@ fn build_modifiers(shift: bool, ctrl: bool, meta: bool) -> Modifiers {
     mods
 }
 
-/// Encode a key press and return the bytes to send to the PTY.
+/// Send a key press through the terminal's key_down() method, which
+/// correctly reads all internal mode state (DECCKM, newline mode,
+/// modify_other_keys, keyboard encoding) and writes the encoded bytes
+/// to the terminal's writer (our CapturingWriter via ThreadedWriter).
 ///
-/// This bypasses the terminal's async ThreadedWriter by encoding the key
-/// directly using KeyCode::encode(). The bytes are returned synchronously
-/// so Elisp can send them to the PTY immediately via process-send-string.
-pub fn encode_key(
-    term: &EbbTerminal,
+/// After key_down(), we briefly yield to let the ThreadedWriter's
+/// background thread deliver the bytes to our CapturingWriter, then
+/// drain and return them.  The channel latency is microseconds.
+///
+/// Returns the encoded bytes as a string, or nil if the key is unknown.
+pub fn key_down(
+    term: &mut EbbTerminal,
     key_name: &str,
     shift: bool,
     ctrl: bool,
@@ -76,75 +81,26 @@ pub fn encode_key(
 
     let mods = build_modifiers(shift, ctrl, meta);
 
-    // Get the terminal's current keyboard encoding mode
-    let encoding = term.terminal.get_keyboard_encoding();
+    term.terminal
+        .key_down(keycode, mods)
+        .map_err(|e| anyhow::anyhow!("key_down error: {}", e))?;
 
-    // Build encode modes from terminal state.
-    // For modes we can't query directly, use safe defaults.
-    let modes = KeyCodeEncodeModes {
-        encoding,
-        // Application cursor keys (DECCKM) - we can't easily query this
-        // from the public API, but the default (false) produces standard
-        // escape sequences which work for most cases.
-        application_cursor_keys: false,
-        newline_mode: false,
-        modify_other_keys: None,
-    };
-
-    match keycode.encode(mods, modes, true) {
-        Ok(encoded) => {
-            if encoded.is_empty() {
-                // KeyCode::encode() doesn't handle simple control characters.
-                // Fall back to direct byte encoding for common keys.
-                Ok(fallback_encode(keycode, mods))
-            } else {
-                Ok(Some(encoded))
+    // The ThreadedWriter sends bytes through an mpsc channel to a
+    // background thread, which writes to our CapturingWriter.  Yield
+    // briefly to let the background thread process the write.
+    for _ in 0..1000 {
+        std::thread::yield_now();
+        if let Ok(buf) = term.output.lock() {
+            if !buf.is_empty() {
+                break;
             }
         }
-        Err(_) => Ok(fallback_encode(keycode, mods)),
     }
-}
 
-/// Direct byte encoding for keys that KeyCode::encode() returns empty for.
-fn fallback_encode(keycode: KeyCode, mods: Modifiers) -> Option<String> {
-    let ctrl = mods.contains(Modifiers::CTRL);
-    let meta = mods.contains(Modifiers::ALT);
-
-    let byte = match keycode {
-        KeyCode::Enter => Some("\r"),
-        KeyCode::Backspace => Some("\x7f"),
-        KeyCode::Tab => Some("\t"),
-        KeyCode::Escape => Some("\x1b"),
-        KeyCode::Char(c) if ctrl => {
-            // Ctrl+letter -> control character (C-a = 0x01, C-z = 0x1a)
-            let code = c.to_ascii_lowercase() as u8;
-            if (b'a'..=b'z').contains(&code) {
-                let ctrl_code = code - b'a' + 1;
-                return Some(String::from(ctrl_code as char));
-            }
-            match c {
-                '\\' => return Some(String::from(28 as char)), // C-\
-                ']' => return Some(String::from(29 as char)),  // C-]
-                '_' => return Some(String::from(31 as char)),  // C-_
-                ' ' => return Some(String::from(0 as char)),   // C-SPC
-                _ => None,
-            }
-        }
-        KeyCode::Char(c) if !ctrl && !meta => {
-            return Some(String::from(c));
-        }
-        _ => None,
-    };
-
-    match byte {
-        Some(s) => {
-            if meta {
-                // Meta prefix: ESC + byte
-                Some(format!("\x1b{}", s))
-            } else {
-                Some(s.to_string())
-            }
-        }
-        None => None,
+    let bytes = term.drain_output_bytes();
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 }

@@ -184,7 +184,16 @@ fn free(term: &mut EbbTerminal) -> Result<()> {
 // Defuns: I/O
 // ---------------------------------------------------------------------------
 
-/// Feed raw bytes from the PTY into the terminal's VT parser.
+/// Feed PTY output into the terminal's VT parser.
+///
+/// Takes a String because the `emacs` crate's FromLisp always goes through
+/// copy_string_contents which UTF-8 encodes the Emacs string.  This is
+/// correct for the common case: Emacs decodes UTF-8 PTY output to internal
+/// representation, then re-encodes as UTF-8 for Rust, and advance_bytes
+/// receives the original UTF-8 bytes.  The edge case of raw bytes 128-255
+/// that aren't valid UTF-8 (extremely rare in modern terminals) would be
+/// re-encoded as 2-byte UTF-8 sequences, but escape sequences are 7-bit
+/// and binary payloads (sixel, kitty graphics) use base64.
 #[defun]
 fn feed(term: &mut EbbTerminal, bytes: String) -> Result<()> {
     if term.freed {
@@ -373,18 +382,19 @@ fn resize(term: &mut EbbTerminal, rows: i64, cols: i64) -> Result<()> {
 // Defuns: Input
 // ---------------------------------------------------------------------------
 
-/// Encode a key press and return the bytes to send to the PTY.
-/// Returns the encoded string, or nil if the key is unknown.
-/// This is synchronous -- bypasses the async ThreadedWriter.
+/// Send a key press through the terminal, which reads all internal mode
+/// state (DECCKM, newline mode, keyboard encoding) to produce correct
+/// escape sequences.  Returns the encoded bytes to send to the PTY,
+/// or nil if the key is unknown.
 #[defun]
-fn encode_key(
-    term: &EbbTerminal,
+fn key_down(
+    term: &mut EbbTerminal,
     key_name: String,
     shift: Option<i64>,
     ctrl: Option<i64>,
     meta: Option<i64>,
 ) -> Result<Option<String>> {
-    input::encode_key(
+    input::key_down(
         term,
         &key_name,
         shift.is_some(),
