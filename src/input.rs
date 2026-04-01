@@ -94,11 +94,57 @@ pub fn encode_key(
     match keycode.encode(mods, modes, true) {
         Ok(encoded) => {
             if encoded.is_empty() {
-                Ok(None)
+                // KeyCode::encode() doesn't handle simple control characters.
+                // Fall back to direct byte encoding for common keys.
+                Ok(fallback_encode(keycode, mods))
             } else {
                 Ok(Some(encoded))
             }
         }
-        Err(_) => Ok(None),
+        Err(_) => Ok(fallback_encode(keycode, mods)),
+    }
+}
+
+/// Direct byte encoding for keys that KeyCode::encode() returns empty for.
+fn fallback_encode(keycode: KeyCode, mods: Modifiers) -> Option<String> {
+    let ctrl = mods.contains(Modifiers::CTRL);
+    let meta = mods.contains(Modifiers::ALT);
+
+    let byte = match keycode {
+        KeyCode::Enter => Some("\r"),
+        KeyCode::Backspace => Some("\x7f"),
+        KeyCode::Tab => Some("\t"),
+        KeyCode::Escape => Some("\x1b"),
+        KeyCode::Char(c) if ctrl => {
+            // Ctrl+letter -> control character (C-a = 0x01, C-z = 0x1a)
+            let code = c.to_ascii_lowercase() as u8;
+            if (b'a'..=b'z').contains(&code) {
+                let ctrl_code = code - b'a' + 1;
+                return Some(String::from(ctrl_code as char));
+            }
+            match c {
+                '\\' => return Some(String::from(28 as char)), // C-\
+                ']' => return Some(String::from(29 as char)),  // C-]
+                '_' => return Some(String::from(31 as char)),  // C-_
+                ' ' => return Some(String::from(0 as char)),   // C-SPC
+                _ => None,
+            }
+        }
+        KeyCode::Char(c) if !ctrl && !meta => {
+            return Some(String::from(c));
+        }
+        _ => None,
+    };
+
+    match byte {
+        Some(s) => {
+            if meta {
+                // Meta prefix: ESC + byte
+                Some(format!("\x1b{}", s))
+            } else {
+                Some(s.to_string())
+            }
+        }
+        None => None,
     }
 }

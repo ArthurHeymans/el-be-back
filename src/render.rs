@@ -105,13 +105,37 @@ struct StyledRun {
     hyperlink_uri: Option<String>,
 }
 
+/// Find the last column that has non-space content or a non-default background.
+/// Trailing blank cells beyond this point are rendered as plain unstyled spaces.
+fn last_content_col(line: &wezterm_surface::Line, cols: usize) -> usize {
+    let mut last = 0;
+    for col in 0..cols {
+        if let Some(cell) = line.get_cell(col) {
+            if cell.width() == 0 {
+                continue;
+            }
+            let s = cell.str();
+            let is_blank = s.is_empty() || s == " ";
+            let has_bg = cell.attrs().background() != ColorAttribute::Default;
+            if !is_blank || has_bg {
+                last = col + 1;
+            }
+        }
+    }
+    last
+}
+
 /// Render a single line by accumulating style runs and inserting with faces.
+/// Trailing blank cells are rendered as plain unstyled spaces to avoid
+/// underline/strikethrough extending across the full terminal width.
 fn render_line(
     env: &Env,
     line: &wezterm_surface::Line,
     cols: usize,
     palette: &ColorPalette,
 ) -> Result<()> {
+    let content_end = last_content_col(line, cols);
+
     let mut runs: Vec<StyledRun> = Vec::new();
     let mut current_text = String::new();
     let mut current_attrs: Option<CellAttributes> = None;
@@ -123,8 +147,16 @@ fn render_line(
                 continue;
             }
 
-            let attrs = cell.attrs().clone();
-            let link_uri = attrs.hyperlink().map(|h| h.uri().to_string());
+            // Past content end: treat trailing blanks as unstyled to avoid
+            // underline/strikethrough extending across the full width.
+            let (attrs, link_uri) = if col >= content_end {
+                (CellAttributes::default(), None)
+            } else {
+                (
+                    cell.attrs().clone(),
+                    cell.attrs().hyperlink().map(|h| h.uri().to_string()),
+                )
+            };
 
             let same_style = current_attrs.as_ref().map_or(false, |ca| {
                 ca.attribute_bits_equal(&attrs)
