@@ -2,3 +2,6 @@
 *.so
 *.dylib
 *.elc
+/.direnv/
+/result
+!.envrc
