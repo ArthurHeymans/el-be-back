@@ -387,10 +387,12 @@ The Rust render function erases the buffer and re-renders all visible rows."
 
 (defconst ebb--simple-key-bytes
   '(("return"    . "\r")
-    ("backspace" . "\x7f")
+    ("backspace" . "\x08")
     ("tab"       . "\t")
     ("escape"    . "\x1b")
-    ("DEL"       . "\x7f")
+    ("DEL"       . "\x08")
+    ("delete"    . "\x1b[3~")
+    ("deletechar" . "\x1b[3~")
     ("RET"       . "\r")
     ("TAB"       . "\t")
     ("ESC"       . "\x1b"))
