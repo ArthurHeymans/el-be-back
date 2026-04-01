@@ -335,12 +335,16 @@ The Rust render function erases the buffer and re-renders all visible rows."
       (ding t))))
 
 (defun ebb--process-sentinel (process event)
-  "Handle PROCESS state change EVENT."
+  "Handle PROCESS state change EVENT.
+When the process exits, kill the buffer."
   (when (buffer-live-p (process-buffer process))
-    (with-current-buffer (process-buffer process)
-      (let ((inhibit-read-only t))
-        (goto-char (point-max))
-        (insert (format "\n[Process %s]\n" (string-trim event)))))))
+    (let ((buf (process-buffer process)))
+      (if (memq (process-status process) '(exit signal))
+          (kill-buffer buf)
+        (with-current-buffer buf
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (insert (format "\n[Process %s]\n" (string-trim event)))))))))
 
 (defun ebb--kill-buffer-hook ()
   "Clean up when the terminal buffer is killed."
