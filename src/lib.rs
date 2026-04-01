@@ -52,6 +52,13 @@ pub struct EbbTerminal {
     alerts: Arc<Mutex<AlertQueue>>,
     last_seqno: SequenceNo,
     last_rows: usize,
+    /// StableRowIndex of the first visible line at last render.
+    /// Used to detect how many new lines scrolled into scrollback.
+    last_first_vis_stable: isize,
+    /// Number of scrollback lines currently in the Emacs buffer.
+    scrollback_in_buffer: usize,
+    /// Maximum scrollback lines to keep in the buffer.
+    max_scrollback: usize,
     freed: bool,
 }
 
@@ -95,6 +102,9 @@ impl EbbTerminal {
             alerts,
             last_seqno: 0,
             last_rows: 0,
+            last_first_vis_stable: 0,
+            scrollback_in_buffer: 0,
+            max_scrollback: scrollback,
             freed: false,
         }
     }

@@ -48,6 +48,9 @@ pub(crate) struct Syms {
     t_val: GlobalRef,
     // Property stickiness control
     rear_nonsticky: GlobalRef,
+    // Additional functions for scrollback
+    point: GlobalRef,
+    point_max: GlobalRef,
 }
 
 static SYMS: OnceLock<Syms> = OnceLock::new();
@@ -88,6 +91,8 @@ pub(crate) fn init_syms(env: &Env) -> Result<()> {
         italic_val: env.intern("italic")?.make_global_ref(),
         t_val: env.intern("t")?.make_global_ref(),
         rear_nonsticky: env.intern("rear-nonsticky")?.make_global_ref(),
+        point: env.intern("point")?.make_global_ref(),
+        point_max: env.intern("point-max")?.make_global_ref(),
     };
     let _ = SYMS.set(syms);
     Ok(())
@@ -230,8 +235,13 @@ fn build_face_plist<'e>(env: &'e Env, key: &FaceKey, syms: &'e Syms) -> Result<V
 
 /// Render the terminal screen into the current Emacs buffer.
 ///
+/// Buffer layout:
+///   [scrollback lines]  -- permanent, above display region
+///   [display region]    -- rows x cols, updated each frame
+///
 /// Uses incremental (dirty-row) rendering when possible.  Falls back to a
 /// full erase+redraw when the terminal was resized or on the first render.
+/// New scrollback lines are inserted above the display region as they appear.
 pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     if term.freed {
         return Ok(());
@@ -243,6 +253,9 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
         ref terminal,
         ref mut last_seqno,
         ref mut last_rows,
+        ref mut last_first_vis_stable,
+        ref mut scrollback_in_buffer,
+        max_scrollback,
         ..
     } = *term;
 
@@ -256,22 +269,83 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
         return Ok(());
     }
 
+    let scrollback_count = screen.scrollback_rows().saturating_sub(rows);
+    let cur_first_vis_stable = screen.visible_row_to_stable_row(0);
     let needs_full = *last_rows != rows || *last_seqno == 0;
 
     if needs_full {
-        full_render(env, screen, rows, cols, &palette, syms)?;
+        // ---- Full render: scrollback (plain text) + display (styled) ----
+        env.call(&syms.erase_buffer, [])?;
+
+        // Bulk-insert scrollback as plain text for speed.
+        if scrollback_count > 0 {
+            let mut sb = String::new();
+            for phys in 0..scrollback_count {
+                let lines = screen.lines_in_phys_range(phys..phys + 1);
+                if let Some(line) = lines.first() {
+                    sb.push_str(&line.as_str());
+                }
+                sb.push('\n');
+            }
+            env.call(&syms.insert, (sb.as_str(),))?;
+        }
+
+        // Render visible rows with full styling.
+        render_display_rows(env, screen, rows, cols, &palette, syms)?;
+
+        *scrollback_in_buffer = scrollback_count;
     } else {
-        let first_stable = screen.visible_row_to_stable_row(0);
+        // ---- Incremental render ----
+
+        // 1) Insert any new scrollback lines above the display region.
+        let new_sb = (cur_first_vis_stable - *last_first_vis_stable).max(0) as usize;
+        if new_sb > 0 {
+            // Navigate to the boundary between scrollback and display.
+            env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
+            env.call(&syms.forward_line, (*scrollback_in_buffer as i64,))?;
+
+            // The newest scrollback lines sit at the END of the scrollback
+            // region: phys indices (scrollback_count - new_sb) .. scrollback_count.
+            let start_phys = scrollback_count.saturating_sub(new_sb);
+            for phys in start_phys..scrollback_count {
+                let lines = screen.lines_in_phys_range(phys..phys + 1);
+                if let Some(line) = lines.first() {
+                    render_line(env, line, cols, &palette, syms)?;
+                }
+                env.call(&syms.insert, ("\n",))?;
+            }
+            *scrollback_in_buffer += new_sb;
+        }
+
+        // 2) Trim scrollback if over the limit.
+        if *scrollback_in_buffer > max_scrollback {
+            let excess = *scrollback_in_buffer - max_scrollback;
+            env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
+            env.call(&syms.forward_line, (excess as i64,))?;
+            let cut = env.call(&syms.point, [])?;
+            env.call(&syms.delete_region, (env.call(&syms.point_min, [])?, cut))?;
+            *scrollback_in_buffer = max_scrollback;
+        }
+
+        // 3) Update dirty visible rows in the display region.
+        let first_stable = cur_first_vis_stable;
         let last_stable = screen.visible_row_to_stable_row((rows - 1) as i64);
         let dirty = screen.get_changed_stable_rows(first_stable..last_stable + 1, *last_seqno);
 
         if !dirty.is_empty() {
-            // When most rows changed, a full redraw is cheaper than
-            // per-row navigation + delete + reinsert.
             if dirty.len() > rows / 2 {
-                full_render(env, screen, rows, cols, &palette, syms)?;
+                // Redraw the entire display region (keep scrollback).
+                redraw_display_region(
+                    env,
+                    screen,
+                    rows,
+                    cols,
+                    &palette,
+                    syms,
+                    *scrollback_in_buffer,
+                )?;
             } else {
-                incremental_render(
+                incremental_render_display(
                     env,
                     screen,
                     rows,
@@ -280,14 +354,16 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
                     syms,
                     &dirty,
                     first_stable,
+                    *scrollback_in_buffer,
                 )?;
             }
         }
     }
 
-    // ---- Position cursor ----
+    // ---- Position cursor (in display region) ----
+    let cursor_buf_line = *scrollback_in_buffer as i64 + cursor.y;
     env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
-    env.call(&syms.forward_line, (cursor.y,))?;
+    env.call(&syms.forward_line, (cursor_buf_line,))?;
     let char_off = cursor_char_offset(screen, cursor.y, cursor.x, cols);
     let line_start = env
         .call(&syms.line_beginning_position, [])?
@@ -301,12 +377,13 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     // ---- Update tracking ----
     *last_seqno = terminal.current_seqno();
     *last_rows = rows;
+    *last_first_vis_stable = cur_first_vis_stable;
 
     Ok(())
 }
 
-/// Erase the buffer and redraw every visible row.
-fn full_render(
+/// Render all visible rows with full styling (no scrollback).
+fn render_display_rows(
     env: &Env,
     screen: &wezterm_term::Screen,
     rows: usize,
@@ -314,7 +391,6 @@ fn full_render(
     palette: &ColorPalette,
     syms: &Syms,
 ) -> Result<()> {
-    env.call(&syms.erase_buffer, [])?;
     for vis_row in 0..rows {
         let stable = screen.visible_row_to_stable_row(vis_row as i64);
         if let Some(phys) = screen.stable_row_to_phys(stable) {
@@ -330,8 +406,31 @@ fn full_render(
     Ok(())
 }
 
-/// Update only the dirty rows in-place.
-fn incremental_render(
+/// Erase the display region (last `rows` lines) and redraw it, preserving
+/// scrollback above.
+fn redraw_display_region(
+    env: &Env,
+    screen: &wezterm_term::Screen,
+    rows: usize,
+    cols: usize,
+    palette: &ColorPalette,
+    syms: &Syms,
+    scrollback_in_buffer: usize,
+) -> Result<()> {
+    // Navigate to start of display region.
+    env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
+    env.call(&syms.forward_line, (scrollback_in_buffer as i64,))?;
+    let display_start = env.call(&syms.point, [])?;
+    let buf_end = env.call(&syms.point_max, [])?;
+    env.call(&syms.delete_region, (display_start, buf_end))?;
+
+    // Re-render all visible rows.
+    render_display_rows(env, screen, rows, cols, palette, syms)?;
+    Ok(())
+}
+
+/// Update only the dirty rows in the display region.
+fn incremental_render_display(
     env: &Env,
     screen: &wezterm_term::Screen,
     rows: usize,
@@ -340,9 +439,8 @@ fn incremental_render(
     syms: &Syms,
     dirty: &[isize],
     first_stable: isize,
+    scrollback_in_buffer: usize,
 ) -> Result<()> {
-    // Convert to visible-row indices and sort ascending for efficient
-    // forward-line navigation.
     let mut vis_rows: Vec<usize> = dirty
         .iter()
         .map(|s| (s - first_stable) as usize)
@@ -351,21 +449,20 @@ fn incremental_render(
     vis_rows.sort_unstable();
     vis_rows.dedup();
 
+    // Navigate to the start of the display region.
     env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
+    env.call(&syms.forward_line, (scrollback_in_buffer as i64,))?;
     let mut current_line: i64 = 0;
 
     for &vis_row in &vis_rows {
-        // Navigate forward to the target row
         let delta = vis_row as i64 - current_line;
         env.call(&syms.forward_line, (delta,))?;
         current_line = vis_row as i64;
 
-        // Delete old content (preserves the newline)
         let lbeg = env.call(&syms.line_beginning_position, [])?;
         let lend = env.call(&syms.line_end_position, [])?;
         env.call(&syms.delete_region, (lbeg, lend))?;
 
-        // Re-render this line at point
         let stable = screen.visible_row_to_stable_row(vis_row as i64);
         if let Some(phys) = screen.stable_row_to_phys(stable) {
             let lines = screen.lines_in_phys_range(phys..phys + 1);
