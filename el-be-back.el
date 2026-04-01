@@ -249,7 +249,11 @@ search, and copying."
   (setq-local header-line-format
               '(:eval (ebb--header-line)))
   (add-hook 'kill-buffer-hook #'ebb--kill-buffer-hook nil t)
-  (add-hook 'window-size-change-functions #'ebb--window-size-change))
+  ;; Global hook (not buffer-local) -- add-hook is idempotent, so
+  ;; multiple ebb buffers won't duplicate it.
+  (add-hook 'window-size-change-functions #'ebb--window-size-change)
+  ;; Remove the hook when no ebb buffers remain.
+  (add-hook 'kill-buffer-hook #'ebb--maybe-remove-resize-hook nil t))
 
 (defun ebb--header-line ()
   "Generate the header line for the terminal buffer."
@@ -346,21 +350,27 @@ output.  This prevents render overhead from throttling throughput."
     ;; Process title/CWD/bell alerts
     (ebb--process-alerts)))
 
-(defun ebb--render-screen ()
+(defun ebb--render-screen (&optional window)
   "Render the terminal screen into the current buffer.
 Must be called within the performance-trinity let bindings.
-The Rust render function updates scrollback and display rows."
+The Rust render function updates scrollback and display rows.
+WINDOW, if non-nil, is the window to pin.  Otherwise the window
+displaying the current buffer is used.  This avoids corrupting
+other windows (e.g. magit) when a render timer fires while a
+different window is selected."
   (when ebb--terminal
     (ebb--render ebb--terminal)
     ;; Pin the window to show the display region (the last `rows' lines
     ;; of the buffer), like a real terminal screen.  Scrollback above is
     ;; only visible in copy-mode.
     (unless ebb-copy-mode
-      (let ((rows (ebb--get-rows ebb--terminal)))
-        (save-excursion
-          (goto-char (point-max))
-          (forward-line (- (1- rows)))
-          (set-window-start (selected-window) (point) t))))))
+      (let ((win (or window (get-buffer-window (current-buffer)))))
+        (when win
+          (let ((rows (ebb--get-rows ebb--terminal)))
+            (save-excursion
+              (goto-char (point-max))
+              (forward-line (- (1- rows)))
+              (set-window-start win (point) t))))))))
 
 (defun ebb--drain-and-send ()
   "Drain captured terminal output and send to the PTY."
@@ -409,6 +419,16 @@ When the process exits, kill the buffer."
     (ebb--free ebb--terminal)
     (setq ebb--terminal nil)))
 
+(defun ebb--maybe-remove-resize-hook ()
+  "Remove the resize hook when no ebb buffers remain."
+  (unless (cl-some (lambda (buf)
+                     (and (not (eq buf (current-buffer)))
+                          (buffer-live-p buf)
+                          (eq (buffer-local-value 'major-mode buf)
+                              'ebb-mode)))
+                   (buffer-list))
+    (remove-hook 'window-size-change-functions #'ebb--window-size-change)))
+
 ;;; --- Resize handling ---
 
 (defun ebb--window-size-change (frame)
@@ -432,7 +452,7 @@ When the process exits, kill the buffer."
               (let ((inhibit-read-only t)
                     (inhibit-modification-hooks t)
                     (buffer-undo-list t))
-                (ebb--render-screen)))))))))
+                (ebb--render-screen window)))))))))
 
 ;;; --- Input handling ---
 
