@@ -203,6 +203,50 @@ fn content(term: &EbbTerminal) -> Result<String> {
     Ok(term.screen_text())
 }
 
+/// Debug: return info about cell colors on a given visible row.
+/// Returns a string describing the first few non-default-colored cells.
+#[defun]
+fn debug_row_attrs(term: &EbbTerminal, vis_row: i64) -> Result<String> {
+    if term.freed {
+        return Ok("freed".to_string());
+    }
+    let screen = term.terminal.screen();
+    let cols = screen.physical_cols;
+    let stable = screen.visible_row_to_stable_row(vis_row);
+    let phys = match screen.stable_row_to_phys(stable) {
+        Some(p) => p,
+        None => return Ok(format!("row {} not found", vis_row)),
+    };
+    let lines = screen.lines_in_phys_range(phys..phys + 1);
+    let line = match lines.first() {
+        Some(l) => l,
+        None => return Ok("no line data".to_string()),
+    };
+    let mut result = String::new();
+    let mut styled_count = 0;
+    for col in 0..cols.min(120) {
+        if let Some(cell) = line.get_cell(col) {
+            use wezterm_cell::color::ColorAttribute;
+            let fg = cell.attrs().foreground();
+            let bg = cell.attrs().background();
+            if fg != ColorAttribute::Default || bg != ColorAttribute::Default {
+                styled_count += 1;
+                if styled_count <= 5 {
+                    result.push_str(&format!(
+                        "col{}='{}' fg={:?} bg={:?}; ",
+                        col,
+                        cell.str(),
+                        fg,
+                        bg
+                    ));
+                }
+            }
+        }
+    }
+    result.push_str(&format!("total_styled={}/{}", styled_count, cols.min(120)));
+    Ok(result)
+}
+
 // ---------------------------------------------------------------------------
 // Defuns: State queries
 // ---------------------------------------------------------------------------

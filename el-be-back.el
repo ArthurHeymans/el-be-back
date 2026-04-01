@@ -81,11 +81,13 @@
         (pop-to-buffer "*ebb-compile*")
         (error "[ebb] Module compilation failed (exit code %d)" status)))
     (let* ((target-dir (expand-file-name "target/release/"))
+           ;; Cargo converts hyphens to underscores in library filenames
+           (crate-name (replace-regexp-in-string "-" "_" ebb--module-name))
            (lib-name (cond
                       ((eq system-type 'darwin)
-                       (concat "lib" ebb--module-name ".dylib"))
+                       (concat "lib" crate-name ".dylib"))
                       (t
-                       (concat "lib" ebb--module-name ".so"))))
+                       (concat "lib" crate-name ".so"))))
            (src (expand-file-name lib-name target-dir))
            (dst (ebb--module-file)))
       (unless (file-exists-p src)
@@ -200,8 +202,19 @@ Lines beyond this limit are deleted from the top of the buffer."
   (setq-local hscroll-margin 0)
   (setq-local left-margin-width 0)
   (setq-local right-margin-width 0)
-  ;; We manage faces ourselves
-  (setq-local font-lock-defaults '(nil t))
+  ;; Disable font-lock completely -- we manage faces ourselves.
+  ;; font-lock/jit-lock will otherwise refontify the buffer and strip our
+  ;; face properties. We must be aggressive here because frameworks like
+  ;; Doom Emacs forcibly re-enable font-lock.
+  (setq-local font-lock-defaults nil)
+  (setq-local font-lock-function #'ignore)
+  (setq-local font-lock-keywords nil)
+  (font-lock-mode -1)
+  (when (bound-and-true-p jit-lock-mode)
+    (jit-lock-mode nil))
+  ;; Disable indent-bars and similar visual modes
+  (when (bound-and-true-p indent-bars-mode)
+    (indent-bars-mode -1))
   ;; Header line showing terminal title
   (setq-local header-line-format
               '(:eval (ebb--header-line)))
