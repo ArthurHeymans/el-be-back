@@ -385,16 +385,44 @@ The Rust render function erases the buffer and re-renders all visible rows."
   (when (and ebb--process (process-live-p ebb--process))
     (process-send-string ebb--process string)))
 
+(defconst ebb--simple-key-bytes
+  '(("return"    . "\r")
+    ("backspace" . "\x7f")
+    ("tab"       . "\t")
+    ("escape"    . "\x1b")
+    ("DEL"       . "\x7f")
+    ("RET"       . "\r")
+    ("TAB"       . "\t")
+    ("ESC"       . "\x1b"))
+  "Direct byte mappings for keys that KeyCode::encode() returns empty for.")
+
 (defun ebb--send-key (key-name &optional shift ctrl meta)
   "Send KEY-NAME to the terminal via wezterm key encoding.
 KEY-NAME is a string like \"a\", \"return\", \"up\", etc.
 Encodes synchronously and sends directly to PTY."
   (when (and ebb--terminal ebb--process (process-live-p ebb--process))
-    ;; Encode key synchronously (bypasses async ThreadedWriter)
-    (let ((encoded (ebb--encode-key ebb--terminal key-name
-                                    (if shift 1 nil)
-                                    (if ctrl 1 nil)
-                                    (if meta 1 nil))))
+    (let ((encoded (or
+                    ;; Try Rust encoder first (handles CSI sequences, function keys, etc.)
+                    (let ((result (ebb--encode-key ebb--terminal key-name
+                                                  (if shift 1 nil)
+                                                  (if ctrl 1 nil)
+                                                  (if meta 1 nil))))
+                      (and result (not (string-empty-p result)) result))
+                    ;; Fallback: simple key byte table
+                    (let ((entry (assoc key-name ebb--simple-key-bytes)))
+                      (when entry
+                        (let ((bytes (cdr entry)))
+                          (if meta (concat "\x1b" bytes) bytes))))
+                    ;; Fallback: ctrl+letter
+                    (when (and ctrl (= (length key-name) 1))
+                      (let* ((ch (aref key-name 0))
+                             (code (- (downcase ch) ?a -1)))
+                        (when (and (>= code 1) (<= code 26))
+                          (let ((bytes (string code)))
+                            (if meta (concat "\x1b" bytes) bytes)))))
+                    ;; Fallback: plain character
+                    (when (and (= (length key-name) 1) (not ctrl) (not meta))
+                      key-name))))
       (when encoded
         (process-send-string ebb--process encoded)))))
 
