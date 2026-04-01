@@ -6,6 +6,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use emacs::{defun, Env, Result, Value};
+use wezterm_surface::SequenceNo;
 use wezterm_term::{Terminal, TerminalSize};
 
 use config::{AlertQueue, EbbAlertSink, EbbConfig};
@@ -14,6 +15,7 @@ emacs::plugin_is_GPL_compatible!();
 
 #[emacs::module(name = "ebb-module", defun_prefix = "ebb", separator = "--")]
 fn init(env: &Env) -> Result<()> {
+    render::init_syms(env)?;
     env.message("[ebb] module loaded")?;
     Ok(())
 }
@@ -48,6 +50,8 @@ pub struct EbbTerminal {
     terminal: Terminal,
     output: Arc<Mutex<Vec<u8>>>,
     alerts: Arc<Mutex<AlertQueue>>,
+    last_seqno: SequenceNo,
+    last_rows: usize,
     freed: bool,
 }
 
@@ -89,6 +93,8 @@ impl EbbTerminal {
             terminal,
             output,
             alerts,
+            last_seqno: 0,
+            last_rows: 0,
             freed: false,
         }
     }

@@ -1,4 +1,6 @@
-use emacs::{Env, Result};
+use std::sync::OnceLock;
+
+use emacs::{Env, GlobalRef, IntoLisp, Result, Value};
 use wezterm_cell::color::{ColorAttribute, SrgbaTuple};
 use wezterm_cell::CellAttributes;
 use wezterm_escape_parser::csi::Intensity;
@@ -6,107 +8,424 @@ use wezterm_term::color::ColorPalette;
 
 use crate::EbbTerminal;
 
+// ---------------------------------------------------------------------------
+// Pre-interned Emacs symbols -- allocated once at module init, reused every
+// frame.  Eliminates all env.intern() and env.call("name", ..) FFI overhead
+// during rendering.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct Syms {
+    // Functions
+    insert: GlobalRef,
+    propertize: GlobalRef,
+    erase_buffer: GlobalRef,
+    goto_char: GlobalRef,
+    point_min: GlobalRef,
+    forward_line: GlobalRef,
+    line_beginning_position: GlobalRef,
+    line_end_position: GlobalRef,
+    delete_region: GlobalRef,
+    symbol_value: GlobalRef,
+    // Property name symbols
+    face: GlobalRef,
+    help_echo: GlobalRef,
+    mouse_face: GlobalRef,
+    highlight: GlobalRef,
+    ebb_url: GlobalRef,
+    keymap: GlobalRef,
+    ebb_hyperlink_map: GlobalRef,
+    // Face plist keywords and values
+    kw_foreground: GlobalRef,
+    kw_background: GlobalRef,
+    kw_weight: GlobalRef,
+    kw_slant: GlobalRef,
+    kw_underline: GlobalRef,
+    kw_strike_through: GlobalRef,
+    kw_inverse_video: GlobalRef,
+    bold: GlobalRef,
+    light: GlobalRef,
+    italic_val: GlobalRef,
+    t_val: GlobalRef,
+    // Property stickiness control
+    rear_nonsticky: GlobalRef,
+}
+
+static SYMS: OnceLock<Syms> = OnceLock::new();
+
+pub(crate) fn init_syms(env: &Env) -> Result<()> {
+    if SYMS.get().is_some() {
+        return Ok(());
+    }
+    let syms = Syms {
+        insert: env.intern("insert")?.make_global_ref(),
+        propertize: env.intern("propertize")?.make_global_ref(),
+        erase_buffer: env.intern("erase-buffer")?.make_global_ref(),
+        goto_char: env.intern("goto-char")?.make_global_ref(),
+        point_min: env.intern("point-min")?.make_global_ref(),
+        forward_line: env.intern("forward-line")?.make_global_ref(),
+        line_beginning_position: env.intern("line-beginning-position")?.make_global_ref(),
+        line_end_position: env.intern("line-end-position")?.make_global_ref(),
+        delete_region: env.intern("delete-region")?.make_global_ref(),
+        symbol_value: env.intern("symbol-value")?.make_global_ref(),
+
+        face: env.intern("face")?.make_global_ref(),
+        help_echo: env.intern("help-echo")?.make_global_ref(),
+        mouse_face: env.intern("mouse-face")?.make_global_ref(),
+        highlight: env.intern("highlight")?.make_global_ref(),
+        ebb_url: env.intern("ebb-url")?.make_global_ref(),
+        keymap: env.intern("keymap")?.make_global_ref(),
+        ebb_hyperlink_map: env.intern("ebb-hyperlink-map")?.make_global_ref(),
+
+        kw_foreground: env.intern(":foreground")?.make_global_ref(),
+        kw_background: env.intern(":background")?.make_global_ref(),
+        kw_weight: env.intern(":weight")?.make_global_ref(),
+        kw_slant: env.intern(":slant")?.make_global_ref(),
+        kw_underline: env.intern(":underline")?.make_global_ref(),
+        kw_strike_through: env.intern(":strike-through")?.make_global_ref(),
+        kw_inverse_video: env.intern(":inverse-video")?.make_global_ref(),
+        bold: env.intern("bold")?.make_global_ref(),
+        light: env.intern("light")?.make_global_ref(),
+        italic_val: env.intern("italic")?.make_global_ref(),
+        t_val: env.intern("t")?.make_global_ref(),
+        rear_nonsticky: env.intern("rear-nonsticky")?.make_global_ref(),
+    };
+    let _ = SYMS.set(syms);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Face key -- compact representation of the attributes that affect face
+// construction.  Used to detect style changes between adjacent cells.
+// ---------------------------------------------------------------------------
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+pub(crate) struct FaceKey {
+    fg: Option<[u8; 3]>,
+    bg: Option<[u8; 3]>,
+    intensity: u8, // 0=Normal 1=Bold 2=Half
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+    reverse: bool,
+}
+
+impl FaceKey {
+    fn default_unstyled() -> Self {
+        FaceKey {
+            fg: None,
+            bg: None,
+            intensity: 0,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            reverse: false,
+        }
+    }
+}
+
+/// Build a FaceKey from cell attributes, resolving palette colours to RGB.
+/// Returns (key, has_style) where has_style=false means entirely default.
+fn make_face_key(attrs: &CellAttributes, palette: &ColorPalette) -> (FaceKey, bool) {
+    let fg = resolve_color_rgb(attrs.foreground(), palette);
+    let bg = resolve_color_rgb(attrs.background(), palette);
+    let intensity = match attrs.intensity() {
+        Intensity::Normal => 0u8,
+        Intensity::Bold => 1,
+        Intensity::Half => 2,
+    };
+    let italic = attrs.italic();
+    let underline = attrs.underline() != wezterm_escape_parser::csi::Underline::None;
+    let strikethrough = attrs.strikethrough();
+    let reverse = attrs.reverse();
+
+    let has_style = fg.is_some()
+        || bg.is_some()
+        || intensity != 0
+        || italic
+        || underline
+        || strikethrough
+        || reverse;
+
+    (
+        FaceKey {
+            fg,
+            bg,
+            intensity,
+            italic,
+            underline,
+            strikethrough,
+            reverse,
+        },
+        has_style,
+    )
+}
+
+fn resolve_color_rgb(attr: ColorAttribute, palette: &ColorPalette) -> Option<[u8; 3]> {
+    match attr {
+        ColorAttribute::Default => None,
+        ColorAttribute::PaletteIndex(idx) => {
+            let c = palette.resolve_fg(ColorAttribute::PaletteIndex(idx));
+            Some(srgba_to_rgb(c))
+        }
+        ColorAttribute::TrueColorWithPaletteFallback(c, _)
+        | ColorAttribute::TrueColorWithDefaultFallback(c) => Some(srgba_to_rgb(c)),
+    }
+}
+
+#[inline]
+fn srgba_to_rgb(c: SrgbaTuple) -> [u8; 3] {
+    [
+        (c.0 * 255.0).round() as u8,
+        (c.1 * 255.0).round() as u8,
+        (c.2 * 255.0).round() as u8,
+    ]
+}
+
+/// Build a face plist like (:foreground "#rrggbb" :weight bold …) directly
+/// as a Lisp list -- no string formatting then (read …) round-trip.
+fn build_face_plist<'e>(env: &'e Env, key: &FaceKey, syms: &'e Syms) -> Result<Value<'e>> {
+    let mut p: Vec<Value<'e>> = Vec::with_capacity(14);
+
+    if let Some(rgb) = key.fg {
+        p.push(syms.kw_foreground.bind(env));
+        p.push(format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]).into_lisp(env)?);
+    }
+    if let Some(rgb) = key.bg {
+        p.push(syms.kw_background.bind(env));
+        p.push(format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]).into_lisp(env)?);
+    }
+    match key.intensity {
+        1 => {
+            p.push(syms.kw_weight.bind(env));
+            p.push(syms.bold.bind(env));
+        }
+        2 => {
+            p.push(syms.kw_weight.bind(env));
+            p.push(syms.light.bind(env));
+        }
+        _ => {}
+    }
+    if key.italic {
+        p.push(syms.kw_slant.bind(env));
+        p.push(syms.italic_val.bind(env));
+    }
+    if key.underline {
+        p.push(syms.kw_underline.bind(env));
+        p.push(syms.t_val.bind(env));
+    }
+    if key.strikethrough {
+        p.push(syms.kw_strike_through.bind(env));
+        p.push(syms.t_val.bind(env));
+    }
+    if key.reverse {
+        p.push(syms.kw_inverse_video.bind(env));
+        p.push(syms.t_val.bind(env));
+    }
+    env.list(&p[..])
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
 /// Render the terminal screen into the current Emacs buffer.
 ///
-/// Erases the display region and re-renders all visible rows with faces.
-/// Tracks cursor position during rendering for accurate placement
-/// despite character width mismatches between wezterm and Emacs.
+/// Uses incremental (dirty-row) rendering when possible.  Falls back to a
+/// full erase+redraw when the terminal was resized or on the first render.
 pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     if term.freed {
         return Ok(());
     }
 
-    let screen = term.terminal.screen();
+    let syms = SYMS.get().expect("ebb: symbols not initialised");
+
+    let EbbTerminal {
+        ref terminal,
+        ref mut last_seqno,
+        ref mut last_rows,
+        ..
+    } = *term;
+
+    let screen = terminal.screen();
     let rows = screen.physical_rows;
     let cols = screen.physical_cols;
-    let palette = term.terminal.palette();
-    let cursor = term.terminal.cursor_pos();
+    let palette = terminal.palette();
+    let cursor = terminal.cursor_pos();
 
-    // Erase buffer and re-render visible rows
-    env.call("erase-buffer", [])?;
+    if rows == 0 {
+        return Ok(());
+    }
 
-    let mut cursor_buf_pos: Option<i64> = None;
+    let needs_full = *last_rows != rows || *last_seqno == 0;
 
-    for vis_row in 0..rows {
-        let is_cursor_row = vis_row as i64 == cursor.y;
-        let stable = screen.visible_row_to_stable_row(vis_row as i64);
-        if let Some(phys) = screen.stable_row_to_phys(stable) {
-            let lines = screen.lines_in_phys_range(phys..phys + 1);
-            if let Some(line) = lines.first() {
-                if is_cursor_row {
-                    cursor_buf_pos = Some(render_line_with_cursor(
-                        env,
-                        line,
-                        cols,
-                        &palette,
-                        cursor.x as i64,
-                    )?);
-                } else {
-                    render_line(env, line, cols, &palette)?;
-                }
+    if needs_full {
+        full_render(env, screen, rows, cols, &palette, syms)?;
+    } else {
+        let first_stable = screen.visible_row_to_stable_row(0);
+        let last_stable = screen.visible_row_to_stable_row((rows - 1) as i64);
+        let dirty = screen.get_changed_stable_rows(first_stable..last_stable + 1, *last_seqno);
+
+        if !dirty.is_empty() {
+            // When most rows changed, a full redraw is cheaper than
+            // per-row navigation + delete + reinsert.
+            if dirty.len() > rows / 2 {
+                full_render(env, screen, rows, cols, &palette, syms)?;
+            } else {
+                incremental_render(
+                    env,
+                    screen,
+                    rows,
+                    cols,
+                    &palette,
+                    syms,
+                    &dirty,
+                    first_stable,
+                )?;
             }
         }
-        if vis_row < rows - 1 {
-            env.call("insert", ("\n",))?;
-        }
     }
 
-    // Position cursor
-    if let Some(pos) = cursor_buf_pos {
-        env.call("goto-char", (pos,))?;
-    } else {
-        env.call("goto-char", (env.call("point-min", [])?,))?;
-    }
+    // ---- Position cursor ----
+    env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
+    env.call(&syms.forward_line, (cursor.y,))?;
+    let char_off = cursor_char_offset(screen, cursor.y, cursor.x, cols);
+    let line_start = env
+        .call(&syms.line_beginning_position, [])?
+        .into_rust::<i64>()?;
+    let line_end = env.call(&syms.line_end_position, [])?.into_rust::<i64>()?;
+    env.call(
+        &syms.goto_char,
+        ((line_start + char_off as i64).min(line_end).max(line_start),),
+    )?;
+
+    // ---- Update tracking ----
+    *last_seqno = terminal.current_seqno();
+    *last_rows = rows;
 
     Ok(())
 }
 
-/// Render a line and return the buffer position corresponding to `cursor_col`.
-fn render_line_with_cursor(
+/// Erase the buffer and redraw every visible row.
+fn full_render(
     env: &Env,
-    line: &wezterm_surface::Line,
+    screen: &wezterm_term::Screen,
+    rows: usize,
     cols: usize,
     palette: &ColorPalette,
-    cursor_col: i64,
-) -> Result<i64> {
-    // Build mapping: cell column -> character index in rendered output
-    let mut char_entries: Vec<usize> = Vec::new(); // cell_col for each rendered char
+    syms: &Syms,
+) -> Result<()> {
+    env.call(&syms.erase_buffer, [])?;
+    for vis_row in 0..rows {
+        let stable = screen.visible_row_to_stable_row(vis_row as i64);
+        if let Some(phys) = screen.stable_row_to_phys(stable) {
+            let lines = screen.lines_in_phys_range(phys..phys + 1);
+            if let Some(line) = lines.first() {
+                render_line(env, line, cols, palette, syms)?;
+            }
+        }
+        if vis_row < rows - 1 {
+            env.call(&syms.insert, ("\n",))?;
+        }
+    }
+    Ok(())
+}
+
+/// Update only the dirty rows in-place.
+fn incremental_render(
+    env: &Env,
+    screen: &wezterm_term::Screen,
+    rows: usize,
+    cols: usize,
+    palette: &ColorPalette,
+    syms: &Syms,
+    dirty: &[isize],
+    first_stable: isize,
+) -> Result<()> {
+    // Convert to visible-row indices and sort ascending for efficient
+    // forward-line navigation.
+    let mut vis_rows: Vec<usize> = dirty
+        .iter()
+        .map(|s| (s - first_stable) as usize)
+        .filter(|&v| v < rows)
+        .collect();
+    vis_rows.sort_unstable();
+    vis_rows.dedup();
+
+    env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
+    let mut current_line: i64 = 0;
+
+    for &vis_row in &vis_rows {
+        // Navigate forward to the target row
+        let delta = vis_row as i64 - current_line;
+        env.call(&syms.forward_line, (delta,))?;
+        current_line = vis_row as i64;
+
+        // Delete old content (preserves the newline)
+        let lbeg = env.call(&syms.line_beginning_position, [])?;
+        let lend = env.call(&syms.line_end_position, [])?;
+        env.call(&syms.delete_region, (lbeg, lend))?;
+
+        // Re-render this line at point
+        let stable = screen.visible_row_to_stable_row(vis_row as i64);
+        if let Some(phys) = screen.stable_row_to_phys(stable) {
+            let lines = screen.lines_in_phys_range(phys..phys + 1);
+            if let Some(line) = lines.first() {
+                render_line(env, line, cols, palette, syms)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compute the character offset within a rendered line for cursor placement.
+/// Wide characters (width > 1 cell) produce a single rendered character, so
+/// the character index may differ from the cell column.
+fn cursor_char_offset(
+    screen: &wezterm_term::Screen,
+    cursor_y: i64,
+    cursor_x: usize,
+    cols: usize,
+) -> usize {
+    let stable = screen.visible_row_to_stable_row(cursor_y);
+    let phys = match screen.stable_row_to_phys(stable) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let lines = screen.lines_in_phys_range(phys..phys + 1);
+    let line = match lines.first() {
+        Some(l) => l,
+        None => return 0,
+    };
+
+    let mut char_idx = 0usize;
     for col in 0..cols {
+        if col == cursor_x {
+            return char_idx;
+        }
         if let Some(cell) = line.get_cell(col) {
             if cell.width() == 0 {
                 continue;
             }
-            char_entries.push(col);
-        } else {
-            char_entries.push(col);
         }
+        char_idx += 1;
     }
-
-    // Find which character index the cursor falls on
-    let cursor_char_idx = char_entries
-        .iter()
-        .position(|&col| col >= cursor_col as usize)
-        .unwrap_or(char_entries.len());
-
-    // Render the line
-    let line_start = env.call("point", [])?.into_rust::<i64>()?;
-    render_line(env, line, cols, palette)?;
-
-    // Calculate cursor position: count characters up to cursor_char_idx
-    let cursor_pos = line_start + cursor_char_idx as i64;
-    let line_end = env.call("point", [])?.into_rust::<i64>()?;
-    Ok(cursor_pos.min(line_end).max(line_start))
+    char_idx
 }
 
-/// A styled run of text with optional hyperlink.
+// ---------------------------------------------------------------------------
+// Per-line rendering
+// ---------------------------------------------------------------------------
+
 struct StyledRun {
     text: String,
-    attrs: CellAttributes,
+    face_key: FaceKey,
+    has_style: bool,
     hyperlink_uri: Option<String>,
 }
 
-/// Find the last column that has non-space content or a non-default background.
-/// Trailing blank cells beyond this point are rendered as plain unstyled spaces.
+/// Find the last column with non-space content or non-default background.
+/// Trailing blanks past this point are rendered unstyled to prevent
+/// underline / strikethrough from extending across the full width.
 fn last_content_col(line: &wezterm_surface::Line, cols: usize) -> usize {
     let mut last = 0;
     for col in 0..cols {
@@ -125,21 +444,89 @@ fn last_content_col(line: &wezterm_surface::Line, cols: usize) -> usize {
     last
 }
 
-/// Render a single line by accumulating style runs and inserting with faces.
-/// Trailing blank cells are rendered as plain unstyled spaces to avoid
-/// underline/strikethrough extending across the full terminal width.
+/// Render a single line at the current buffer position.
+///
+/// Collects styled runs, builds propertized strings via the face cache,
+/// and inserts everything with a single `(insert …)` call.
 fn render_line(
     env: &Env,
     line: &wezterm_surface::Line,
     cols: usize,
     palette: &ColorPalette,
+    syms: &Syms,
 ) -> Result<()> {
     let content_end = last_content_col(line, cols);
+    let runs = collect_runs(line, cols, content_end, palette);
 
+    if runs.is_empty() {
+        let blanks = " ".repeat(cols);
+        env.call(&syms.insert, (blanks.as_str(),))?;
+        return Ok(());
+    }
+
+    // Resolve the hyperlink keymap once if any run carries a link.
+    let hyperlink_km = if runs.iter().any(|r| r.hyperlink_uri.is_some()) {
+        Some(env.call(&syms.symbol_value, (&syms.ebb_hyperlink_map,))?)
+    } else {
+        None
+    };
+
+    let mut insert_args: Vec<Value> = Vec::with_capacity(runs.len());
+
+    for run in &runs {
+        let needs_props = run.has_style || run.hyperlink_uri.is_some();
+
+        if needs_props {
+            // Build (propertize TEXT prop val …) argument vector.
+            let mut pargs: Vec<Value> = Vec::with_capacity(14);
+            pargs.push(run.text.as_str().into_lisp(env)?);
+
+            if run.has_style {
+                pargs.push(syms.face.bind(env));
+                pargs.push(build_face_plist(env, &run.face_key, syms)?);
+            }
+
+            if let Some(ref uri) = run.hyperlink_uri {
+                pargs.push(syms.ebb_url.bind(env));
+                pargs.push(uri.as_str().into_lisp(env)?);
+                pargs.push(syms.help_echo.bind(env));
+                pargs.push(uri.as_str().into_lisp(env)?);
+                pargs.push(syms.mouse_face.bind(env));
+                pargs.push(syms.highlight.bind(env));
+                if let Some(km) = hyperlink_km {
+                    pargs.push(syms.keymap.bind(env));
+                    pargs.push(km);
+                }
+            }
+
+            // Prevent face properties from bleeding into adjacent
+            // unstyled text via Emacs rear-stickiness.
+            pargs.push(syms.rear_nonsticky.bind(env));
+            pargs.push(syms.t_val.bind(env));
+
+            insert_args.push(env.call(&syms.propertize, &pargs[..])?);
+        } else {
+            insert_args.push(run.text.as_str().into_lisp(env)?);
+        }
+    }
+
+    // Single insert call for the whole line.
+    env.call(&syms.insert, &insert_args[..])?;
+    Ok(())
+}
+
+/// Collect styled runs from a terminal line (pure data, no FFI).
+fn collect_runs(
+    line: &wezterm_surface::Line,
+    cols: usize,
+    content_end: usize,
+    palette: &ColorPalette,
+) -> Vec<StyledRun> {
     let mut runs: Vec<StyledRun> = Vec::new();
-    let mut current_text = String::new();
-    let mut current_attrs: Option<CellAttributes> = None;
-    let mut current_link: Option<String> = None;
+    let mut text = String::new();
+    let mut cur_key: Option<FaceKey> = None;
+    let mut cur_style = false;
+    let mut cur_link: Option<String> = None;
 
     for col in 0..cols {
         if let Some(cell) = line.get_cell(col) {
@@ -147,8 +534,8 @@ fn render_line(
                 continue;
             }
 
-            // Past content end: treat trailing blanks as unstyled to avoid
-            // underline/strikethrough extending across the full width.
+            // Past the last visible content: treat trailing blanks as unstyled
+            // so underline/strikethrough don't extend to the edge.
             let (attrs, link_uri) = if col >= content_end {
                 (CellAttributes::default(), None)
             } else {
@@ -158,167 +545,68 @@ fn render_line(
                 )
             };
 
-            let same_style = current_attrs.as_ref().map_or(false, |ca| {
-                ca.attribute_bits_equal(&attrs)
-                    && ca.foreground() == attrs.foreground()
-                    && ca.background() == attrs.background()
-            });
-            let same_link = current_link == link_uri;
+            let (key, has_style) = make_face_key(&attrs, palette);
+            let same = cur_key.as_ref().map_or(false, |k| *k == key) && cur_link == link_uri;
 
-            if same_style && same_link {
+            if same {
                 let s = cell.str();
                 if s.is_empty() {
-                    current_text.push(' ');
+                    text.push(' ');
                 } else {
-                    current_text.push_str(s);
+                    text.push_str(s);
                 }
             } else {
-                if !current_text.is_empty() {
-                    if let Some(a) = current_attrs.take() {
-                        runs.push(StyledRun {
-                            text: std::mem::take(&mut current_text),
-                            attrs: a,
-                            hyperlink_uri: current_link.take(),
-                        });
-                    }
+                // Flush previous run
+                if !text.is_empty() {
+                    runs.push(StyledRun {
+                        text: std::mem::take(&mut text),
+                        face_key: cur_key.take().unwrap_or_else(FaceKey::default_unstyled),
+                        has_style: cur_style,
+                        hyperlink_uri: cur_link.take(),
+                    });
                 }
-                current_attrs = Some(attrs);
-                current_link = link_uri;
+                cur_key = Some(key);
+                cur_style = has_style;
+                cur_link = link_uri;
                 let s = cell.str();
                 if s.is_empty() {
-                    current_text.push(' ');
+                    text.push(' ');
                 } else {
-                    current_text.push_str(s);
+                    text.push_str(s);
                 }
             }
         } else {
             // Cell doesn't exist (sparse line) — treat as unstyled space.
-            // Must break the current run if it carries any styling, otherwise
-            // underline/strikethrough bleeds into trailing blanks.
-            let attrs = CellAttributes::default();
-            let same_style = current_attrs.as_ref().map_or(false, |ca| {
-                ca.attribute_bits_equal(&attrs)
-                    && ca.foreground() == attrs.foreground()
-                    && ca.background() == attrs.background()
-            });
-            if same_style {
-                current_text.push(' ');
+            // Must break the current run if it carries any styling,
+            // otherwise underline/strikethrough bleeds into trailing blanks.
+            let default_key = FaceKey::default_unstyled();
+            let same = cur_key.as_ref().map_or(false, |k| *k == default_key) && cur_link.is_none();
+            if same {
+                text.push(' ');
             } else {
-                if !current_text.is_empty() {
-                    if let Some(a) = current_attrs.take() {
-                        runs.push(StyledRun {
-                            text: std::mem::take(&mut current_text),
-                            attrs: a,
-                            hyperlink_uri: current_link.take(),
-                        });
-                    }
+                if !text.is_empty() {
+                    runs.push(StyledRun {
+                        text: std::mem::take(&mut text),
+                        face_key: cur_key.take().unwrap_or_else(FaceKey::default_unstyled),
+                        has_style: cur_style,
+                        hyperlink_uri: cur_link.take(),
+                    });
                 }
-                current_attrs = Some(attrs);
-                current_link = None;
-                current_text.push(' ');
+                cur_key = Some(default_key);
+                cur_style = false;
+                cur_link = None;
+                text.push(' ');
             }
         }
     }
 
-    if !current_text.is_empty() {
+    if !text.is_empty() {
         runs.push(StyledRun {
-            text: current_text,
-            attrs: current_attrs.unwrap_or_default(),
-            hyperlink_uri: current_link,
+            text,
+            face_key: cur_key.unwrap_or_else(FaceKey::default_unstyled),
+            has_style: cur_style,
+            hyperlink_uri: cur_link,
         });
     }
-
-    // Insert runs with face properties
-    let face_sym = env.intern("face")?;
-    let help_echo_sym = env.intern("help-echo")?;
-    let mouse_face_sym = env.intern("mouse-face")?;
-    let highlight_sym = env.intern("highlight")?;
-    let ebb_url_sym = env.intern("ebb-url")?;
-    let keymap_sym = env.intern("keymap")?;
-
-    for run in &runs {
-        let has_style = run.attrs.foreground() != ColorAttribute::Default
-            || run.attrs.background() != ColorAttribute::Default
-            || run.attrs.intensity() != Intensity::Normal
-            || run.attrs.italic()
-            || run.attrs.underline() != wezterm_escape_parser::csi::Underline::None
-            || run.attrs.strikethrough()
-            || run.attrs.reverse();
-
-        let start = env.call("point", [])?;
-        env.call("insert", (run.text.as_str(),))?;
-        let end = env.call("point", [])?;
-
-        if has_style {
-            let face_str = build_face_string(&run.attrs, palette);
-            let face_val = env.call("read", (face_str.as_str(),))?;
-            env.call("put-text-property", (start, end, face_sym, face_val))?;
-        }
-
-        if let Some(uri) = &run.hyperlink_uri {
-            env.call("put-text-property", (start, end, ebb_url_sym, uri.as_str()))?;
-            env.call(
-                "put-text-property",
-                (start, end, help_echo_sym, uri.as_str()),
-            )?;
-            env.call(
-                "put-text-property",
-                (start, end, mouse_face_sym, highlight_sym),
-            )?;
-            let km = env.call("symbol-value", (env.intern("ebb-hyperlink-map")?,))?;
-            env.call("put-text-property", (start, end, keymap_sym, km))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Build an Emacs face plist string.
-fn build_face_string(attrs: &CellAttributes, palette: &ColorPalette) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(hex) = resolve_color(attrs.foreground(), palette) {
-        parts.push(format!(":foreground \"{}\"", hex));
-    }
-    if let Some(hex) = resolve_color(attrs.background(), palette) {
-        parts.push(format!(":background \"{}\"", hex));
-    }
-    match attrs.intensity() {
-        Intensity::Bold => parts.push(":weight bold".to_string()),
-        Intensity::Half => parts.push(":weight light".to_string()),
-        Intensity::Normal => {}
-    }
-    if attrs.italic() {
-        parts.push(":slant italic".to_string());
-    }
-    if attrs.underline() != wezterm_escape_parser::csi::Underline::None {
-        parts.push(":underline t".to_string());
-    }
-    if attrs.strikethrough() {
-        parts.push(":strike-through t".to_string());
-    }
-    if attrs.reverse() {
-        parts.push(":inverse-video t".to_string());
-    }
-
-    format!("({})", parts.join(" "))
-}
-
-fn resolve_color(attr: ColorAttribute, palette: &ColorPalette) -> Option<String> {
-    match attr {
-        ColorAttribute::Default => None,
-        ColorAttribute::PaletteIndex(idx) => {
-            let color = palette.resolve_fg(ColorAttribute::PaletteIndex(idx));
-            Some(srgba_to_hex(color))
-        }
-        ColorAttribute::TrueColorWithPaletteFallback(srgba, _) => Some(srgba_to_hex(srgba)),
-        ColorAttribute::TrueColorWithDefaultFallback(srgba) => Some(srgba_to_hex(srgba)),
-    }
-}
-
-fn srgba_to_hex(color: SrgbaTuple) -> String {
-    let r = (color.0 * 255.0).round() as u8;
-    let g = (color.1 * 255.0).round() as u8;
-    let b = (color.2 * 255.0).round() as u8;
-    format!("#{:02x}{:02x}{:02x}", r, g, b)
+    runs
 }

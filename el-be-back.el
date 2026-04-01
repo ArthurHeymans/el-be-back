@@ -286,9 +286,8 @@ Lines beyond this limit are deleted from the top of the buffer."
     (let ((chunks (nreverse ebb--pending-chunks)))
       (setq ebb--pending-chunks nil
             ebb--first-chunk-time nil)
-      ;; Feed all chunks to the terminal
-      (dolist (chunk chunks)
-        (ebb--feed ebb--terminal chunk))
+      ;; Feed all chunks to the terminal in one call
+      (ebb--feed ebb--terminal (apply #'concat chunks))
       ;; Render the screen
       (let ((inhibit-read-only t)
             (inhibit-modification-hooks t)
