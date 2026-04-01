@@ -192,7 +192,31 @@ fn render_line(
                 }
             }
         } else {
-            current_text.push(' ');
+            // Cell doesn't exist (sparse line) — treat as unstyled space.
+            // Must break the current run if it carries any styling, otherwise
+            // underline/strikethrough bleeds into trailing blanks.
+            let attrs = CellAttributes::default();
+            let same_style = current_attrs.as_ref().map_or(false, |ca| {
+                ca.attribute_bits_equal(&attrs)
+                    && ca.foreground() == attrs.foreground()
+                    && ca.background() == attrs.background()
+            });
+            if same_style {
+                current_text.push(' ');
+            } else {
+                if !current_text.is_empty() {
+                    if let Some(a) = current_attrs.take() {
+                        runs.push(StyledRun {
+                            text: std::mem::take(&mut current_text),
+                            attrs: a,
+                            hyperlink_uri: current_link.take(),
+                        });
+                    }
+                }
+                current_attrs = Some(attrs);
+                current_link = None;
+                current_text.push(' ');
+            }
         }
     }
 
