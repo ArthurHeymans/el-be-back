@@ -274,20 +274,18 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
     let needs_full = *last_rows != rows || *last_seqno == 0;
 
     if needs_full {
-        // ---- Full render: scrollback (plain text) + display (styled) ----
+        // ---- Full render: scrollback (styled) + display (styled) ----
         env.call(&syms.erase_buffer, [])?;
 
-        // Bulk-insert scrollback as plain text for speed.
+        // Render scrollback lines with full styling (colors, bold, etc.).
         if scrollback_count > 0 {
-            let mut sb = String::new();
             for phys in 0..scrollback_count {
                 let lines = screen.lines_in_phys_range(phys..phys + 1);
                 if let Some(line) = lines.first() {
-                    sb.push_str(&line.as_str());
+                    render_line(env, line, cols, &palette, syms)?;
                 }
-                sb.push('\n');
+                env.call(&syms.insert, ("\n",))?;
             }
-            env.call(&syms.insert, (sb.as_str(),))?;
         }
 
         // Render visible rows with full styling.
@@ -351,16 +349,12 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
             if missed > 0 {
                 env.call(&syms.goto_char, (env.call(&syms.point_max, [])?,))?;
                 let start_phys = scrollback_count.saturating_sub(missed);
-                let mut sb = String::new();
                 for phys in start_phys..scrollback_count {
                     let lines = screen.lines_in_phys_range(phys..phys + 1);
                     if let Some(line) = lines.first() {
-                        sb.push('\n');
-                        sb.push_str(&line.as_str());
+                        env.call(&syms.insert, ("\n",))?;
+                        render_line(env, line, cols, &palette, syms)?;
                     }
-                }
-                if !sb.is_empty() {
-                    env.call(&syms.insert, (sb.as_str(),))?;
                 }
                 *scrollback_in_buffer += missed;
             }
