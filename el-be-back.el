@@ -79,16 +79,47 @@ Used when the shell reports a CWD on an unknown remote host
   (expand-file-name (concat ebb--module-name ".so") ebb--directory))
 
 (defun ebb-compile-module ()
-  "Compile the Rust dynamic module."
+  "Compile the Rust dynamic module.
+On NixOS or when nix is available and a flake.nix exists, uses
+`nix build' for correct toolchain handling.  Otherwise falls back
+to `cargo build --release'."
   (interactive)
   (let ((default-directory ebb--directory))
-    (message "[ebb] Compiling module (this may take a minute)...")
+    (if (and (executable-find "nix")
+             (file-exists-p (expand-file-name "flake.nix" ebb--directory)))
+        (ebb--compile-module-nix)
+      (ebb--compile-module-cargo))))
+
+(defun ebb--compile-module-nix ()
+  "Compile the module using `nix build'."
+  (let* ((default-directory ebb--directory)
+         (ext (if (eq system-type 'darwin) "dylib" "so"))
+         (buf (get-buffer-create "*ebb-compile*")))
+    (message "[ebb] Compiling module via nix build (this may take a few minutes)...")
+    (with-current-buffer buf (erase-buffer))
+    (let ((status (call-process "nix" nil buf t "build")))
+      (unless (= status 0)
+        (pop-to-buffer buf)
+        (error "[ebb] nix build failed (exit code %d)" status)))
+    (let* ((result-link (expand-file-name "result" ebb--directory))
+           (src (expand-file-name (format "lib/ebb-module.%s" ext) result-link))
+           (dst (ebb--module-file)))
+      (unless (file-exists-p src)
+        (pop-to-buffer buf)
+        (error "[ebb] Built module not found at %s" src))
+      (copy-file src dst t)
+      (message "[ebb] Module compiled successfully via nix."))))
+
+(defun ebb--compile-module-cargo ()
+  "Compile the module using `cargo build --release'."
+  (let ((default-directory ebb--directory))
+    (message "[ebb] Compiling module via cargo (this may take a minute)...")
     (let ((status (call-process
                    "cargo" nil "*ebb-compile*" t
                    "build" "--release")))
       (unless (= status 0)
         (pop-to-buffer "*ebb-compile*")
-        (error "[ebb] Module compilation failed (exit code %d)" status)))
+        (error "[ebb] cargo build failed (exit code %d)" status)))
     (let* ((target-dir (expand-file-name "target/release/"))
            ;; Cargo converts hyphens to underscores in library filenames
            (crate-name (replace-regexp-in-string "-" "_" ebb--module-name))

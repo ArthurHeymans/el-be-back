@@ -38,33 +38,94 @@ clickable hyperlinks, copy mode).
 * Requirements
 
 - Emacs 29.1+ with dynamic module support
-- Rust toolchain (nightly, for building the module)
+- Rust stable toolchain (for building the module), or Nix
 - A C compiler (for the =emacs= crate's bindings)
 
 * Installation
 
-#+begin_src sh
-git clone <repo-url> el_be_back
-cd el_be_back
-./build.sh
-#+end_src
-
-Or with Nix:
+** Manual (cargo)
 
 #+begin_src sh
-nix develop    # enters a shell with the Rust toolchain
-./build.sh
+git clone https://github.com/ArthurHeymans/el-be-back.git
+cd el-be-back
+cargo build --release
+cp target/release/libebb_module.so ebb-module.so  # .dylib on macOS
 #+end_src
 
 Then in Emacs:
 
 #+begin_src emacs-lisp
-(add-to-list 'load-path "/path/to/el_be_back")
+(add-to-list 'load-path "/path/to/el-be-back")
 (require 'el-be-back)
 #+end_src
 
-The module auto-compiles on first load if =ebb-always-compile-module= is
-non-nil (the default).
+Or run =M-x ebb-compile-module= from Emacs to compile interactively.
+On NixOS (or any system with =nix= available), this automatically uses
+=nix build= instead of =cargo= to avoid linker issues.
+
+** Nix (flake)
+
+The flake exports a package that builds the Rust module:
+
+#+begin_src sh
+nix build github:ArthurHeymans/el-be-back
+ls result/lib/ebb-module.so result/share/emacs/site-lisp/el-be-back.el
+#+end_src
+
+** NixOS with nix-doom-emacs-unstraightened
+
+Add the flake input to your =flake.nix=:
+
+#+begin_src nix
+inputs.el-be-back = {
+  url = "github:ArthurHeymans/el-be-back";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+#+end_src
+
+Then in your Emacs home-manager module, build the Emacs package from
+the pre-compiled module and add it to =extraPackages=:
+
+#+begin_src nix
+programs.doom-emacs = {
+  extraPackages = epkgs:
+    let
+      ebb-module = inputs.el-be-back.packages.${pkgs.system}.default;
+      el-be-back = epkgs.trivialBuild {
+        pname = "el-be-back";
+        version = "0.1.0";
+        src = inputs.el-be-back;
+        postInstall = ''
+          install -m444 ${ebb-module}/lib/ebb-module.so \
+            $out/share/emacs/site-lisp/
+        '';
+      };
+    in
+    [ el-be-back ];
+};
+#+end_src
+
+This pre-builds the module via nix so Doom never needs to compile it.
+
+** Doom Emacs (without Nix)
+
+In =packages.el=:
+
+#+begin_src emacs-lisp
+(package! el-be-back
+  :recipe (:host github
+           :repo "ArthurHeymans/el-be-back"
+           :files ("*.el" "Cargo.toml" "Cargo.lock" "src" "build.sh")))
+#+end_src
+
+In =config.el=:
+
+#+begin_src emacs-lisp
+(use-package! el-be-back
+  :commands (ebb)
+  :config
+  (setq ebb-always-compile-module t))
+#+end_src
 
 * Usage
 
