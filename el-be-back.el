@@ -6,7 +6,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: terminals
-;; URL: https://github.com/arthur/el-be-back
+;; URL: https://github.com/ArthurHeymans/el-be-back
 
 ;;; Commentary:
 
@@ -51,8 +51,10 @@
   :type 'number
   :group 'el-be-back)
 
-(defcustom ebb-always-compile-module t
-  "If non-nil, compile the module automatically if not found."
+(defcustom ebb-always-compile-module nil
+  "If non-nil, compile the module automatically if not found.
+When nil, an error is raised with instructions to run
+\\[ebb-compile-module] manually."
   :type 'boolean
   :group 'el-be-back)
 

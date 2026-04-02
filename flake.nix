@@ -32,7 +32,7 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          rust = pkgs.rust-bin.nightly."2026-02-27".default.override {
+          rust = pkgs.rust-bin.stable.latest.default.override {
             extensions = [
               "rust-src"
               "rust-analyzer"
