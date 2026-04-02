@@ -80,35 +80,39 @@ Used when the shell reports a CWD on an unknown remote host
 
 (defun ebb-compile-module ()
   "Compile the Rust dynamic module.
-On NixOS or when nix is available and a flake.nix exists, uses
-`nix build' for correct toolchain handling.  Otherwise falls back
-to `cargo build --release'."
+On NixOS, uses `nix shell' to provide a working Rust toolchain
+\(rustup's linker paths are broken on NixOS).  Otherwise uses
+`cargo build --release' directly."
   (interactive)
   (let ((default-directory ebb--directory))
-    (if (and (executable-find "nix")
-             (file-exists-p (expand-file-name "flake.nix" ebb--directory)))
-        (ebb--compile-module-nix)
-      (ebb--compile-module-cargo))))
+    (cond
+     ;; NixOS: always use nix shell (rustup's linker is broken)
+     ((file-exists-p "/etc/NIXOS")
+      (ebb--compile-module-nix))
+     ;; Has cargo: use it directly
+     ((executable-find "cargo")
+      (ebb--compile-module-cargo))
+     ;; No cargo but has nix: use nix shell
+     ((executable-find "nix")
+      (ebb--compile-module-nix))
+     (t
+      (error "[ebb] Neither cargo nor nix found.  Install Rust or Nix to compile the module")))))
 
 (defun ebb--compile-module-nix ()
-  "Compile the module using `nix build'."
-  (let* ((default-directory ebb--directory)
-         (ext (if (eq system-type 'darwin) "dylib" "so"))
-         (buf (get-buffer-create "*ebb-compile*")))
-    (message "[ebb] Compiling module via nix build (this may take a few minutes)...")
-    (with-current-buffer buf (erase-buffer))
-    (let ((status (call-process "nix" nil buf t "build")))
+  "Compile the module using a nix-provided Rust toolchain.
+Runs `nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#gcc' to get
+a working toolchain, then `cargo build --release' inside it.
+Works in any directory (does not require a git repo or flake)."
+  (let ((default-directory ebb--directory))
+    (message "[ebb] Compiling module via nix shell (this may take a few minutes)...")
+    (let ((status (call-process
+                   "nix" nil "*ebb-compile*" t
+                   "shell" "nixpkgs#cargo" "nixpkgs#rustc" "nixpkgs#gcc"
+                   "-c" "cargo" "build" "--release")))
       (unless (= status 0)
-        (pop-to-buffer buf)
-        (error "[ebb] nix build failed (exit code %d)" status)))
-    (let* ((result-link (expand-file-name "result" ebb--directory))
-           (src (expand-file-name (format "lib/ebb-module.%s" ext) result-link))
-           (dst (ebb--module-file)))
-      (unless (file-exists-p src)
-        (pop-to-buffer buf)
-        (error "[ebb] Built module not found at %s" src))
-      (copy-file src dst t)
-      (message "[ebb] Module compiled successfully via nix."))))
+        (pop-to-buffer "*ebb-compile*")
+        (error "[ebb] nix cargo build failed (exit code %d)" status)))
+    (ebb--install-built-module)))
 
 (defun ebb--compile-module-cargo ()
   "Compile the module using `cargo build --release'."
@@ -120,20 +124,24 @@ to `cargo build --release'."
       (unless (= status 0)
         (pop-to-buffer "*ebb-compile*")
         (error "[ebb] cargo build failed (exit code %d)" status)))
-    (let* ((target-dir (expand-file-name "target/release/"))
-           ;; Cargo converts hyphens to underscores in library filenames
-           (crate-name (replace-regexp-in-string "-" "_" ebb--module-name))
-           (lib-name (cond
-                      ((eq system-type 'darwin)
-                       (concat "lib" crate-name ".dylib"))
-                      (t
-                       (concat "lib" crate-name ".so"))))
-           (src (expand-file-name lib-name target-dir))
-           (dst (ebb--module-file)))
-      (unless (file-exists-p src)
-        (error "[ebb] Built library not found at %s" src))
-      (copy-file src dst t)
-      (message "[ebb] Module compiled successfully."))))
+    (ebb--install-built-module)))
+
+(defun ebb--install-built-module ()
+  "Copy the built module from target/release/ to the package directory."
+  (let* ((target-dir (expand-file-name "target/release/" ebb--directory))
+         ;; Cargo converts hyphens to underscores in library filenames
+         (crate-name (replace-regexp-in-string "-" "_" ebb--module-name))
+         (lib-name (cond
+                    ((eq system-type 'darwin)
+                     (concat "lib" crate-name ".dylib"))
+                    (t
+                     (concat "lib" crate-name ".so"))))
+         (src (expand-file-name lib-name target-dir))
+         (dst (ebb--module-file)))
+    (unless (file-exists-p src)
+      (error "[ebb] Built library not found at %s" src))
+    (copy-file src dst t)
+    (message "[ebb] Module compiled successfully.")))
 
 (add-to-list 'load-path ebb--directory)
 (unless (require 'ebb-module nil t)
