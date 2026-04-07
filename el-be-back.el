@@ -280,7 +280,7 @@ nil — raise an error."
 (defconst ebb--module-name "ebb-module"
   "Name of the dynamic module.")
 
-(defconst ebb--minimum-module-version "0.1.0"
+(defconst ebb--minimum-module-version "0.2.0"
   "Minimum module version required by this Elisp.")
 
 (defconst ebb--directory
@@ -399,9 +399,13 @@ On NixOS, uses `nix shell' to provide a working Rust toolchain
 
 (when (and (fboundp 'ebb--version)
            (version< (ebb--version) ebb--minimum-module-version))
-  (warn "[ebb] Module version %s is older than required %s. \
-Run M-x ebb-compile-module to update."
-        (ebb--version) ebb--minimum-module-version))
+  (warn "[ebb] Module version %s is older than required %s — attempting recompile."
+        (ebb--version) ebb--minimum-module-version)
+  (condition-case err
+      (progn (ebb-compile-module) (require 'ebb-module))
+    (error
+     (error "[ebb] Module recompile failed: %s.  \
+Please run M-x ebb-compile-module manually." (error-message-string err)))))
 
 ;;; --- Buffer-local variables ---
 
@@ -461,25 +465,57 @@ Run M-x ebb-compile-module to update."
 
 (defun ebb--face-hex-color (face attr)
   "Extract hex color string from FACE's ATTR (:foreground or :background).
+For the special \='default face the attribute is read directly.
+For all other faces the :inherit chain is followed without ever
+falling back to the \='default face, so a theme that leaves
+term-color-* foregrounds unspecified does not cause every palette
+entry to collapse to the default-face colour.
 Falls back to \"#000000\" if the color cannot be resolved."
-  (or (let ((color (face-attribute face attr nil 'default)))
-        (when (and (stringp color) (not (string= color "unspecified")))
-          (let ((rgb (color-values color)))
-            (if rgb
-                (apply #'format "#%02x%02x%02x"
-                       (mapcar (lambda (c) (ash c -8)) rgb))
-              ;; Batch mode: color-values returns nil without a display.
-              (and (string-prefix-p "#" color) (= (length color) 7)
-                   color)))))
+  (or (if (eq face 'default)
+          ;; Read the default face directly — no inheritance needed.
+          (ebb--color-string-to-hex (face-attribute 'default attr nil nil))
+        ;; Walk the :inherit chain, stopping before `default'.
+        (ebb--resolve-face-color face attr nil))
       "#000000"))
+
+(defun ebb--color-string-to-hex (color)
+  "Convert a color name or #RRGGBB string COLOR to #RRGGBB, or nil."
+  (when (and (stringp color) (not (string= color "unspecified")))
+    (let ((rgb (color-values color)))
+      (if rgb
+          (apply #'format "#%02x%02x%02x"
+                 (mapcar (lambda (c) (ash c -8)) rgb))
+        ;; Batch mode: color-values returns nil without a display.
+        (and (string-prefix-p "#" color) (= (length color) 7)
+             color)))))
+
+(defun ebb--resolve-face-color (face attr seen)
+  "Recursively resolve FACE's ATTR following :inherit, skipping `default'.
+SEEN is a list of already-visited face symbols used to break cycles.
+Returns a hex string or nil."
+  (when (and (symbolp face)
+             face
+             (not (eq face 'default))
+             (not (memq face seen)))
+    (let* ((seen (cons face seen))
+           (color (face-attribute face attr nil nil)))
+      (if (and (stringp color) (not (string= color "unspecified")))
+          (ebb--color-string-to-hex color)
+        ;; No direct attr; follow :inherit.
+        (let ((inh (face-attribute face :inherit nil nil)))
+          (unless (or (null inh) (eq inh 'unspecified))
+            (if (listp inh)
+                (cl-some (lambda (f) (ebb--resolve-face-color f attr seen)) inh)
+              (ebb--resolve-face-color inh attr seen))))))))
 
 (defun ebb--apply-palette (term)
   "Apply colors from `ebb-color-palette' faces and default fg/bg to TERM."
   (when term
-    (ebb--set-default-colors
-     term
-     (ebb--face-hex-color 'default :foreground)
-     (ebb--face-hex-color 'default :background))
+    (when (fboundp 'ebb--set-default-colors)
+      (ebb--set-default-colors
+       term
+       (ebb--face-hex-color 'default :foreground)
+       (ebb--face-hex-color 'default :background)))
     (when ebb-color-palette
       (let ((colors
              (mapconcat

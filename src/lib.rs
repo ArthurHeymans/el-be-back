@@ -13,7 +13,7 @@ use config::{AlertQueue, EbbAlertSink, EbbConfig};
 
 emacs::plugin_is_GPL_compatible!();
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.2.0";
 
 #[emacs::module(name = "ebb-module", defun_prefix = "ebb", separator = "--")]
 fn init(env: &Env) -> Result<()> {
