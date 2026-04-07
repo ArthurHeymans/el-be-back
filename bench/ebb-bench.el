@@ -467,14 +467,14 @@ DATA-SIZE is the byte count processed per iteration (for MB/s)."
   (let* ((raw-data (ebb-bench--gen-plain-ascii ebb-bench-data-size))
          (chunk-size ebb-bench-chunk-size)
          (redraw-every 16))
-    ;; ebb
+    ;; ebb (separate feed + render)
     (with-temp-buffer
       (let* ((data (ebb-bench--encode-for-backend raw-data 'ebb))
              (data-len (length data))
              (term (ebb-bench--make-ebb 24 80))
              (inhibit-read-only t))
         (ebb-bench--measure
-         "stream/ebb" (string-bytes data) ebb-bench-iterations
+         "stream/ebb-sep" (string-bytes data) ebb-bench-iterations
          (lambda ()
            (let ((offset 0) (chunk-count 0))
              (while (< offset data-len)
@@ -484,6 +484,26 @@ DATA-SIZE is the byte count processed per iteration (for MB/s)."
                  (cl-incf chunk-count)
                  (when (zerop (% chunk-count redraw-every))
                    (ebb--render term)))))))))
+    ;; ebb (combined feed+render — O1 optimization, same redraw cadence)
+    (with-temp-buffer
+      (let* ((data (ebb-bench--encode-for-backend raw-data 'ebb))
+             (data-len (length data))
+             (term (ebb-bench--make-ebb 24 80))
+             (inhibit-read-only t))
+        (ebb-bench--measure
+         "stream/ebb-combined" (string-bytes data) ebb-bench-iterations
+         (lambda ()
+           (let ((offset 0) (chunk-count 0))
+             (while (< offset data-len)
+               (let ((end (min (+ offset chunk-size) data-len)))
+                 ;; Feed without render for most chunks
+                 (cl-incf chunk-count)
+                 (if (zerop (% chunk-count redraw-every))
+                     ;; Combined feed+render every 16th chunk
+                     (ebb--feed-and-render term (substring data offset end))
+                   ;; Feed only for intermediate chunks
+                   (ebb--feed term (substring data offset end)))
+                 (setq offset end))))))))
     ;; ghostel
     (when ebb-bench-include-ghostel
       (with-temp-buffer
@@ -570,7 +590,7 @@ DATA-SIZE is the byte count processed per iteration (for MB/s)."
              (cols (cdr size))
              (raw-frame (ebb-bench--gen-tui-frame rows cols))
              (label (format "%dx%d" rows cols)))
-        ;; ebb
+        ;; ebb (combined feed+render)
         (with-temp-buffer
           (let ((frame (ebb-bench--encode-for-backend raw-frame 'ebb))
                 (term (ebb-bench--make-ebb rows cols))
@@ -580,8 +600,7 @@ DATA-SIZE is the byte count processed per iteration (for MB/s)."
                     (format "tui-frame/ebb/%s" label)
                     (string-bytes frame) tui-iterations
                     (lambda ()
-                      (ebb--feed term frame)
-                      (ebb--render term)))))
+                      (ebb--feed-and-render term frame)))))
               (message "    ^ %.0f fps" (/ 1000.0 (plist-get result :per-iter-ms))))))
         ;; ghostel
         (when ebb-bench-include-ghostel

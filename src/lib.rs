@@ -513,6 +513,16 @@ fn render<'a>(env: &'a Env, term_val: Value<'a>) -> Result<()> {
     render::render_to_buffer(env, &mut term)
 }
 
+/// Combined feed + render in a single FFI call (O1 optimization).
+/// Feeds PTY output bytes to the VT parser and renders the result,
+/// avoiding the Elisp→Rust→Elisp→Rust round-trip of separate
+/// feed + render calls.
+#[defun]
+fn feed_and_render<'a>(env: &'a Env, term_val: Value<'a>, bytes: String) -> Result<()> {
+    let mut term = term_val.into_ref_mut::<EbbTerminal>()?;
+    render::feed_and_render(env, &mut term, &bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Defuns: Color palette (Theme integration)
 // ---------------------------------------------------------------------------

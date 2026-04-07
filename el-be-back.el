@@ -994,42 +994,61 @@ Soft-wrapped newlines are removed and trailing whitespace is stripped."
     (cancel-timer ebb--render-timer)
     (setq ebb--render-timer nil))
   (when (and ebb--terminal ebb--pending-chunks)
-    ;; Feed current pending chunks.
-    (let ((chunks (nreverse ebb--pending-chunks)))
+    ;; Collect all pending chunks into a single string.
+    (let ((combined (apply #'concat (nreverse ebb--pending-chunks))))
       (setq ebb--pending-chunks nil
             ebb--first-chunk-time nil)
-      (ebb--feed ebb--terminal (apply #'concat chunks)))
-    ;; Drain any immediately available additional data before rendering.
-    (let ((deadline (+ (float-time) ebb-maximum-latency)))
-      (while (and ebb--process
-                  (process-live-p ebb--process)
-                  (< (float-time) deadline)
-                  (accept-process-output ebb--process 0 nil t)
-                  ebb--pending-chunks)
-        (when ebb--render-timer
-          (cancel-timer ebb--render-timer)
-          (setq ebb--render-timer nil))
-        (let ((chunks (nreverse ebb--pending-chunks)))
+      ;; Drain any immediately available additional data before rendering,
+      ;; concatenating everything into one big string to minimize FFI calls.
+      (let ((deadline (+ (float-time) ebb-maximum-latency)))
+        (while (and ebb--process
+                    (process-live-p ebb--process)
+                    (< (float-time) deadline)
+                    (accept-process-output ebb--process 0 nil t)
+                    ebb--pending-chunks)
+          (when ebb--render-timer
+            (cancel-timer ebb--render-timer)
+            (setq ebb--render-timer nil))
+          (setq combined (concat combined
+                                 (apply #'concat (nreverse ebb--pending-chunks))))
           (setq ebb--pending-chunks nil
-                ebb--first-chunk-time nil)
-          (ebb--feed ebb--terminal (apply #'concat chunks)))))
-    ;; Render the final screen state once.
-    (let ((inhibit-read-only t)
-          (inhibit-modification-hooks t)
-          (inhibit-quit t)
-          (buffer-undo-list t))
-      (ebb--render-screen)
-      ;; Detect links after rendering
-      (ebb--detect-urls))
+                ebb--first-chunk-time nil)))
+      ;; Scan for OSC sequences (prompts, eval, clipboard) before feeding.
+      (ebb--scan-osc-sequences combined)
+      ;; O1: Feed + render in a single FFI call.
+      ;; This avoids the Elisp->Rust->Elisp->Rust round-trip of separate
+      ;; ebb--feed + ebb--render calls.
+      (let ((inhibit-read-only t)
+            (inhibit-modification-hooks t)
+            (inhibit-quit t)
+            (buffer-undo-list t))
+        (ebb--feed-and-render ebb--terminal combined)
+        ;; Update cursor style
+        (ebb--update-cursor-style)
+        ;; Pin window to display region
+        (unless ebb-copy-mode
+          (let ((win (get-buffer-window (current-buffer))))
+            (when win
+              (let ((rows (ebb--get-rows ebb--terminal)))
+                (save-excursion
+                  (goto-char (point-max))
+                  (forward-line (- (1- rows)))
+                  (set-window-start win (point) t))))))
+        ;; Detect links after rendering
+        (ebb--detect-urls)))
     ;; Drain terminal responses and send to PTY
     (ebb--drain-and-send)
     ;; Process title/CWD/bell alerts
     (ebb--process-alerts)))
 
 (defun ebb--render-screen (&optional window)
-  "Render the terminal screen into the current buffer."
+  "Render the terminal screen into the current buffer.
+Used for resize redraws and copy-mode exit where no new data is fed."
   (when ebb--terminal
-    (ebb--render ebb--terminal)
+    (let ((inhibit-read-only t)
+          (inhibit-modification-hooks t)
+          (buffer-undo-list t))
+      (ebb--render ebb--terminal))
     ;; Phase A4: update cursor style
     (ebb--update-cursor-style)
     ;; Pin the window to show the display region
