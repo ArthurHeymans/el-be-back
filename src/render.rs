@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
+use emacs::raw::emacs_value;
 use emacs::{Env, GlobalRef, IntoLisp, Result, Value};
 use wezterm_cell::color::{ColorAttribute, SrgbaTuple};
 use wezterm_cell::CellAttributes;
@@ -216,23 +217,54 @@ fn srgba_to_rgb(c: SrgbaTuple) -> [u8; 3] {
 }
 
 // ---------------------------------------------------------------------------
-// Face cache (O6): cache face plist GlobalRefs keyed by FaceKey.
-// Cleared per-frame isn't needed because GlobalRefs persist across calls.
-// We use a per-render HashMap<FaceKey, Value> that builds the Lisp face
-// plist once per unique style and reuses it for subsequent runs with the
-// same style.
+// Face cache (O6): static Mutex<HashMap> of GlobalRefs keyed by FaceKey.
+// GlobalRefs are rooted and persist across frames, so identical face
+// combinations (e.g. "green on black, bold") are built once and reused
+// forever.  The Mutex is locked briefly per render_line call.
 // ---------------------------------------------------------------------------
 
-/// Build a face plist for the given FaceKey.
-/// Uses stack-allocated color buffers (O3) and pre-interned palette
-/// strings (O10) to minimize allocations.
-fn get_or_build_face<'e>(
-    env: &'e Env,
-    key: &FaceKey,
-    syms: &'e Syms,
-    _face_cache: &mut HashMap<FaceKey, GlobalRef>,
-) -> Result<Value<'e>> {
-    build_face_plist(env, key, syms)
+static FACE_CACHE: OnceLock<Mutex<HashMap<FaceKey, GlobalRef>>> = OnceLock::new();
+
+fn face_cache() -> &'static Mutex<HashMap<FaceKey, GlobalRef>> {
+    FACE_CACHE.get_or_init(|| Mutex::new(HashMap::with_capacity(64)))
+}
+
+/// Extract the raw emacs_value from a GlobalRef.
+/// This is safe because GlobalRef is #[repr(transparent)] over emacs_value.
+#[inline]
+fn global_ref_raw(gref: &GlobalRef) -> emacs_value {
+    // Safety: GlobalRef is #[repr(transparent)] wrapping emacs_value.
+    unsafe { std::ptr::read(gref as *const GlobalRef as *const emacs_value) }
+}
+
+/// Look up or build a face plist for the given FaceKey.
+/// Uses the global face cache to avoid rebuilding identical plists.
+///
+/// Safety: We extract the raw `emacs_value` from the GlobalRef while
+/// holding the MutexGuard, then create a Value from it after dropping
+/// the guard.  This is safe because:
+/// 1. The GlobalRef keeps the Lisp object rooted (prevents GC)
+/// 2. We never remove entries from FACE_CACHE
+/// 3. The raw emacs_value is valid for the entire Emacs session
+fn get_or_build_face<'e>(env: &'e Env, key: &FaceKey, syms: &'e Syms) -> Result<Value<'e>> {
+    let cache = face_cache();
+    // Fast path: look up cached face, extract raw pointer, drop lock.
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(gref) = guard.get(key) {
+            let raw = global_ref_raw(gref);
+            drop(guard);
+            // Safety: The GlobalRef in FACE_CACHE keeps this value rooted.
+            return Ok(unsafe { Value::new(raw, env) });
+        }
+    }
+    // Slow path: build, cache, and return
+    let face = build_face_plist(env, key, syms)?;
+    let gref = face.make_global_ref();
+    let raw = global_ref_raw(&gref);
+    cache.lock().unwrap().entry(*key).or_insert(gref);
+    // Safety: Same as above — the GlobalRef is now in FACE_CACHE.
+    Ok(unsafe { Value::new(raw, env) })
 }
 
 /// Build a face plist like (:foreground "#rrggbb" :weight bold ...).
@@ -356,9 +388,7 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
         return Ok(());
     }
 
-    // Per-frame face cache (O6) — maps FaceKey to GlobalRef.
-    // Avoids rebuilding identical face plists for repeated styles.
-    let mut face_cache: HashMap<FaceKey, GlobalRef> = HashMap::with_capacity(32);
+    // Face cache is now a global static (O6) — no per-frame allocation.
 
     let scrollback_count = screen.scrollback_rows().saturating_sub(rows);
     let cur_first_vis_stable = screen.visible_row_to_stable_row(0);
@@ -372,13 +402,13 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
             for phys in 0..scrollback_count {
                 let lines = screen.lines_in_phys_range(phys..phys + 1);
                 if let Some(line) = lines.first() {
-                    render_line(env, line, cols, &palette, syms, &mut face_cache)?;
+                    render_line(env, line, cols, &palette, syms)?;
                 }
                 env.call(&syms.insert, ("\n",))?;
             }
         }
 
-        render_display_rows(env, screen, rows, cols, &palette, syms, &mut face_cache)?;
+        render_display_rows(env, screen, rows, cols, &palette, syms)?;
         *scrollback_in_buffer = scrollback_count;
     } else {
         // ---- Incremental render ----
@@ -395,7 +425,7 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
                 if let Some(phys) = screen.stable_row_to_phys(stable) {
                     let lines = screen.lines_in_phys_range(phys..phys + 1);
                     if let Some(line) = lines.first() {
-                        render_line(env, line, cols, &palette, syms, &mut face_cache)?;
+                        render_line(env, line, cols, &palette, syms)?;
                     }
                 }
             }
@@ -416,7 +446,6 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
                         &dirty,
                         first_kept,
                         *scrollback_in_buffer,
-                        &mut face_cache,
                     )?;
                 }
             }
@@ -431,7 +460,7 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
                     let lines = screen.lines_in_phys_range(phys..phys + 1);
                     if let Some(line) = lines.first() {
                         env.call(&syms.insert, ("\n",))?;
-                        render_line(env, line, cols, &palette, syms, &mut face_cache)?;
+                        render_line(env, line, cols, &palette, syms)?;
                     }
                 }
                 *scrollback_in_buffer += missed;
@@ -439,7 +468,7 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
 
             env.call(&syms.goto_char, (env.call(&syms.point_max, [])?,))?;
             env.call(&syms.insert, ("\n",))?;
-            render_display_rows(env, screen, rows, cols, &palette, syms, &mut face_cache)?;
+            render_display_rows(env, screen, rows, cols, &palette, syms)?;
         } else {
             let first_stable = cur_first_vis_stable;
             let last_stable = screen.visible_row_to_stable_row((rows - 1) as i64);
@@ -455,7 +484,6 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
                         &palette,
                         syms,
                         *scrollback_in_buffer,
-                        &mut face_cache,
                     )?;
                 } else {
                     incremental_render_display(
@@ -468,7 +496,6 @@ pub fn render_to_buffer(env: &Env, term: &mut EbbTerminal) -> Result<()> {
                         &dirty,
                         first_stable,
                         *scrollback_in_buffer,
-                        &mut face_cache,
                     )?;
                 }
             }
@@ -514,14 +541,13 @@ fn render_display_rows(
     cols: usize,
     palette: &ColorPalette,
     syms: &Syms,
-    face_cache: &mut HashMap<FaceKey, GlobalRef>,
 ) -> Result<()> {
     for vis_row in 0..rows {
         let stable = screen.visible_row_to_stable_row(vis_row as i64);
         if let Some(phys) = screen.stable_row_to_phys(stable) {
             let lines = screen.lines_in_phys_range(phys..phys + 1);
             if let Some(line) = lines.first() {
-                render_line(env, line, cols, palette, syms, face_cache)?;
+                render_line(env, line, cols, palette, syms)?;
             }
         }
         if vis_row < rows - 1 {
@@ -539,14 +565,13 @@ fn redraw_display_region(
     palette: &ColorPalette,
     syms: &Syms,
     scrollback_in_buffer: usize,
-    face_cache: &mut HashMap<FaceKey, GlobalRef>,
 ) -> Result<()> {
     env.call(&syms.goto_char, (env.call(&syms.point_min, [])?,))?;
     env.call(&syms.forward_line, (scrollback_in_buffer as i64,))?;
     let display_start = env.call(&syms.point, [])?;
     let buf_end = env.call(&syms.point_max, [])?;
     env.call(&syms.delete_region, (display_start, buf_end))?;
-    render_display_rows(env, screen, rows, cols, palette, syms, face_cache)?;
+    render_display_rows(env, screen, rows, cols, palette, syms)?;
     Ok(())
 }
 
@@ -560,7 +585,6 @@ fn incremental_render_display(
     dirty: &[isize],
     first_stable: isize,
     scrollback_in_buffer: usize,
-    face_cache: &mut HashMap<FaceKey, GlobalRef>,
 ) -> Result<()> {
     let mut vis_rows: Vec<usize> = dirty
         .iter()
@@ -587,7 +611,7 @@ fn incremental_render_display(
         if let Some(phys) = screen.stable_row_to_phys(stable) {
             let lines = screen.lines_in_phys_range(phys..phys + 1);
             if let Some(line) = lines.first() {
-                render_line(env, line, cols, palette, syms, face_cache)?;
+                render_line(env, line, cols, palette, syms)?;
             }
         }
     }
@@ -671,7 +695,6 @@ fn render_line(
     cols: usize,
     palette: &ColorPalette,
     syms: &Syms,
-    face_cache: &mut HashMap<FaceKey, GlobalRef>,
 ) -> Result<()> {
     let content_end = last_content_col(line, cols);
 
@@ -779,7 +802,7 @@ fn render_line(
             let end_v = end.into_lisp(env)?;
 
             // Apply face
-            let face = get_or_build_face(env, &run.face_key, syms, face_cache)?;
+            let face = get_or_build_face(env, &run.face_key, syms)?;
             env.call(
                 &syms.put_text_property,
                 (start_v, end_v, syms.face.bind(env), face),
