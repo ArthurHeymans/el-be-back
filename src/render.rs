@@ -28,6 +28,8 @@ pub(crate) struct Syms {
     symbol_value: GlobalRef,
     put_text_property: GlobalRef,
     list: GlobalRef,
+    vector: GlobalRef,
+    apply_faces: GlobalRef,
     // Property name symbols
     face: GlobalRef,
     help_echo: GlobalRef,
@@ -103,6 +105,8 @@ pub(crate) fn init_syms(env: &Env) -> Result<()> {
         symbol_value: env.intern("symbol-value")?.make_global_ref(),
         put_text_property: env.intern("put-text-property")?.make_global_ref(),
         list: env.intern("list")?.make_global_ref(),
+        vector: env.intern("vector")?.make_global_ref(),
+        apply_faces: env.intern("ebb--apply-faces")?.make_global_ref(),
 
         face: env.intern("face")?.make_global_ref(),
         help_echo: env.intern("help-echo")?.make_global_ref(),
@@ -786,9 +790,8 @@ fn render_line(
     let insert_point = env.call(&syms.point, [])?.into_rust::<i64>()?;
     env.call(&syms.insert, (text.as_str(),))?;
 
-    // Phase 3: Apply face properties via put-text-property on ranges (O2)
+    // Phase 3: Apply face + hyperlink properties via put-text-property
     if !runs.is_empty() {
-        // Resolve hyperlink keymap once if needed
         let hyperlink_km = if runs.iter().any(|r| r.hyperlink_uri.is_some()) {
             Some(env.call(&syms.symbol_value, (&syms.ebb_hyperlink_map,))?)
         } else {
@@ -796,12 +799,10 @@ fn render_line(
         };
 
         for run in &runs {
-            let start = insert_point + run.char_start as i64;
-            let end = insert_point + run.char_end as i64;
-            let start_v = start.into_lisp(env)?;
-            let end_v = end.into_lisp(env)?;
+            let start_v = (insert_point + run.char_start as i64).into_lisp(env)?;
+            let end_v = (insert_point + run.char_end as i64).into_lisp(env)?;
 
-            // Apply face
+            // Apply face (uses cached GlobalRef from O6)
             let face = get_or_build_face(env, &run.face_key, syms)?;
             env.call(
                 &syms.put_text_property,

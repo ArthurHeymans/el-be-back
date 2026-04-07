@@ -897,6 +897,20 @@ Soft-wrapped newlines are removed and trailing whitespace is stripped."
   (end-of-line)
   (skip-chars-backward " \t"))
 
+;;; --- Batch property application (O9) ---
+
+(defun ebb--apply-faces (props)
+  "Apply face text properties from PROPS vector.
+PROPS is a flat vector: [START1 END1 FACE1 START2 END2 FACE2 ...].
+Each triplet applies (put-text-property START END \\='face FACE).
+This batches N put-text-property calls into a single FFI crossing."
+  (let ((i 0)
+        (len (length props)))
+    (while (< i len)
+      (put-text-property (aref props i) (aref props (1+ i))
+                         'face (aref props (+ i 2)))
+      (setq i (+ i 3)))))
+
 ;;; --- Major mode ---
 
 (define-derived-mode ebb-mode fundamental-mode "EBB"
