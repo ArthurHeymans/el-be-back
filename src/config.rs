@@ -51,3 +51,20 @@ impl AlertHandler for EbbAlertSink {
         }
     }
 }
+
+/// Parse a "#RRGGBB" hex color string to an SrgbaTuple.
+pub fn parse_hex_color(hex: &str) -> Option<wezterm_cell::color::SrgbaTuple> {
+    if hex.len() >= 7 && hex.as_bytes()[0] == b'#' {
+        let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
+        let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
+        let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
+        Some(wezterm_cell::color::SrgbaTuple(
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+            1.0,
+        ))
+    } else {
+        None
+    }
+}

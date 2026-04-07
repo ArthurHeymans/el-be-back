@@ -1,5 +1,6 @@
 use emacs::Result;
 use termwiz::input::{KeyCode, Modifiers};
+use wezterm_term::input::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::EbbTerminal;
 
@@ -88,6 +89,84 @@ pub fn key_down(
     // The ThreadedWriter sends bytes through an mpsc channel to a
     // background thread, which writes to our CapturingWriter.  Yield
     // briefly to let the background thread process the write.
+    for _ in 0..1000 {
+        std::thread::yield_now();
+        if let Ok(buf) = term.output.lock() {
+            if !buf.is_empty() {
+                break;
+            }
+        }
+    }
+
+    let bytes = term.drain_output_bytes();
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+}
+
+/// Send a mouse event through the terminal, which encodes it based on
+/// the active mouse tracking mode (X10, VT200, SGR, etc.).
+///
+/// action: 0=press, 1=release, 2=motion
+/// button: 1=left, 2=right, 3=middle
+/// mods: bitmask (shift=1, meta=2, ctrl=4)
+///
+/// Returns the encoded bytes to send to the PTY, or nil if mouse
+/// tracking is not active.
+pub fn mouse_event(
+    term: &mut EbbTerminal,
+    action: i64,
+    button: i64,
+    row: i64,
+    col: i64,
+    mods: i64,
+) -> Result<Option<String>> {
+    if term.freed {
+        return Ok(None);
+    }
+
+    let mb = match button {
+        1 => MouseButton::Left,
+        2 => MouseButton::Right,
+        3 => MouseButton::Middle,
+        _ => MouseButton::None,
+    };
+
+    let kind = match action {
+        0 => MouseEventKind::Press,
+        1 => MouseEventKind::Release,
+        2 => MouseEventKind::Move,
+        _ => return Ok(None),
+    };
+
+    let mut key_mods = KeyModifiers::NONE;
+    if mods & 1 != 0 {
+        key_mods |= KeyModifiers::SHIFT;
+    }
+    if mods & 2 != 0 {
+        key_mods |= KeyModifiers::ALT;
+    }
+    if mods & 4 != 0 {
+        key_mods |= KeyModifiers::CTRL;
+    }
+
+    let event = MouseEvent {
+        kind,
+        x: col.max(0) as usize,
+        y: row.max(0) as i64,
+        x_pixel_offset: 0,
+        y_pixel_offset: 0,
+        button: mb,
+        modifiers: key_mods,
+    };
+
+    term.terminal
+        .mouse_event(event)
+        .map_err(|e| anyhow::anyhow!("mouse_event: {}", e))?;
+
+    // Yield to let ThreadedWriter deliver bytes
     for _ in 0..1000 {
         std::thread::yield_now();
         if let Ok(buf) = term.output.lock() {

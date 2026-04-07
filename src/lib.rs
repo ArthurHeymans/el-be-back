@@ -361,6 +361,33 @@ fn bracketed_paste_enabled(term: &EbbTerminal) -> Result<bool> {
     Ok(term.terminal.bracketed_paste_enabled())
 }
 
+/// Return the cursor style as an integer.
+/// 0=bar, 1=block, 2=underline.
+/// Maps DECSCUSR cursor shapes to a simple integer for Elisp.
+#[defun]
+fn cursor_style(term: &EbbTerminal) -> Result<i64> {
+    if term.freed {
+        return Ok(1); // default block
+    }
+    use wezterm_surface::CursorShape;
+    let shape = term.terminal.cursor_pos().shape;
+    Ok(match shape {
+        CursorShape::Default | CursorShape::BlinkingBlock | CursorShape::SteadyBlock => 1,
+        CursorShape::BlinkingBar | CursorShape::SteadyBar => 0,
+        CursorShape::BlinkingUnderline | CursorShape::SteadyUnderline => 2,
+    })
+}
+
+/// Return whether the cursor is visible.
+#[defun]
+fn cursor_visible(term: &EbbTerminal) -> Result<bool> {
+    if term.freed {
+        return Ok(true);
+    }
+    use wezterm_surface::CursorVisibility;
+    Ok(term.terminal.cursor_pos().visibility == CursorVisibility::Visible)
+}
+
 /// Resize the terminal.
 #[defun]
 fn resize(term: &mut EbbTerminal, rows: i64, cols: i64) -> Result<()> {
@@ -403,6 +430,60 @@ fn key_down(
     )
 }
 
+/// Send a mouse event through the terminal.  The terminal encodes it
+/// based on the active mouse tracking mode (X10, VT200, SGR, etc.).
+/// action: 0=press, 1=release, 2=motion.
+/// button: 1=left, 2=right, 3=middle.
+/// mods: bitmask (shift=1, meta=2, ctrl=4).
+/// Returns encoded bytes or nil if mouse tracking is not active.
+#[defun]
+fn mouse_event(
+    term: &mut EbbTerminal,
+    action: i64,
+    button: i64,
+    row: i64,
+    col: i64,
+    mods: i64,
+) -> Result<Option<String>> {
+    input::mouse_event(term, action, button, row, col, mods)
+}
+
+/// Notify the terminal about a focus change.
+/// The terminal handles mode 1004 (FocusTracking) internally --
+/// if enabled, it writes \e[I (gained) or \e[O (lost) to the writer.
+/// `gained` is non-nil (any integer) for focus gained, nil for focus lost.
+/// Returns the encoded bytes (to send to the PTY) or nil.
+#[defun]
+fn focus_event(term: &mut EbbTerminal, gained: Option<i64>) -> Result<Option<String>> {
+    if term.freed {
+        return Ok(None);
+    }
+    term.terminal.focus_changed(gained.is_some());
+
+    // The ThreadedWriter sends bytes through an mpsc channel to a
+    // background thread which writes to our CapturingWriter.
+    // Use the same wait pattern as key_down: yield first, then sleep.
+    for i in 0..200 {
+        if i < 50 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        if let Ok(buf) = term.output.lock() {
+            if !buf.is_empty() {
+                break;
+            }
+        }
+    }
+
+    let bytes = term.drain_output_bytes();
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+}
+
 /// Send a paste to the terminal (with bracketed paste wrapping if enabled).
 #[defun]
 fn send_paste(term: &mut EbbTerminal, text: String) -> Result<()> {
@@ -430,6 +511,49 @@ fn send_paste(term: &mut EbbTerminal, text: String) -> Result<()> {
 fn render<'a>(env: &'a Env, term_val: Value<'a>) -> Result<()> {
     let mut term = term_val.into_ref_mut::<EbbTerminal>()?;
     render::render_to_buffer(env, &mut term)
+}
+
+// ---------------------------------------------------------------------------
+// Defuns: Color palette (Theme integration)
+// ---------------------------------------------------------------------------
+
+/// Set the ANSI palette entries 0-15 from a concatenated hex string.
+/// `colors_string` is 16 consecutive "#RRGGBB" entries (112 chars).
+/// Returns t on success, nil on failure.
+#[defun]
+fn set_palette(term: &mut EbbTerminal, colors_string: String) -> Result<bool> {
+    if term.freed {
+        return Ok(false);
+    }
+    if colors_string.len() < 7 * 16 {
+        return Ok(false);
+    }
+    let palette = term.terminal.palette_mut();
+    for i in 0..16 {
+        let start = i * 7;
+        let end = start + 7;
+        if let Some(color) = config::parse_hex_color(&colors_string[start..end]) {
+            palette.colors.0[i] = color;
+        }
+    }
+    Ok(true)
+}
+
+/// Set the terminal's default foreground and background colors.
+/// `fg_hex` and `bg_hex` are "#RRGGBB" strings.
+#[defun]
+fn set_default_colors(term: &mut EbbTerminal, fg_hex: String, bg_hex: String) -> Result<bool> {
+    if term.freed {
+        return Ok(false);
+    }
+    let palette = term.terminal.palette_mut();
+    if let Some(fg) = config::parse_hex_color(&fg_hex) {
+        palette.foreground = fg;
+    }
+    if let Some(bg) = config::parse_hex_color(&bg_hex) {
+        palette.background = bg;
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
