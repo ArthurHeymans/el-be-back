@@ -190,9 +190,7 @@ state are reconciled independently so metadata-only updates are visible."
              (display-begin (chomp-render-state-display-begin render)))
         (save-excursion
           (goto-char display-begin)
-          (dolist (line new-lines)
-            (insert (chomp-render--cells-to-string (chomp-line-cells line) width)
-                    "\n")))
+          (insert (chomp-render--lines-to-string new-lines width)))
         (setf (chomp-render-state-scrollback-count render) model-count))))
     (chomp-screen-clear-scrollback-dirty screen)))
 
@@ -205,10 +203,16 @@ state are reconciled independently so metadata-only updates are visible."
     (save-excursion
       (delete-region (point-min) display-begin)
       (goto-char (point-min))
-      (dolist (line lines)
-        (insert (chomp-render--cells-to-string (chomp-line-cells line) width)
-                "\n")))
+      (insert (chomp-render--lines-to-string lines width)))
     (setf (chomp-render-state-scrollback-count render) (length lines))))
+
+(defun chomp-render--lines-to-string (lines width)
+  "Return LINES as one string with trailing newlines."
+  (mapconcat (lambda (line)
+               (concat (chomp-render--cells-to-string
+                        (chomp-line-cells line) width)
+                       "\n"))
+             lines ""))
 
 ;;;; ---- Display Line Rendering -----------------------------------------
 
@@ -232,6 +236,25 @@ state are reconciled independently so metadata-only updates are visible."
 (defun chomp-render--cells-to-string (cells width)
   "Convert a vector of chomp-cells to a propertized string.
 Handles double-width characters by inserting invisible spacers."
+  (or (chomp-render--cells-to-string-fast cells width)
+      (chomp-render--cells-to-string-general cells width)))
+
+(defun chomp-render--cells-to-string-fast (cells width)
+  "Fast path for default single-width CELLS, or nil if not applicable."
+  (let ((i 0))
+    (while (and (< i width)
+                (let ((cell (aref cells i)))
+                  (and (= (chomp-cell-width cell) 1)
+                       (null (chomp-cell-attr cell)))))
+      (cl-incf i))
+    (when (= i width)
+      (let ((s (make-string width ?\s)))
+        (dotimes (j width)
+          (aset s j (chomp-cell-char (aref cells j))))
+        s))))
+
+(defun chomp-render--cells-to-string-general (cells width)
+  "General propertized conversion for CELLS."
   (let ((parts nil)
         (i 0))
     ;; Process cells one at a time, grouping single-width same-attr runs
