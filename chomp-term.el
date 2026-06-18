@@ -95,6 +95,7 @@
   (last-char nil)
   ;; Dirty tracking
   (dirty-lines nil)
+  (dirty-map nil)        ; bool vector indexed by row, avoids hot-path `pushnew'
   ;; Pending wrap
   (pending-wrap nil))
 
@@ -224,7 +225,10 @@ and where COL is a continuation cell (width = 0)."
 
 (defsubst chomp--mark-dirty (screen row)
   "Mark ROW as dirty on SCREEN."
-  (cl-pushnew row (chomp-screen-dirty-lines screen)))
+  (let ((map (chomp-screen-dirty-map screen)))
+    (unless (aref map row)
+      (aset map row t)
+      (push row (chomp-screen-dirty-lines screen)))))
 
 (defsubst chomp--translate-charset (screen char)
   "Translate CHAR through the active character set on SCREEN."
@@ -254,7 +258,8 @@ and where COL is a continuation cell (width = 0)."
      :scroll-bottom (1- height)
      :current-attr (make-chomp-attr)
      :tab-stops (chomp--default-tab-stops width)
-     :dirty-lines (number-sequence 0 (1- height)))))
+     :dirty-lines (number-sequence 0 (1- height))
+     :dirty-map (make-vector height t))))
 
 ;;;; ---- Dirty Tracking -------------------------------------------------
 
@@ -264,6 +269,8 @@ and where COL is a continuation cell (width = 0)."
 
 (defun chomp-screen-clear-dirty (screen)
   "Clear the dirty line list."
+  (dolist (row (chomp-screen-dirty-lines screen))
+    (aset (chomp-screen-dirty-map screen) row nil))
   (setf (chomp-screen-dirty-lines screen) nil))
 
 (defun chomp-screen-clear-scrollback-dirty (screen)
@@ -487,18 +494,30 @@ for wide/non-ASCII/insert-mode cases."
           (unless default-attr
             (setf (chomp-line-text line) nil))
           ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
-          (while (and (< i limit)
-                      (< (aref string i) 128)
-                      (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
-            (let* ((cell (aref cells (+ cx (- i start-i))))
-                   (col (+ cx (- i start-i)))
-                   (attr (unless default-attr (chomp-attr-copy attr-template))))
-              (setf (chomp-cell-char cell) (aref string i))
-              (setf (chomp-cell-width cell) 1)
-              (setf (chomp-cell-attr cell) attr)
-              (when line-text
-                (aset line-text col (aref string i))))
-            (cl-incf i))
+          ;; Split the default-attribute path to avoid per-byte attr checks and
+          ;; copies for ordinary command output.
+          (if default-attr
+              (while (and (< i limit)
+                          (< (aref string i) 128)
+                          (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
+                (let* ((col (+ cx (- i start-i)))
+                       (cell (aref cells col))
+                       (ch (aref string i)))
+                  (setf (chomp-cell-char cell) ch)
+                  (setf (chomp-cell-width cell) 1)
+                  (setf (chomp-cell-attr cell) nil)
+                  (when line-text
+                    (aset line-text col ch)))
+                (cl-incf i))
+            (while (and (< i limit)
+                        (< (aref string i) 128)
+                        (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
+              (let* ((cell (aref cells (+ cx (- i start-i))))
+                     (ch (aref string i)))
+                (setf (chomp-cell-char cell) ch)
+                (setf (chomp-cell-width cell) 1)
+                (setf (chomp-cell-attr cell) (chomp-attr-copy attr-template)))
+              (cl-incf i)))
           (if (= i start-i)
               ;; Could not use the fast row writer for this byte.
               (progn
@@ -895,7 +914,8 @@ Handles LF, VT, FF."
       (setf (chomp-screen-scrollback-length screen) 0)
       (setf (chomp-screen-scrollback-dirty screen) t)
       (setf (chomp-screen-dirty-lines screen)
-            (number-sequence 0 (1- h))))))
+            (number-sequence 0 (1- h)))
+      (setf (chomp-screen-dirty-map screen) (make-vector h t)))))
 
 (defun chomp-screen-leave-alt (screen)
   "Leave alternate screen buffer, restoring main screen."
@@ -919,7 +939,9 @@ Handles LF, VT, FF."
     (setf (chomp-screen-alt-screen screen) nil)
     ;; Everything is dirty
     (setf (chomp-screen-dirty-lines screen)
-          (number-sequence 0 (1- (chomp-screen-height screen))))))
+          (number-sequence 0 (1- (chomp-screen-height screen))))
+    (setf (chomp-screen-dirty-map screen)
+          (make-vector (chomp-screen-height screen) t))))
 
 ;;;; ---- Save / Restore Cursor ------------------------------------------
 
@@ -1018,6 +1040,7 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
           ;; Phase 6: All dirty
           (setf (chomp-screen-dirty-lines screen)
                 (number-sequence 0 (1- new-height)))
+          (setf (chomp-screen-dirty-map screen) (make-vector new-height t))
           ;; Reset tab stops for new width
           (setf (chomp-screen-tab-stops screen)
                 (chomp--default-tab-stops new-width)))))))
@@ -1172,7 +1195,8 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
     (setf (chomp-screen-last-char screen) nil)
     ;; Everything is dirty
     (setf (chomp-screen-dirty-lines screen)
-          (number-sequence 0 (1- h)))))
+          (number-sequence 0 (1- h)))
+    (setf (chomp-screen-dirty-map screen) (make-vector h t))))
 
 ;;;; ---- Character Set Designation --------------------------------------
 
