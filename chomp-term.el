@@ -91,6 +91,7 @@
   (scrollback nil)      ; list of chomp-line, newest first
   (scrollback-length 0) ; cached length of scrollback
   (scrollback-max 10000) ; max lines
+  (scrollback-trim-batch 256) ; amortize list trimming after this overflow
   (scrollback-dirty nil) ; non-nil when renderer must fully reconcile it
   (scrollback-appended-count 0) ; lines appended since last render refresh
   (scrollback-trimmed-count 0)  ; oldest lines trimmed since last render refresh
@@ -427,11 +428,14 @@ Bottom lines are discarded."
 (defun chomp--trim-scrollback (screen)
   "Trim scrollback to max lines."
   (let ((max (chomp-screen-scrollback-max screen))
-        (len (chomp-screen-scrollback-length screen)))
-    (when (> len max)
+        (len (chomp-screen-scrollback-length screen))
+        (batch (chomp-screen-scrollback-trim-batch screen)))
+    (when (> len (+ max batch))
       ;; Keep the newest MAX entries (the list is newest first) without
-      ;; rebuilding the whole list on every scroll after the limit.  The
-      ;; renderer can mirror this as delete-oldest + append-newest.
+      ;; rebuilding the whole list on every scroll after the limit.  Trimming is
+      ;; intentionally batched because otherwise every new line after a full
+      ;; scrollback performs an O(max) `nthcdr'.  The renderer mirrors the whole
+      ;; batch as one delete-oldest + append-newest update.
       (let ((tail (nthcdr (1- max) (chomp-screen-scrollback screen)))
             (trimmed (- len max)))
         (when tail
