@@ -172,27 +172,49 @@ state are reconciled independently so metadata-only updates are visible."
 (defun chomp-render--update-scrollback (render)
   "Reconcile rendered scrollback with the screen model."
   (let* ((screen (chomp-render-state-screen render))
-         (sb (chomp-screen-scrollback screen))
          (model-count (chomp-screen-scrollback-length screen))
          (rendered-count (chomp-render-state-scrollback-count render))
-         (new-count (- model-count rendered-count)))
+         (new-count (- model-count rendered-count))
+         (appended (chomp-screen-scrollback-appended-count screen))
+         (trimmed (chomp-screen-scrollback-trimmed-count screen)))
     (cond
-     ;; Clears, trims, alternate-screen switches, and other non-append
-     ;; mutations require a full scrollback-region rewrite.
+     ;; Clears, alternate-screen switches, and other non-append mutations
+     ;; require a full scrollback-region rewrite.
      ((or (chomp-screen-scrollback-dirty screen)
           (< new-count 0))
       (chomp-render--rebuild-scrollback render))
-     ((> new-count 0)
-      ;; New scrollback lines are at the front of the list (newest first).
-      ;; Insert them in chronological order (oldest of the new batch first).
-      (let* ((new-lines (reverse (cl-subseq sb 0 new-count)))
-             (width (chomp-screen-width screen))
-             (display-begin (chomp-render-state-display-begin render)))
-        (save-excursion
-          (goto-char display-begin)
-          (insert (chomp-render--lines-to-string new-lines width)))
-        (setf (chomp-render-state-scrollback-count render) model-count))))
+     ;; When scrollback is already full, new model lines are balanced by trims:
+     ;; mirror that in the buffer by deleting oldest rendered rows and appending
+     ;; the new rows, instead of rebuilding the entire history region.
+     ((or (> new-count 0) (> appended 0) (> trimmed 0))
+      (chomp-render--append-scrollback render
+                                       (max appended new-count)
+                                       trimmed
+                                       model-count)))
     (chomp-screen-clear-scrollback-dirty screen)))
+
+(defun chomp-render--append-scrollback (render append-count trim-count model-count)
+  "Append APPEND-COUNT newest scrollback lines and delete TRIM-COUNT old rows."
+  (let* ((screen (chomp-render-state-screen render))
+         (width (chomp-screen-width screen))
+         (display-begin (chomp-render-state-display-begin render))
+         (count (min append-count model-count)))
+    (save-excursion
+      (when (> trim-count 0)
+        (goto-char (point-min))
+        (let ((beg (point))
+              (n (min trim-count (chomp-render-state-scrollback-count render))))
+          (forward-line n)
+          (delete-region beg (point))))
+      (when (> count 0)
+        ;; New scrollback lines are at the front of the list (newest first).
+        ;; Insert them in chronological order (oldest of the new batch first).
+        (goto-char display-begin)
+        (insert (chomp-render--lines-to-string
+                 (chomp-render--newest-lines-oldest-first
+                  (chomp-screen-scrollback screen) count)
+                 width))))
+    (setf (chomp-render-state-scrollback-count render) model-count)))
 
 (defun chomp-render--rebuild-scrollback (render)
   "Replace the rendered scrollback region from the screen model."
@@ -205,6 +227,15 @@ state are reconciled independently so metadata-only updates are visible."
       (goto-char (point-min))
       (insert (chomp-render--lines-to-string lines width)))
     (setf (chomp-render-state-scrollback-count render) (length lines))))
+
+(defun chomp-render--newest-lines-oldest-first (lines count)
+  "Return the first COUNT newest-first LINES in oldest-first order."
+  (let ((taken nil)
+        (n 0))
+    (while (and lines (< n count))
+      (push (pop lines) taken)
+      (cl-incf n))
+    taken))
 
 (defun chomp-render--lines-to-string (lines width)
   "Return LINES as one string with trailing newlines."

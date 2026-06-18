@@ -87,6 +87,8 @@
   (scrollback-length 0) ; cached length of scrollback
   (scrollback-max 10000) ; max lines
   (scrollback-dirty nil) ; non-nil when renderer must fully reconcile it
+  (scrollback-appended-count 0) ; lines appended since last render refresh
+  (scrollback-trimmed-count 0)  ; oldest lines trimmed since last render refresh
   ;; Title / CWD
   (title "") (cwd nil)
   ;; Tab stops
@@ -274,8 +276,10 @@ and where COL is a continuation cell (width = 0)."
   (setf (chomp-screen-dirty-lines screen) nil))
 
 (defun chomp-screen-clear-scrollback-dirty (screen)
-  "Clear SCREEN's scrollback dirty flag."
-  (setf (chomp-screen-scrollback-dirty screen) nil))
+  "Clear SCREEN's scrollback reconciliation flags."
+  (setf (chomp-screen-scrollback-dirty screen) nil)
+  (setf (chomp-screen-scrollback-appended-count screen) 0)
+  (setf (chomp-screen-scrollback-trimmed-count screen) 0))
 
 ;;;; ---- Internal Scrolling ---------------------------------------------
 
@@ -295,7 +299,8 @@ Top lines go to scrollback (if on main screen)."
       (dotimes (i n)
         (push (aref lines (+ top i))
               (chomp-screen-scrollback screen))
-        (cl-incf (chomp-screen-scrollback-length screen))))
+        (cl-incf (chomp-screen-scrollback-length screen))
+        (cl-incf (chomp-screen-scrollback-appended-count screen))))
     ;; Shift remaining lines up
     (cl-loop for i from top to (- bot n)
              do (aset lines i (aref lines (+ i n))))
@@ -332,12 +337,14 @@ Bottom lines are discarded."
         (len (chomp-screen-scrollback-length screen)))
     (when (> len max)
       ;; Keep the newest MAX entries (the list is newest first) without
-      ;; rebuilding the whole list on every scroll after the limit.
-      (let ((tail (nthcdr (1- max) (chomp-screen-scrollback screen))))
+      ;; rebuilding the whole list on every scroll after the limit.  The
+      ;; renderer can mirror this as delete-oldest + append-newest.
+      (let ((tail (nthcdr (1- max) (chomp-screen-scrollback screen)))
+            (trimmed (- len max)))
         (when tail
-          (setcdr tail nil)))
-      (setf (chomp-screen-scrollback-length screen) max)
-      (setf (chomp-screen-scrollback-dirty screen) t))))
+          (setcdr tail nil))
+        (setf (chomp-screen-scrollback-length screen) max)
+        (cl-incf (chomp-screen-scrollback-trimmed-count screen) trimmed)))))
 
 ;;;; ---- Character Writing ----------------------------------------------
 
