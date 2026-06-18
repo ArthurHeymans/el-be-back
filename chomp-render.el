@@ -245,10 +245,20 @@ state are reconciled independently so metadata-only updates are visible."
 
 (defun chomp-render--line-to-string (line width)
   "Convert LINE to a string of WIDTH terminal columns."
-  (or (and (chomp-line-text line)
-           (= (length (chomp-line-text line)) width)
-           (chomp-line-text line))
-      (chomp-render--cells-to-string (chomp-line-cells line) width)))
+  (cond
+   ((and (chomp-line-text line)
+         (= (length (chomp-line-text line)) width))
+    (setf (chomp-line-dirty line) nil)
+    (chomp-line-text line))
+   ((and (not (chomp-line-dirty line))
+         (chomp-line-rendered line)
+         (= (length (chomp-line-rendered line)) width))
+    (chomp-line-rendered line))
+   (t
+    (let ((s (chomp-render--cells-to-string (chomp-line-cells line) width)))
+      (setf (chomp-line-rendered line) s)
+      (setf (chomp-line-dirty line) nil)
+      s))))
 
 ;;;; ---- Display Line Rendering -----------------------------------------
 
@@ -262,10 +272,17 @@ state are reconciled independently so metadata-only updates are visible."
       (save-excursion
         (goto-char display-begin)
         (forward-line row)
-        (let ((bol (point))
-              (eol (line-end-position)))
-          (delete-region bol eol)
-          (insert (chomp-render--line-to-string line width)))))))
+        (let* ((bol (point))
+               (eol (line-end-position))
+               (new (chomp-render--line-to-string line width)))
+          ;; TUI programs often repaint rows with identical content.  Avoid a
+          ;; buffer modification when the rendered text/properties are already
+          ;; correct; cursor overlay movement is handled separately.
+          (unless (and (= (- eol bol) (length new))
+                       (equal-including-properties
+                        new (buffer-substring bol eol)))
+            (delete-region bol eol)
+            (insert new)))))))
 
 ;;;; ---- Cell-to-String Conversion --------------------------------------
 

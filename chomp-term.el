@@ -43,6 +43,7 @@
   "A single line in the terminal."
   (cells nil)       ; vector of chomp-cell
   (text nil)        ; plain single-width/default-attr cache string, or nil
+  (rendered nil)    ; cached rendered/propertized string for non-plain lines
   (wrapped nil)     ; auto-wrapped from previous line?
   (dirty t))
 
@@ -301,15 +302,23 @@ Top lines go to scrollback (if on main screen)."
               (chomp-screen-scrollback screen))
         (cl-incf (chomp-screen-scrollback-length screen))
         (cl-incf (chomp-screen-scrollback-appended-count screen))))
-    ;; Shift remaining lines up
-    (cl-loop for i from top to (- bot n)
-             do (aset lines i (aref lines (+ i n))))
-    ;; Fill bottom with empty lines
-    (cl-loop for i from (1+ (- bot n)) to bot
-             do (aset lines i (chomp--make-empty-line width)))
-    ;; Mark all lines in region dirty
-    (cl-loop for i from top to bot
-             do (chomp--mark-dirty screen i))
+    ;; Shift remaining lines up.  Use explicit loops here; this is one of the
+    ;; hottest paths during bulk output and avoids `cl-loop' dispatch overhead.
+    (let ((i top)
+          (end (- bot n)))
+      (while (<= i end)
+        (aset lines i (aref lines (+ i n)))
+        (cl-incf i)))
+    ;; Fill bottom with empty lines.
+    (let ((i (1+ (- bot n))))
+      (while (<= i bot)
+        (aset lines i (chomp--make-empty-line width))
+        (cl-incf i)))
+    ;; Mark all lines in region dirty.
+    (let ((i top))
+      (while (<= i bot)
+        (chomp--mark-dirty screen i)
+        (cl-incf i)))
     ;; Trim scrollback
     (chomp--trim-scrollback screen)))
 
@@ -321,15 +330,23 @@ Bottom lines are discarded."
          (lines (chomp-screen-lines screen))
          (width (chomp-screen-width screen))
          (n (min count (1+ (- bot top)))))
-    ;; Shift lines down
-    (cl-loop for i from bot downto (+ top n)
-             do (aset lines i (aref lines (- i n))))
-    ;; Fill top with empty lines
-    (cl-loop for i from top to (+ top n -1)
-             do (aset lines i (chomp--make-empty-line width)))
-    ;; Mark dirty
-    (cl-loop for i from top to bot
-             do (chomp--mark-dirty screen i))))
+    ;; Shift lines down.
+    (let ((i bot)
+          (end (+ top n)))
+      (while (>= i end)
+        (aset lines i (aref lines (- i n)))
+        (cl-decf i)))
+    ;; Fill top with empty lines.
+    (let ((i top)
+          (end (+ top n -1)))
+      (while (<= i end)
+        (aset lines i (chomp--make-empty-line width))
+        (cl-incf i)))
+    ;; Mark dirty.
+    (let ((i top))
+      (while (<= i bot)
+        (chomp--mark-dirty screen i)
+        (cl-incf i)))))
 
 (defun chomp--trim-scrollback (screen)
   "Trim scrollback to max lines."
