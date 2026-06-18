@@ -249,6 +249,18 @@ EXTRA-ENV is the env var list (used to find integration dir)."
         ;; Unknown shell: just run it
         (_ (list shell-command))))))
 
+(defun chomp-io--wrap-command-with-stty (command rows columns)
+  "Wrap COMMAND to initialize PTY termios before exec.
+Eat does this with `stty ... sane' before starting the client program; in
+particular it makes the erase character match TERM's kbs=^?, which keeps
+Backspace working in shells and line editors."
+  (append
+   (list "/usr/bin/env" "sh" "-c"
+         (format "stty -nl echo rows %d columns %d sane 2>%s; if [ \"$1\" = .. ]; then shift; fi; exec \"$@\""
+                 rows columns null-device)
+         "..")
+   command))
+
 (defun chomp-io--bash-rcfile (integration-script)
   "Create a temporary rcfile that sources ~/.bashrc and INTEGRATION-SCRIPT.
 Returns the path to the temporary file."
@@ -307,8 +319,10 @@ the process environment."
             "INSIDE_EMACS=chomp")
            (or extra-env nil)
            process-environment))
-         ;; Construct the command with shell integration
-         (cmd (chomp-io--build-command shell-command extra-env))
+         ;; Construct the command with shell integration and initialize PTY
+         ;; termios like Eat does before execing the client program.
+         (cmd (chomp-io--wrap-command-with-stty
+               (chomp-io--build-command shell-command extra-env) h w))
          ;; Create process
          (proc (make-process
                 :name "chomp"

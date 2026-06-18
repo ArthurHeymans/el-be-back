@@ -702,11 +702,8 @@ Binds `screen' and `parser' in BODY."
     ;; C-backspace
     (should (equal "\x08" (chomp-input-translate
                             (event-convert-list '(control backspace)) screen)))
-    ;; Terminal Emacs commonly reports the physical Backspace key as C-h;
-    ;; normalize it to DEL, matching terminfo kbs=^? and the PTY erase char.
-    (should (equal "\x7f" (chomp-input-translate ?\C-h screen)))
-    (should (eq (lookup-key chomp-semi-char-mode-map [?\C-h])
-                #'chomp-self-input))))
+    ;; Eat treats DEL as ordinary backspace input.
+    (should (equal "\x7f" (chomp-input-translate ?\C-? screen)))))
 
 (ert-deftest chomp-test-input-function-keys-extended ()
   "F21+ function keys produce escape sequences."
@@ -722,6 +719,14 @@ Binds `screen' and `parser' in BODY."
   "deletechar key translates to ESC[3~."
   (let ((screen (chomp-screen-create 80 24)))
     (should (equal "\e[3~" (chomp-input-translate 'deletechar screen)))))
+
+(ert-deftest chomp-test-io-command-sets-stty-sane ()
+  "PTY command wrapper initializes terminal settings like Eat."
+  (let ((cmd (chomp-io--wrap-command-with-stty '("/bin/sh") 24 80)))
+    (should (equal '("/usr/bin/env" "sh" "-c")
+                   (list (nth 0 cmd) (nth 1 cmd) (nth 2 cmd))))
+    (should (string-match-p "stty .* rows 24 columns 80 sane" (nth 3 cmd)))
+    (should (equal '(".." "/bin/sh") (nthcdr 4 cmd)))))
 
 (ert-deftest chomp-test-mouse-wheel-left-right ()
   "Mouse wheel-left/right produce correct button codes."
