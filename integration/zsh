@@ -1,0 +1,78 @@
+# integration/zsh --- Zsh integration for chomp
+
+# Copyright (C) 2026
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Shell integration for chomp terminal emulator.
+# Compatible with eat's OSC 51 protocol.
+
+__chomp_precmd () {
+  __chomp_exit_status="$?"
+  # Send exit status.
+  if test -n "$__chomp_current_command"
+  then
+    printf '\e]51;e;H;%i\e\\' "$__chomp_exit_status"
+  fi
+  __chomp_current_command=""
+  # Inform that a new prompt is going to be printed.
+  printf '\e]51;e;J\e\\'
+  # Send the current working directory, for directory tracking.
+  printf '\e]51;e;A;%s;%s\e\\' "$(printf "%s" "$HOST" | base64)" \
+         "$(printf "%s" "$PWD" | base64)"
+  # Update title.
+  printf '\e]2;%s@%s:%s%s\e\\' "$USER" "$HOST" "${PWD/$HOME/~}" \
+         "$(test $UID -eq 0 && echo '#' || echo '%')"
+}
+
+__chomp_preexec () {
+  __chomp_current_command="$1"
+  # Send current command.
+  printf '\e]51;e;F;%s\e\\' \
+         "$(printf "%s" "$__chomp_current_command" | base64)"
+  # Send pre-exec sequence.
+  printf '\e]51;e;G\e\\'
+  # Update title to include the command running.
+  printf '\e]2;%s@%s:%s%s %s\e\\' "$USER" "$HOST" "${PWD/$HOME/~}" \
+         "$(test $UID -eq 0 && echo '#' || echo '%')" \
+         "$__chomp_current_command"
+}
+
+__chomp_enable_integration ()
+{
+  __chomp_integration_enabled=yes
+  __chomp_current_command=""
+  __chomp_exit_status=0
+  local __chomp_prompt_start="$(printf '\e]51;e;B\e\\')"
+  local __chomp_prompt_end="$(printf '\e]51;e;C\e\\')"
+  local __chomp_continuation_start="$(printf '\e]51;e;D\e\\')"
+  local __chomp_continuation_end="$(printf '\e]51;e;E\e\\')"
+  PS1="%{$__chomp_prompt_start%}$PS1%{$__chomp_prompt_end%}"
+  PS2="%{$__chomp_continuation_start%}$PS2%{$__chomp_continuation_end%}"
+  autoload -Uz add-zsh-hook
+  add-zsh-hook precmd __chomp_precmd
+  add-zsh-hook preexec __chomp_preexec
+}
+
+_chomp_msg () {
+  local msg=$'\e]51;e;M'
+  for _ in $(eval "echo {1..$#}")
+  do
+    msg="$msg;$(printf "%s" "$1" | base64)"
+    shift
+  done
+  printf "%s\e\\" "$msg"
+}
+
+# Enable.
+if test -z "$__chomp_integration_enabled" && \
+    { test "${TERM:0:6}" = "chomp-" || test "${TERM:0:4}" = "eat-"; }
+then
+  __chomp_enable_integration
+else
+  true
+fi
+
+# Local Variables:
+# mode: sh
+# sh-shell: zsh
+# End:
