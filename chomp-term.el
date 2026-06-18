@@ -798,8 +798,20 @@ Handles LF, VT, FF."
        (cl-loop for r from 0 below cy
                 do (chomp--erase-whole-line screen r)))
       (2 ;; Erase whole display
-       (cl-loop for r from 0 below height
-                do (chomp--erase-whole-line screen r)))
+       (let ((bg (and (chomp-screen-current-attr screen)
+                      (chomp-attr-bg (chomp-screen-current-attr screen)))))
+         (if (null bg)
+             ;; Common full-frame path: clear by replacing row objects with
+             ;; lazy blank lines instead of materializing and clearing every
+             ;; cell.  ED 2 does not affect scrollback.
+             (let ((r 0)
+                   (width (chomp-screen-width screen)))
+               (while (< r height)
+                 (chomp--set-line-at screen r (chomp--make-empty-line width))
+                 (cl-incf r))
+               (chomp--mark-region-dirty screen 0 (1- height)))
+           (cl-loop for r from 0 below height
+                    do (chomp--erase-whole-line screen r)))))
       (3 ;; Erase scrollback
        (setf (chomp-screen-scrollback screen) nil)
        (setf (chomp-screen-scrollback-length screen) 0)
