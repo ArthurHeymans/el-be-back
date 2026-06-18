@@ -238,10 +238,52 @@ state are reconciled independently so metadata-only updates are visible."
     taken))
 
 (defun chomp-render--lines-to-string (lines width)
-  "Return LINES as one string with trailing newlines."
+  "Return scrollback LINES as one string with trailing newlines.
+Unlike display rows, scrollback rows do not need invisible spacer characters for
+cursor column addressing, so default wide-character rows can be emitted more
+compactly."
   (mapconcat (lambda (line)
-               (concat (chomp-render--line-to-string line width) "\n"))
+               (concat (chomp-render--line-to-string-scrollback line width) "\n"))
              lines ""))
+
+(defun chomp-render--line-to-string-scrollback (line width)
+  "Convert LINE for scrollback rendering."
+  (cond
+   ((and (chomp-line-text line)
+         (= (length (chomp-line-text line)) width))
+    (setf (chomp-line-dirty line) nil)
+    (if-let ((attr (chomp-line-uniform-attr line)))
+        (let ((s (copy-sequence (chomp-line-text line)))
+              (face (chomp-render--attr-to-face attr)))
+          (when face
+            (put-text-property 0 width 'face face s))
+          s)
+      (chomp-line-text line)))
+   ((chomp-render--cells-to-string-scrollback-fast (chomp-line-cells line) width))
+   (t
+    (chomp-render--line-to-string line width))))
+
+(defun chomp-render--cells-to-string-scrollback-fast (cells width)
+  "Return unstyled CELLS as visible scrollback text, or nil if styled."
+  (catch 'styled
+    (let ((s (make-string width ?\s))
+          (i 0)
+          (pos 0)
+          (cols 0))
+      (while (< i width)
+        (let* ((cell (aref cells i))
+               (cw (chomp-cell-width cell)))
+          (when (chomp-cell-attr cell)
+            (throw 'styled nil))
+          (cond
+           ((zerop cw)
+            (cl-incf i))
+           (t
+            (aset s pos (chomp-cell-char cell))
+            (cl-incf pos)
+            (cl-incf cols cw)
+            (cl-incf i cw)))))
+      (substring s 0 (+ pos (max 0 (- width cols)))))))
 
 (defun chomp-render--line-to-string (line width)
   "Convert LINE to a string of WIDTH terminal columns."
