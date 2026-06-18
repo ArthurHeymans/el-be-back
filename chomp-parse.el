@@ -208,7 +208,8 @@ only digits and semicolons."
         (progn
           (chomp-screen-reset-attr screen)
           t)
-      (catch 'fallback
+      (or (chomp-parse--fast-simple-sgr-at screen string start end)
+          (catch 'fallback
         ;; Most SGR sequences are very short.  Keep the vector stack-local and
         ;; fall back for unusually long forms rather than growing structures in
         ;; the hot path.
@@ -306,7 +307,53 @@ only digits and semicolons."
                   (chomp-screen-set-attr screen :bg (+ 8 (- p 100))))
                  (t (throw 'fallback nil))))
               (cl-incf idx)))
-          t)))))
+          t))))))
+
+(defun chomp-parse--fast-simple-sgr-at (screen string start end)
+  "Handle the shortest and most frequent SGR forms in STRING[START, END)."
+  (let ((len (- end start)))
+    (cond
+     ((and (= len 1) (= (aref string start) ?0))
+      (chomp-screen-reset-attr screen)
+      t)
+     ((and (= len 2)
+           (= (aref string start) ?3)
+           (<= ?0 (aref string (1+ start)))
+           (<= (aref string (1+ start)) ?7))
+      (chomp-screen-set-attr screen :fg (- (aref string (1+ start)) ?0))
+      t)
+     ((and (= len 2)
+           (= (aref string start) ?4)
+           (<= ?0 (aref string (1+ start)))
+           (<= (aref string (1+ start)) ?7))
+      (chomp-screen-set-attr screen :bg (- (aref string (1+ start)) ?0))
+      t)
+     ((and (> len 5)
+           (= (aref string start) ?3)
+           (= (aref string (1+ start)) ?8)
+           (= (aref string (+ start 2)) ?\;)
+           (= (aref string (+ start 3)) ?5)
+           (= (aref string (+ start 4)) ?\;))
+      (let ((value 0)
+            (i (+ start 5)))
+        (while (< i end)
+          (setq value (+ (* value 10) (- (aref string i) ?0)))
+          (cl-incf i))
+        (chomp-screen-set-attr screen :fg (min value 16384))
+        t))
+     ((and (> len 5)
+           (= (aref string start) ?4)
+           (= (aref string (1+ start)) ?8)
+           (= (aref string (+ start 2)) ?\;)
+           (= (aref string (+ start 3)) ?5)
+           (= (aref string (+ start 4)) ?\;))
+      (let ((value 0)
+            (i (+ start 5)))
+        (while (< i end)
+          (setq value (+ (* value 10) (- (aref string i) ?0)))
+          (cl-incf i))
+        (chomp-screen-set-attr screen :bg (min value 16384))
+        t)))))
 
 ;;;; ---- Main Dispatch --------------------------------------------------
 
