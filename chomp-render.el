@@ -293,18 +293,34 @@ Handles double-width characters by inserting invisible spacers."
       (chomp-render--cells-to-string-general cells width)))
 
 (defun chomp-render--cells-to-string-fast (cells width)
-  "Fast path for default single-width CELLS, or nil if not applicable."
-  (let ((i 0))
-    (while (and (< i width)
-                (let ((cell (aref cells i)))
-                  (and (= (chomp-cell-width cell) 1)
-                       (null (chomp-cell-attr cell)))))
-      (cl-incf i))
-    (when (= i width)
-      (let ((s (make-string width ?\s)))
-        (dotimes (j width)
-          (aset s j (chomp-cell-char (aref cells j))))
-        s))))
+  "Fast path for default-attribute CELLS, or nil if styled.
+Handles both single-width and wide characters without consing per-cell run
+lists; falls back only when a styled cell is present."
+  (catch 'styled
+    (let ((s (make-string width ?\s))
+          (i 0)
+          (pos 0))
+      (while (< i width)
+        (let* ((cell (aref cells i))
+               (cw (chomp-cell-width cell)))
+          (when (chomp-cell-attr cell)
+            (throw 'styled nil))
+          (cond
+           ((zerop cw)
+            (cl-incf i))
+           ((> cw 1)
+            (aset s pos (chomp-cell-char cell))
+            (let ((end (min width (+ pos cw))))
+              (when (< (1+ pos) end)
+                (put-text-property (1+ pos) end 'invisible t s)
+                (put-text-property (1+ pos) end 'chomp-wide-spacer t s)))
+            (cl-incf pos cw)
+            (cl-incf i cw))
+           (t
+            (aset s pos (chomp-cell-char cell))
+            (cl-incf pos)
+            (cl-incf i)))))
+      s)))
 
 (defun chomp-render--cells-to-string-general (cells width)
   "General propertized conversion for CELLS."
