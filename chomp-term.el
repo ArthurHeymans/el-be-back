@@ -50,6 +50,7 @@
 (cl-defstruct (chomp-alt-save (:copier nil))
   "Saved main-screen state when in alternate screen."
   (lines nil)
+  (line-start 0)
   (cursor-x 0) (cursor-y 0)
   (cursor-saved-x 0) (cursor-saved-y 0) (cursor-saved-attr nil)
   (current-attr nil)
@@ -64,6 +65,7 @@
   "The complete terminal screen state."
   ;; Display
   (lines nil) (width 80) (height 24)
+  (line-start 0)       ; physical index of logical display row 0
   ;; Cursor
   (cursor-x 0) (cursor-y 0)
   (cursor-saved-x 0) (cursor-saved-y 0) (cursor-saved-attr nil)
@@ -99,6 +101,7 @@
   ;; Dirty tracking
   (dirty-lines nil)
   (dirty-map nil)        ; bool vector indexed by row, avoids hot-path `pushnew'
+  (dirty-count 0)
   ;; Pending wrap
   (pending-wrap nil))
 
@@ -159,6 +162,27 @@
                    :text (make-string width ?\s)
                    :dirty t))
 
+(defsubst chomp--line-index (screen row)
+  "Return physical line-vector index for logical ROW on SCREEN."
+  (% (+ (chomp-screen-line-start screen) row)
+     (chomp-screen-height screen)))
+
+(defsubst chomp--line-at (screen row)
+  "Return logical ROW from SCREEN."
+  (aref (chomp-screen-lines screen) (chomp--line-index screen row)))
+
+(defsubst chomp--set-line-at (screen row line)
+  "Set logical ROW on SCREEN to LINE."
+  (aset (chomp-screen-lines screen) (chomp--line-index screen row) line))
+
+(defun chomp--ordered-lines-vector (screen)
+  "Return SCREEN's display lines in logical row order."
+  (let* ((height (chomp-screen-height screen))
+         (v (make-vector height nil)))
+    (dotimes (i height)
+      (aset v i (chomp--line-at screen i)))
+    v))
+
 (defun chomp--default-tab-stops (width)
   "Return default tab stop list (every 8 columns) for WIDTH."
   (cl-loop for i from 8 below width by 8 collect i))
@@ -199,7 +223,7 @@
 This handles both the case where COL is the start of a wide char (width > 1)
 and where COL is a continuation cell (width = 0)."
   (when (and (>= col 0) (< col (chomp-screen-width screen)))
-    (let* ((line (aref (chomp-screen-lines screen) row))
+    (let* ((line (chomp--line-at screen row))
            (cells (chomp-line-cells line))
            (cell (aref cells col))
            (w (chomp-cell-width cell)))
@@ -231,7 +255,16 @@ and where COL is a continuation cell (width = 0)."
   (let ((map (chomp-screen-dirty-map screen)))
     (unless (aref map row)
       (aset map row t)
-      (push row (chomp-screen-dirty-lines screen)))))
+      (push row (chomp-screen-dirty-lines screen))
+      (cl-incf (chomp-screen-dirty-count screen)))))
+
+(defun chomp--mark-region-dirty (screen top bot)
+  "Mark logical rows TOP through BOT dirty."
+  (unless (= (chomp-screen-dirty-count screen) (chomp-screen-height screen))
+    (let ((i top))
+      (while (<= i bot)
+        (chomp--mark-dirty screen i)
+        (cl-incf i)))))
 
 (defsubst chomp--translate-charset (screen char)
   "Translate CHAR through the active character set on SCREEN."
@@ -262,7 +295,8 @@ and where COL is a continuation cell (width = 0)."
      :current-attr (make-chomp-attr)
      :tab-stops (chomp--default-tab-stops width)
      :dirty-lines (number-sequence 0 (1- height))
-     :dirty-map (make-vector height t))))
+     :dirty-map (make-vector height t)
+     :dirty-count height)))
 
 ;;;; ---- Dirty Tracking -------------------------------------------------
 
@@ -274,7 +308,8 @@ and where COL is a continuation cell (width = 0)."
   "Clear the dirty line list."
   (dolist (row (chomp-screen-dirty-lines screen))
     (aset (chomp-screen-dirty-map screen) row nil))
-  (setf (chomp-screen-dirty-lines screen) nil))
+  (setf (chomp-screen-dirty-lines screen) nil)
+  (setf (chomp-screen-dirty-count screen) 0))
 
 (defun chomp-screen-clear-scrollback-dirty (screen)
   "Clear SCREEN's scrollback reconciliation flags."
@@ -289,6 +324,7 @@ and where COL is a continuation cell (width = 0)."
 Top lines go to scrollback (if on main screen)."
   (let* ((top (chomp-screen-scroll-top screen))
          (bot (chomp-screen-scroll-bottom screen))
+         (height (chomp-screen-height screen))
          (lines (chomp-screen-lines screen))
          (width (chomp-screen-width screen))
          (n (min count (1+ (- bot top)))))
@@ -298,27 +334,37 @@ Top lines go to scrollback (if on main screen)."
     (when (and (not (chomp-screen-alt-screen screen))
                (zerop top))
       (dotimes (i n)
-        (push (aref lines (+ top i))
+        (push (chomp--line-at screen (+ top i))
               (chomp-screen-scrollback screen))
         (cl-incf (chomp-screen-scrollback-length screen))
         (cl-incf (chomp-screen-scrollback-appended-count screen))))
-    ;; Shift remaining lines up.  Use explicit loops here; this is one of the
-    ;; hottest paths during bulk output and avoids `cl-loop' dispatch overhead.
-    (let ((i top)
-          (end (- bot n)))
-      (while (<= i end)
-        (aset lines i (aref lines (+ i n)))
-        (cl-incf i)))
-    ;; Fill bottom with empty lines.
-    (let ((i (1+ (- bot n))))
-      (while (<= i bot)
-        (aset lines i (chomp--make-empty-line width))
-        (cl-incf i)))
+    (if (and (zerop top) (= bot (1- height)))
+        ;; Full-screen scrolling is the dominant bulk-output path.  Advance a
+        ;; logical top index instead of moving every row object in the vector.
+        (let ((old-start (chomp-screen-line-start screen))
+              (i 0))
+          (setf (chomp-screen-line-start screen) (% (+ old-start n) height))
+          ;; The physical slots that used to hold the top rows are now the
+          ;; bottom logical rows; replace them with fresh blank rows.  Do not
+          ;; reuse the scrolled-off line objects because scrollback references
+          ;; them.
+          (while (< i n)
+            (aset lines (% (+ old-start i) height)
+                  (chomp--make-empty-line width))
+            (cl-incf i)))
+      ;; Inner/partial regions are uncommon; keep logical row order correct via
+      ;; accessors rather than physically normalizing the whole display.
+      (let ((i top)
+            (end (- bot n)))
+        (while (<= i end)
+          (chomp--set-line-at screen i (chomp--line-at screen (+ i n)))
+          (cl-incf i)))
+      (let ((i (1+ (- bot n))))
+        (while (<= i bot)
+          (chomp--set-line-at screen i (chomp--make-empty-line width))
+          (cl-incf i))))
     ;; Mark all lines in region dirty.
-    (let ((i top))
-      (while (<= i bot)
-        (chomp--mark-dirty screen i)
-        (cl-incf i)))
+    (chomp--mark-region-dirty screen top bot)
     ;; Trim scrollback
     (chomp--trim-scrollback screen)))
 
@@ -327,26 +373,31 @@ Top lines go to scrollback (if on main screen)."
 Bottom lines are discarded."
   (let* ((top (chomp-screen-scroll-top screen))
          (bot (chomp-screen-scroll-bottom screen))
-         (lines (chomp-screen-lines screen))
+         (height (chomp-screen-height screen))
          (width (chomp-screen-width screen))
          (n (min count (1+ (- bot top)))))
-    ;; Shift lines down.
-    (let ((i bot)
-          (end (+ top n)))
-      (while (>= i end)
-        (aset lines i (aref lines (- i n)))
-        (cl-decf i)))
-    ;; Fill top with empty lines.
-    (let ((i top)
-          (end (+ top n -1)))
-      (while (<= i end)
-        (aset lines i (chomp--make-empty-line width))
-        (cl-incf i)))
+    (if (and (zerop top) (= bot (1- height)))
+        (let ((new-start (% (+ (chomp-screen-line-start screen) height (- n))
+                            height))
+              (i 0))
+          (setf (chomp-screen-line-start screen) new-start)
+          (while (< i n)
+            (chomp--set-line-at screen i (chomp--make-empty-line width))
+            (cl-incf i)))
+      ;; Shift lines down.
+      (let ((i bot)
+            (end (+ top n)))
+        (while (>= i end)
+          (chomp--set-line-at screen i (chomp--line-at screen (- i n)))
+          (cl-decf i)))
+      ;; Fill top with empty lines.
+      (let ((i top)
+            (end (+ top n -1)))
+        (while (<= i end)
+          (chomp--set-line-at screen i (chomp--make-empty-line width))
+          (cl-incf i))))
     ;; Mark dirty.
-    (let ((i top))
-      (while (<= i bot)
-        (chomp--mark-dirty screen i)
-        (cl-incf i)))))
+    (chomp--mark-region-dirty screen top bot)))
 
 (defun chomp--trim-scrollback (screen)
   "Trim scrollback to max lines."
@@ -378,8 +429,7 @@ Handles double-width (CJK) characters by occupying two cells."
       (setf (chomp-screen-pending-wrap screen) nil)
       (when (chomp-screen-auto-wrap screen)
         ;; Mark current line as wrapped
-        (let ((line (aref (chomp-screen-lines screen)
-                          (chomp-screen-cursor-y screen))))
+        (let ((line (chomp--line-at screen (chomp-screen-cursor-y screen))))
           (setf (chomp-line-wrapped line) t))
         ;; Move to next line
         (setf (chomp-screen-cursor-x screen) 0)
@@ -391,7 +441,7 @@ Handles double-width (CJK) characters by occupying two cells."
     (let* ((cx (chomp-screen-cursor-x screen))
            (cy (chomp-screen-cursor-y screen))
            (translated (chomp--translate-charset screen char))
-           (line (aref (chomp-screen-lines screen) cy))
+           (line (chomp--line-at screen cy))
            (cells (chomp-line-cells line))
            (attr (chomp--cell-attr-for-write screen))
            (cell (aref cells cx)))
@@ -440,7 +490,7 @@ Handles double-width (CJK) characters by occupying two cells."
                     (cl-incf (chomp-screen-cursor-y screen)))
                   (setq cx 0)
                   (setq cy (chomp-screen-cursor-y screen))
-                  (setq line (aref (chomp-screen-lines screen) cy))
+                  (setq line (chomp--line-at screen cy))
                   (setq cells (chomp-line-cells line)))
               ;; No auto-wrap: just stay at last column
               (setq cx (1- scrn-width))))
@@ -498,8 +548,7 @@ for wide/non-ASCII/insert-mode cases."
         (when (chomp-screen-pending-wrap screen)
           (setf (chomp-screen-pending-wrap screen) nil)
           (when (chomp-screen-auto-wrap screen)
-            (let ((line (aref (chomp-screen-lines screen)
-                              (chomp-screen-cursor-y screen))))
+            (let ((line (chomp--line-at screen (chomp-screen-cursor-y screen))))
               (setf (chomp-line-wrapped line) t))
             (setf (chomp-screen-cursor-x screen) 0)
             (if (= (chomp-screen-cursor-y screen)
@@ -508,7 +557,7 @@ for wide/non-ASCII/insert-mode cases."
               (cl-incf (chomp-screen-cursor-y screen)))))
         (let* ((cx (chomp-screen-cursor-x screen))
                (cy (chomp-screen-cursor-y screen))
-               (line (aref (chomp-screen-lines screen) cy))
+               (line (chomp--line-at screen cy))
                (cells (chomp-line-cells line))
                (attr-template (chomp-screen-current-attr screen))
                (default-attr (not (chomp--attr-non-default-p attr-template)))
@@ -695,7 +744,7 @@ Handles LF, VT, FF."
   (let* ((cx (chomp-screen-cursor-x screen))
          (cy (chomp-screen-cursor-y screen))
          (width (chomp-screen-width screen))
-         (line (aref (chomp-screen-lines screen) cy))
+         (line (chomp--line-at screen cy))
          (cells (chomp-line-cells line))
          (ecell (chomp--make-erase-cell screen)))
     (pcase mode
@@ -725,7 +774,7 @@ Handles LF, VT, FF."
 (defun chomp--erase-whole-line (screen row)
   "Erase entire line ROW with BCE."
   (let* ((width (chomp-screen-width screen))
-         (line (aref (chomp-screen-lines screen) row))
+         (line (chomp--line-at screen row))
          (cells (chomp-line-cells line))
          (ecell (chomp--make-erase-cell screen)))
     (cl-loop for i from 0 below width
@@ -742,7 +791,7 @@ Handles LF, VT, FF."
   (let* ((cx (chomp-screen-cursor-x screen))
          (cy (chomp-screen-cursor-y screen))
          (width (chomp-screen-width screen))
-         (line (aref (chomp-screen-lines screen) cy))
+         (line (chomp--line-at screen cy))
          (cells (chomp-line-cells line))
          (ecell (chomp--make-erase-cell screen))
          (end (min (+ cx count) width)))
@@ -771,20 +820,18 @@ Handles LF, VT, FF."
   (let* ((cy (chomp-screen-cursor-y screen))
          (top (chomp-screen-scroll-top screen))
          (bot (chomp-screen-scroll-bottom screen))
-         (lines (chomp-screen-lines screen))
          (width (chomp-screen-width screen)))
     ;; Only operates within scroll region and when cursor is in it
     (when (and (>= cy top) (<= cy bot))
       (let ((n (min count (1+ (- bot cy)))))
         ;; Shift lines down from cy
         (cl-loop for i from bot downto (+ cy n)
-                 do (aset lines i (aref lines (- i n))))
+                 do (chomp--set-line-at screen i (chomp--line-at screen (- i n))))
         ;; Insert blank lines at cy
         (cl-loop for i from cy below (+ cy n)
-                 do (aset lines i (chomp--make-empty-line width)))
+                 do (chomp--set-line-at screen i (chomp--make-empty-line width)))
         ;; Mark dirty
-        (cl-loop for i from cy to bot
-                 do (chomp--mark-dirty screen i))))))
+        (chomp--mark-region-dirty screen cy bot)))))
 
 (defun chomp-screen-delete-lines (screen count)
   "Delete COUNT lines at cursor row, within scroll region."
@@ -792,19 +839,17 @@ Handles LF, VT, FF."
   (let* ((cy (chomp-screen-cursor-y screen))
          (top (chomp-screen-scroll-top screen))
          (bot (chomp-screen-scroll-bottom screen))
-         (lines (chomp-screen-lines screen))
          (width (chomp-screen-width screen)))
     (when (and (>= cy top) (<= cy bot))
       (let ((n (min count (1+ (- bot cy)))))
         ;; Shift lines up
         (cl-loop for i from cy to (- bot n)
-                 do (aset lines i (aref lines (+ i n))))
+                 do (chomp--set-line-at screen i (chomp--line-at screen (+ i n))))
         ;; Fill bottom with empty
         (cl-loop for i from (1+ (- bot n)) to bot
-                 do (aset lines i (chomp--make-empty-line width)))
+                 do (chomp--set-line-at screen i (chomp--make-empty-line width)))
         ;; Mark dirty
-        (cl-loop for i from cy to bot
-                 do (chomp--mark-dirty screen i))))))
+        (chomp--mark-region-dirty screen cy bot)))))
 
 ;;;; ---- Character Operations -------------------------------------------
 
@@ -813,7 +858,7 @@ Handles LF, VT, FF."
   (let* ((cx (chomp-screen-cursor-x screen))
          (cy (chomp-screen-cursor-y screen))
          (width (chomp-screen-width screen))
-         (line (aref (chomp-screen-lines screen) cy))
+         (line (chomp--line-at screen cy))
          (cells (chomp-line-cells line))
          (n (min count (- width cx))))
     (setf (chomp-line-text line) nil)
@@ -831,7 +876,7 @@ Handles LF, VT, FF."
   (let* ((cx (chomp-screen-cursor-x screen))
          (cy (chomp-screen-cursor-y screen))
          (width (chomp-screen-width screen))
-         (line (aref (chomp-screen-lines screen) cy))
+         (line (chomp--line-at screen cy))
          (cells (chomp-line-cells line))
          (n (min count (- width cx))))
     (setf (chomp-line-text line) nil)
@@ -910,6 +955,7 @@ Handles LF, VT, FF."
     (setf (chomp-screen-alt-screen screen)
           (make-chomp-alt-save
            :lines (chomp-screen-lines screen)
+           :line-start (chomp-screen-line-start screen)
            :cursor-x (chomp-screen-cursor-x screen)
            :cursor-y (chomp-screen-cursor-y screen)
            :cursor-saved-x (chomp-screen-cursor-saved-x screen)
@@ -930,6 +976,7 @@ Handles LF, VT, FF."
         (dotimes (i h)
           (aset lines i (chomp--make-empty-line w)))
         (setf (chomp-screen-lines screen) lines))
+      (setf (chomp-screen-line-start screen) 0)
       (setf (chomp-screen-cursor-x screen) 0)
       (setf (chomp-screen-cursor-y screen) 0)
       (setf (chomp-screen-scroll-top screen) 0)
@@ -939,12 +986,14 @@ Handles LF, VT, FF."
       (setf (chomp-screen-scrollback-dirty screen) t)
       (setf (chomp-screen-dirty-lines screen)
             (number-sequence 0 (1- h)))
-      (setf (chomp-screen-dirty-map screen) (make-vector h t)))))
+      (setf (chomp-screen-dirty-map screen) (make-vector h t))
+      (setf (chomp-screen-dirty-count screen) h))))
 
 (defun chomp-screen-leave-alt (screen)
   "Leave alternate screen buffer, restoring main screen."
   (when-let ((saved (chomp-screen-alt-screen screen)))
     (setf (chomp-screen-lines screen) (chomp-alt-save-lines saved))
+    (setf (chomp-screen-line-start screen) (chomp-alt-save-line-start saved))
     (setf (chomp-screen-cursor-x screen) (chomp-alt-save-cursor-x saved))
     (setf (chomp-screen-cursor-y screen) (chomp-alt-save-cursor-y saved))
     (setf (chomp-screen-cursor-saved-x screen) (chomp-alt-save-cursor-saved-x saved))
@@ -965,7 +1014,8 @@ Handles LF, VT, FF."
     (setf (chomp-screen-dirty-lines screen)
           (number-sequence 0 (1- (chomp-screen-height screen))))
     (setf (chomp-screen-dirty-map screen)
-          (make-vector (chomp-screen-height screen) t))))
+          (make-vector (chomp-screen-height screen) t))
+    (setf (chomp-screen-dirty-count screen) (chomp-screen-height screen))))
 
 ;;;; ---- Save / Restore Cursor ------------------------------------------
 
@@ -1043,7 +1093,7 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
   (when (and (> new-width 0) (> new-height 0)
              (or (/= new-width (chomp-screen-width screen))
                  (/= new-height (chomp-screen-height screen))))
-    (let ((old-lines (chomp-screen-lines screen))
+    (let ((old-lines (chomp--ordered-lines-vector screen))
           (old-width (chomp-screen-width screen)))
       ;; Phase 1: Unwrap lines into logical lines
       (let ((logical (chomp--unwrap-lines old-lines old-width)))
@@ -1051,6 +1101,7 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
         (let ((new-lines (chomp--rewrap-lines logical new-width new-height)))
           ;; Phase 3: Apply
           (setf (chomp-screen-lines screen) new-lines)
+          (setf (chomp-screen-line-start screen) 0)
           (setf (chomp-screen-width screen) new-width)
           (setf (chomp-screen-height screen) new-height)
           ;; Phase 4: Clamp cursor
@@ -1065,6 +1116,7 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
           (setf (chomp-screen-dirty-lines screen)
                 (number-sequence 0 (1- new-height)))
           (setf (chomp-screen-dirty-map screen) (make-vector new-height t))
+          (setf (chomp-screen-dirty-count screen) new-height)
           ;; Reset tab stops for new width
           (setf (chomp-screen-tab-stops screen)
                 (chomp--default-tab-stops new-width)))))))
@@ -1179,6 +1231,7 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
       (dotimes (i h)
         (aset lines i (chomp--make-empty-line w)))
       (setf (chomp-screen-lines screen) lines))
+    (setf (chomp-screen-line-start screen) 0)
     ;; Reset cursor
     (setf (chomp-screen-cursor-x screen) 0)
     (setf (chomp-screen-cursor-y screen) 0)
@@ -1220,7 +1273,8 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
     ;; Everything is dirty
     (setf (chomp-screen-dirty-lines screen)
           (number-sequence 0 (1- h)))
-    (setf (chomp-screen-dirty-map screen) (make-vector h t))))
+    (setf (chomp-screen-dirty-map screen) (make-vector h t))
+    (setf (chomp-screen-dirty-count screen) h)))
 
 ;;;; ---- Character Set Designation --------------------------------------
 
@@ -1250,7 +1304,7 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
 (defun chomp-screen-get-line (screen row)
   "Return the chomp-line at ROW."
   (when (and (>= row 0) (< row (chomp-screen-height screen)))
-    (aref (chomp-screen-lines screen) row)))
+    (chomp--line-at screen row)))
 
 (defun chomp-screen-scrollback-lines (screen)
   "Return scrollback lines, oldest first."
