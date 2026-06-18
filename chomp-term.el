@@ -586,17 +586,16 @@ for wide/non-ASCII/insert-mode cases."
                (line-text (and default-attr (chomp-line-text line)))
                (limit (min end (+ i (- width cx))))
                (start-i i)
-               (ascii-only
-                (and line-text
-                     (let ((j i))
-                       (while (and (< j limit) (< (aref string j) 128))
-                         (cl-incf j))
-                       (= j limit)))))
+               (ascii-end
+                (let ((j i))
+                  (while (and (< j limit) (< (aref string j) 128))
+                    (cl-incf j))
+                  j)))
           (cond
            ;; Text-first hot path: use it only when this row segment is entirely
            ;; ASCII.  Mixed Unicode lines would otherwise pay to materialize the
            ;; lazy prefix before every wide/non-ASCII character.
-           (ascii-only
+           ((and line-text (= ascii-end limit))
             (while (< i limit)
               (aset line-text (+ cx (- i start-i)) (aref string i))
               (cl-incf i))
@@ -607,8 +606,7 @@ for wide/non-ASCII/insert-mode cases."
                 (setf (chomp-line-text line) nil))
               ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
               (if default-attr
-                  (while (and (< i limit)
-                              (< (aref string i) 128)
+                  (while (and (< i ascii-end)
                               (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
                     (let* ((col (+ cx (- i start-i)))
                            (cell (aref cells col))
@@ -617,8 +615,7 @@ for wide/non-ASCII/insert-mode cases."
                       (setf (chomp-cell-width cell) 1)
                       (setf (chomp-cell-attr cell) nil))
                     (cl-incf i))
-                (while (and (< i limit)
-                            (< (aref string i) 128)
+                (while (and (< i ascii-end)
                             (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
                   (let* ((cell (aref cells (+ cx (- i start-i))))
                          (ch (aref string i)))
