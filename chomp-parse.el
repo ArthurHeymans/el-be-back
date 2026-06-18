@@ -130,7 +130,16 @@ Returns the number of characters consumed."
                           (let ((c (aref string i)))
                             (and (>= c ?\s) (/= c ?\x7f))))
                 (cl-incf i))
-              (chomp-screen-write-string screen string run-start i))
+              (chomp-screen-write-string screen string run-start i)
+              ;; Bulk command output commonly arrives as printable text followed
+              ;; by CRLF.  Handle that pair inline in ground state to avoid two
+              ;; full parser dispatches per line.
+              (when (and (< (1+ i) e)
+                         (= (aref string i) ?\r)
+                         (= (aref string (1+ i)) ?\n))
+                (chomp-screen-carriage-return screen)
+                (chomp-screen-index screen)
+                (cl-incf i 2)))
           (chomp-parse--process-char parser ch)
           (cl-incf i))))
     (- i (or start 0))))
