@@ -158,8 +158,11 @@
     v))
 
 (defun chomp--make-empty-line (width)
-  "Return a new empty chomp-line of WIDTH cells."
-  (make-chomp-line :cells (chomp--make-empty-cells width)
+  "Return a new empty chomp-line of WIDTH columns.
+Cells are materialized lazily from the plain text cache; this keeps scrolling
+from allocating a full vector of cell structs for every blank bottom row."
+  (make-chomp-line :cells nil
+                   :cells-valid nil
                    :text (make-string width ?\s)
                    :dirty t))
 
@@ -1342,9 +1345,13 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
       (chomp--line-ensure-cells line (chomp-screen-width screen))
       line)))
 
+(defun chomp-screen-scrollback-lines-raw (screen)
+  "Return scrollback lines, oldest first, without materializing lazy cells."
+  (reverse (chomp-screen-scrollback screen)))
+
 (defun chomp-screen-scrollback-lines (screen)
   "Return scrollback lines, oldest first."
-  (let ((lines (reverse (chomp-screen-scrollback screen))))
+  (let ((lines (chomp-screen-scrollback-lines-raw screen)))
     (dolist (line lines)
       (chomp--line-ensure-cells line (chomp-screen-width screen)))
     lines))

@@ -221,7 +221,7 @@ state are reconciled independently so metadata-only updates are visible."
   (let* ((screen (chomp-render-state-screen render))
          (width (chomp-screen-width screen))
          (display-begin (chomp-render-state-display-begin render))
-         (lines (chomp-screen-scrollback-lines screen)))
+         (lines (chomp-screen-scrollback-lines-raw screen)))
     (save-excursion
       (delete-region (point-min) display-begin)
       (goto-char (point-min))
