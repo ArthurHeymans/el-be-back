@@ -701,7 +701,12 @@ Binds `screen' and `parser' in BODY."
                               (event-convert-list '(meta backspace)) screen)))
     ;; C-backspace
     (should (equal "\x08" (chomp-input-translate
-                            (event-convert-list '(control backspace)) screen)))))
+                            (event-convert-list '(control backspace)) screen)))
+    ;; Terminal Emacs commonly reports the physical Backspace key as C-h;
+    ;; normalize it to DEL, matching terminfo kbs=^? and the PTY erase char.
+    (should (equal "\x7f" (chomp-input-translate ?\C-h screen)))
+    (should (eq (lookup-key chomp-semi-char-mode-map [?\C-h])
+                #'chomp-self-input))))
 
 (ert-deftest chomp-test-input-function-keys-extended ()
   "F21+ function keys produce escape sequences."

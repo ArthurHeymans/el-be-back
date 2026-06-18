@@ -94,6 +94,11 @@ SCREEN is consulted for mode flags.  Returns a string or nil."
      ((and (characterp key) (> key ?~) (null mods))
       (string key))
 
+     ;; Terminal Emacs commonly reports the physical Backspace key as C-h.
+     ;; Normalize that event to DEL before the generic C-a..C-z handling.
+     ((eq key ?\C-h)
+      "\x7f")
+
      ;; ---- Control character (C-a through C-z) ----
      ((and (characterp basic) (memq 'control mods)
            (>= basic ?a) (<= basic ?z)
@@ -180,7 +185,12 @@ SCREEN is consulted for mode flags.  Returns a string or nil."
 
      ;; ---- Literal char with no special handling ----
      ((characterp key)
-      (string key))
+      ;; In terminal Emacs, the physical Backspace key is commonly reported as
+      ;; C-h rather than the `backspace' symbol.  TERM advertises kbs=^?, and
+      ;; PTYs typically use DEL as the erase character, so normalize unmodified
+      ;; C-h to DEL for reliable shell line editing.  Explicit C-backspace is
+      ;; handled above and still sends C-h.
+      (if (= key ?\C-h) "\x7f" (string key)))
 
      ;; ---- Unknown ----
      (t nil))))
@@ -284,7 +294,7 @@ Returns a string or nil."
 ;;;; ---- Keymaps --------------------------------------------------------
 
 (defcustom chomp-semi-char-non-bound-keys
-  '([?\C-x] [?\C-\\] [?\C-q] [?\C-g] [?\C-h] [?\e ?\C-c] [?\C-u]
+  '([?\C-x] [?\C-\\] [?\C-q] [?\C-g] [?\e ?\C-c] [?\C-u]
     [?\e ?x] [?\e ?:] [?\e ?!] [?\e ?&]
     [C-insert] [M-insert] [S-insert] [C-M-insert]
     [C-S-insert] [M-S-insert] [C-M-S-insert]
