@@ -439,15 +439,73 @@ Returns the number of characters consumed."
     tbl)
   "CSI final-byte dispatch table.  Indexed by character code.")
 
+(defun chomp-parse--fast-csi (parser final-byte param)
+  "Fast-path common CSI sequences; return non-nil when handled."
+  (and (null (chomp-parser-private parser))
+       (string-empty-p (chomp-parser-intermediates parser))
+       (let ((screen (chomp-parser-screen parser)))
+         (cond
+          ;; TUI repaint streams are dominated by row/column addressing.
+          ((= final-byte ?H)
+           (let ((row 0)
+                 (col 0)
+                 (in-col nil)
+                 (ok t)
+                 (i 0)
+                 (len (length param)))
+             (while (and ok (< i len))
+               (let ((ch (aref param i)))
+                 (cond
+                  ((and (>= ch ?0) (<= ch ?9))
+                   (if in-col
+                       (setq col (+ (* col 10) (- ch ?0)))
+                     (setq row (+ (* row 10) (- ch ?0)))))
+                  ((= ch ?\;)
+                   (setq in-col t))
+                  (t
+                   (setq ok nil))))
+               (cl-incf i))
+             (when ok
+               (chomp-screen-cursor-goto screen
+                                         (1- (if (zerop row) 1 row))
+                                         (1- (if (zerop col) 1 col)))
+               t)))
+          ;; Full-screen clear is common at frame start.
+          ((and (= final-byte ?J)
+                (= (length param) 1)
+                (= (aref param 0) ?2))
+           (chomp-screen-erase-in-display screen 2)
+           t)
+          ;; Simple SGR reset and ANSI foreground/background colors.
+          ((= final-byte ?m)
+           (cond
+            ((or (string-empty-p param) (string= param "0"))
+             (chomp-screen-reset-attr screen)
+             t)
+            ((and (= (length param) 2)
+                  (= (aref param 0) ?4)
+                  (<= ?0 (aref param 1))
+                  (<= (aref param 1) ?7))
+             (chomp-screen-set-attr screen :bg (- (aref param 1) ?0))
+             t)
+            ((and (= (length param) 2)
+                  (= (aref param 0) ?3)
+                  (<= ?0 (aref param 1))
+                  (<= (aref param 1) ?7))
+             (chomp-screen-set-attr screen :fg (- (aref param 1) ?0))
+             t)))
+          (t nil)))))
+
 (defun chomp-parse--dispatch-csi (parser final-byte)
   "Parse parameters and dispatch CSI sequence."
   (condition-case err
-      (let ((params (chomp-parse--parse-params
-                     (chomp-parser-param-string parser)))
-            (handler (if (< final-byte 128)
-                         (aref chomp-parse--csi-dispatch final-byte)
-                       #'chomp-parse--csi-unknown)))
-        (funcall handler parser params))
+      (let ((param (chomp-parser-param-string parser)))
+        (unless (chomp-parse--fast-csi parser final-byte param)
+          (let ((params (chomp-parse--parse-params param))
+                (handler (if (< final-byte 128)
+                             (aref chomp-parse--csi-dispatch final-byte)
+                           #'chomp-parse--csi-unknown)))
+            (funcall handler parser params))))
     (error
      (chomp-parse--log "CSI dispatch error for %c: %S" final-byte err)))
   (setf (chomp-parser-state parser) :ground))
