@@ -123,8 +123,17 @@ Returns the number of characters consumed."
         ;; the parser is in ground state.  Dispatch that whole run to the
         ;; screen model at once instead of re-entering the parser for each byte.
         (if (and (eq (chomp-parser-state parser) :ground)
-                 (>= ch ?\s)
-                 (/= ch ?\x7f))
+                 (= ch ?\e)
+                 (< (+ i 2) e)
+                 (= (aref string (1+ i)) ?\[))
+            (let ((next (chomp-parse--fast-csi-at parser string (+ i 2) e)))
+              (if next
+                  (setq i next)
+                (chomp-parse--process-char parser ch)
+                (cl-incf i)))
+          (if (and (eq (chomp-parser-state parser) :ground)
+                   (>= ch ?\s)
+                   (/= ch ?\x7f))
             (let ((run-start i))
               (while (and (< i e)
                           (let ((c (aref string i)))
@@ -140,9 +149,72 @@ Returns the number of characters consumed."
                 (chomp-screen-carriage-return screen)
                 (chomp-screen-index screen)
                 (cl-incf i 2)))
-          (chomp-parse--process-char parser ch)
-          (cl-incf i))))
+            (chomp-parse--process-char parser ch)
+            (cl-incf i)))))
     (- i (or start 0))))
+
+(defun chomp-parse--fast-csi-at (parser string start end)
+  "Handle a common CSI beginning at START, returning the next index.
+START is the first byte after ESC [.  Return nil when the sequence is not one
+of the simple forms handled here."
+  (catch 'done
+    (let ((j start))
+      (while (< j end)
+        (let ((c (aref string j)))
+          (cond
+           ((or (and (>= c ?0) (<= c ?9)) (= c ?\;))
+            (cl-incf j))
+           ((and (>= c ?@) (<= c ?~))
+            (let ((screen (chomp-parser-screen parser)))
+              (cond
+               ((= c ?H)
+                (let ((row 0)
+                      (col 0)
+                      (in-col nil)
+                      (k start))
+                  (while (< k j)
+                    (let ((p (aref string k)))
+                      (if (= p ?\;)
+                          (if in-col
+                              (throw 'done nil)
+                            (setq in-col t))
+                        (if in-col
+                            (setq col (+ (* col 10) (- p ?0)))
+                          (setq row (+ (* row 10) (- p ?0))))))
+                    (cl-incf k))
+                  (chomp-screen-cursor-goto screen
+                                            (1- (if (zerop row) 1 row))
+                                            (1- (if (zerop col) 1 col)))
+                  (throw 'done (1+ j))))
+               ((and (= c ?J)
+                     (= (- j start) 1)
+                     (= (aref string start) ?2))
+                (chomp-screen-erase-in-display screen 2)
+                (throw 'done (1+ j)))
+               ((= c ?m)
+                (cond
+                 ((= j start)
+                  (chomp-screen-reset-attr screen)
+                  (throw 'done (1+ j)))
+                 ((and (= (- j start) 1)
+                       (= (aref string start) ?0))
+                  (chomp-screen-reset-attr screen)
+                  (throw 'done (1+ j)))
+                 ((and (= (- j start) 2)
+                       (= (aref string start) ?4)
+                       (<= ?0 (aref string (1+ start)))
+                       (<= (aref string (1+ start)) ?7))
+                  (chomp-screen-set-attr screen :bg (- (aref string (1+ start)) ?0))
+                  (throw 'done (1+ j)))
+                 ((and (= (- j start) 2)
+                       (= (aref string start) ?3)
+                       (<= ?0 (aref string (1+ start)))
+                       (<= (aref string (1+ start)) ?7))
+                  (chomp-screen-set-attr screen :fg (- (aref string (1+ start)) ?0))
+                  (throw 'done (1+ j)))
+                 (t (throw 'done nil))))
+               (t (throw 'done nil)))))
+           (t (throw 'done nil))))))))
 
 ;;;; ---- Main Dispatch --------------------------------------------------
 
