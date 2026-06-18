@@ -526,9 +526,14 @@ Handles double-width (CJK) characters by occupying two cells."
               ;; No auto-wrap: just stay at last column
               (setq cx (1- scrn-width))))
 
-          ;; Clear any existing multi-width cell that we're overwriting
-          (chomp--clear-wide-char-at screen cy cx)
-          (when (> char-w 1)
+          ;; Clear existing multi-width cells only when needed.  Sequential
+          ;; mixed Unicode output usually writes into fresh single-width blank
+          ;; cells, so avoid two helper calls per wide character.
+          (unless (= (chomp-cell-width (aref cells cx)) 1)
+            (chomp--clear-wide-char-at screen cy cx))
+          (when (and (> char-w 1)
+                     (< (1+ cx) scrn-width)
+                     (/= (chomp-cell-width (aref cells (1+ cx))) 1))
             (chomp--clear-wide-char-at screen cy (1+ cx)))
 
           ;; Insert mode: shift chars right
@@ -536,14 +541,21 @@ Handles double-width (CJK) characters by occupying two cells."
             (cl-loop for i from (1- scrn-width) above (+ cx char-w -1)
                      do (aset cells i (aref cells (- i char-w)))))
 
-          ;; Write the character
-          (aset cells cx (make-chomp-cell :char translated :width char-w :attr attr))
-          ;; For double-width: fill continuation cell(s)
+          ;; Write the character by mutating existing cells instead of
+          ;; allocating new cell structs for every Unicode character.
+          (let ((cell (aref cells cx)))
+            (setf (chomp-cell-char cell) translated)
+            (setf (chomp-cell-width cell) char-w)
+            (setf (chomp-cell-attr cell) attr))
+          ;; For double-width: mark continuation cell(s).
           (when (> char-w 1)
-            (cl-loop for i from 1 below char-w
-                     when (< (+ cx i) scrn-width)
-                     do (aset cells (+ cx i)
-                             (make-chomp-cell :char ?\s :width 0 :attr attr))))
+            (let ((i 1))
+              (while (and (< i char-w) (< (+ cx i) scrn-width))
+                (let ((cell (aref cells (+ cx i))))
+                  (setf (chomp-cell-char cell) ?\s)
+                  (setf (chomp-cell-width cell) 0)
+                  (setf (chomp-cell-attr cell) attr))
+                (cl-incf i))))
 
           (setf (chomp-line-dirty line) t)
           (chomp--mark-dirty screen cy)
