@@ -43,7 +43,8 @@
   "A single line in the terminal."
   (cells nil)       ; vector of chomp-cell
   (cells-valid t)   ; nil when CELLS must be materialized from TEXT
-  (text nil)        ; plain single-width/default-attr cache string, or nil
+  (text nil)        ; single-width text cache string, or nil
+  (uniform-attr nil) ; non-nil when TEXT has one shared non-default attr
   (rendered nil)    ; cached rendered/propertized string for non-plain lines
   (wrapped nil)     ; auto-wrapped from previous line?
   (dirty t))
@@ -189,7 +190,7 @@ from allocating a full vector of cell structs for every blank bottom row."
             (setf (chomp-cell-char cell)
                   (if (< i (length text)) (aref text i) ?\s))
             (setf (chomp-cell-width cell) 1)
-            (setf (chomp-cell-attr cell) nil))
+            (setf (chomp-cell-attr cell) (chomp-line-uniform-attr line)))
           (cl-incf i)))
       (setf (chomp-line-cells-valid line) t)))
   (chomp-line-cells line))
@@ -222,11 +223,11 @@ from allocating a full vector of cell structs for every blank bottom row."
            (/= 0 (chomp-attr-font attr)))))
 
 (defsubst chomp--cell-attr-for-write (screen)
-  "Return attr to store on a new cell, or nil for default."
+  "Return attr to store on a new cell, or nil for default.
+Current attributes are copy-on-write, so non-default cells may share this
+immutable attr object instead of allocating a copy per cell."
   (let ((a (chomp-screen-current-attr screen)))
-    (if (chomp--attr-non-default-p a)
-        (chomp-attr-copy a)
-      nil)))
+    (and (chomp--attr-non-default-p a) a)))
 
 (defun chomp--make-erase-cell (screen)
   "Return a cell for erased positions (space with current bg via BCE)."
@@ -251,7 +252,8 @@ and where COL is a continuation cell (width = 0)."
            (cell (aref cells col))
            (w (chomp-cell-width cell)))
       (unless (= w 1)
-        (setf (chomp-line-text line) nil))
+        (setf (chomp-line-text line) nil)
+        (setf (chomp-line-uniform-attr line) nil))
       (cond
        ;; This is a wide char start: clear it and its continuation cells
        ((> w 1)
@@ -479,9 +481,14 @@ Handles double-width (CJK) characters by occupying two cells."
             (setf (chomp-cell-char cell) translated)
             (setf (chomp-cell-width cell) 1)
             (setf (chomp-cell-attr cell) attr)
-            (if (and (null attr) (chomp-line-text line))
-                (aset (chomp-line-text line) cx translated)
-              (setf (chomp-line-text line) nil))
+            (let ((uniform (chomp-line-uniform-attr line)))
+              (if (and (chomp-line-text line)
+                       (or (and (null attr) (null uniform))
+                           (and attr uniform
+                                (or (eq attr uniform) (equal attr uniform)))))
+                  (aset (chomp-line-text line) cx translated)
+                (setf (chomp-line-text line) nil)
+                (setf (chomp-line-uniform-attr line) nil)))
             (setf (chomp-line-dirty line) t)
             (chomp--mark-dirty screen cy)
             (setf (chomp-screen-last-char screen) translated)
@@ -497,6 +504,7 @@ Handles double-width (CJK) characters by occupying two cells."
         ;; cells.
         (progn
           (setf (chomp-line-text line) nil)
+        (setf (chomp-line-uniform-attr line) nil)
           ;; Double-width char at last column: fill with space and wrap
           (when (and (> char-w 1) (>= cx (1- scrn-width)))
             ;; Fill last column with space
@@ -583,7 +591,7 @@ for wide/non-ASCII/insert-mode cases."
                (line (chomp--line-at screen cy))
                (attr-template (chomp-screen-current-attr screen))
                (default-attr (not (chomp--attr-non-default-p attr-template)))
-               (line-text (and default-attr (chomp-line-text line)))
+               (line-text (chomp-line-text line))
                (limit (min end (+ i (- width cx))))
                (start-i i)
                (ascii-end
@@ -595,15 +603,27 @@ for wide/non-ASCII/insert-mode cases."
            ;; Text-first hot path: use it only when this row segment is entirely
            ;; ASCII.  Mixed Unicode lines would otherwise pay to materialize the
            ;; lazy prefix before every wide/non-ASCII character.
-           ((and line-text (= ascii-end limit))
+           ((and default-attr line-text (= ascii-end limit))
             (while (< i limit)
               (aset line-text (+ cx (- i start-i)) (aref string i))
               (cl-incf i))
+            (setf (chomp-line-uniform-attr line) nil)
+            (setf (chomp-line-cells-valid line) nil))
+           ((and (not default-attr)
+                 line-text
+                 (= ascii-end limit)
+                 (zerop cx)
+                 (= (- limit start-i) width))
+            (while (< i limit)
+              (aset line-text (- i start-i) (aref string i))
+              (cl-incf i))
+            (setf (chomp-line-uniform-attr line) attr-template)
             (setf (chomp-line-cells-valid line) nil))
            (t
             (let ((cells (chomp--line-ensure-cells line width)))
               (unless default-attr
-                (setf (chomp-line-text line) nil))
+                (setf (chomp-line-text line) nil)
+        (setf (chomp-line-uniform-attr line) nil))
               ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
               (if default-attr
                   (while (and (< i ascii-end)
@@ -621,7 +641,7 @@ for wide/non-ASCII/insert-mode cases."
                          (ch (aref string i)))
                     (setf (chomp-cell-char cell) ch)
                     (setf (chomp-cell-width cell) 1)
-                    (setf (chomp-cell-attr cell) (chomp-attr-copy attr-template)))
+                    (setf (chomp-cell-attr cell) attr-template))
                   (cl-incf i))))))
           (if (= i start-i)
               ;; Could not use the fast row writer for this byte.
@@ -730,7 +750,8 @@ Handles LF, VT, FF."
 
 (defun chomp-screen-set-attr (screen prop value)
   "Set attribute PROP to VALUE on SCREEN's current-attr."
-  (let ((attr (chomp-screen-current-attr screen)))
+  (let ((attr (chomp-attr-copy (chomp-screen-current-attr screen))))
+    (setf (chomp-screen-current-attr screen) attr)
     (pcase prop
       (:fg        (setf (chomp-attr-fg attr) value))
       (:bg        (setf (chomp-attr-bg attr) value))
@@ -784,23 +805,32 @@ Handles LF, VT, FF."
       (0 ;; cursor to end
        (cl-loop for i from cx below width
                 do (aset cells i (copy-chomp-cell ecell)))
-       (if (and (null (chomp-cell-attr ecell)) (chomp-line-text line))
+       (if (and (null (chomp-cell-attr ecell))
+                (chomp-line-text line)
+                (null (chomp-line-uniform-attr line)))
            (cl-loop for i from cx below width
                     do (aset (chomp-line-text line) i ?\s))
-         (setf (chomp-line-text line) nil)))
+         (setf (chomp-line-text line) nil)
+         (setf (chomp-line-uniform-attr line) nil)))
       (1 ;; start to cursor
        (cl-loop for i from 0 to cx
                 do (aset cells i (copy-chomp-cell ecell)))
-       (if (and (null (chomp-cell-attr ecell)) (chomp-line-text line))
+       (if (and (null (chomp-cell-attr ecell))
+                (chomp-line-text line)
+                (null (chomp-line-uniform-attr line)))
            (cl-loop for i from 0 to cx
                     do (aset (chomp-line-text line) i ?\s))
-         (setf (chomp-line-text line) nil)))
+         (setf (chomp-line-text line) nil)
+         (setf (chomp-line-uniform-attr line) nil)))
       (2 ;; whole line
        (cl-loop for i from 0 below width
                 do (aset cells i (copy-chomp-cell ecell)))
        (if (null (chomp-cell-attr ecell))
-           (setf (chomp-line-text line) (make-string width ?\s))
-         (setf (chomp-line-text line) nil))))
+           (progn
+             (setf (chomp-line-text line) (make-string width ?\s))
+             (setf (chomp-line-uniform-attr line) nil))
+         (setf (chomp-line-text line) nil)
+         (setf (chomp-line-uniform-attr line) nil))))
     (setf (chomp-line-dirty line) t)
     (chomp--mark-dirty screen cy)))
 
@@ -813,8 +843,11 @@ Handles LF, VT, FF."
     (cl-loop for i from 0 below width
              do (aset cells i (copy-chomp-cell ecell)))
     (if (null (chomp-cell-attr ecell))
-        (setf (chomp-line-text line) (make-string width ?\s))
-      (setf (chomp-line-text line) nil))
+        (progn
+          (setf (chomp-line-text line) (make-string width ?\s))
+          (setf (chomp-line-uniform-attr line) nil))
+      (setf (chomp-line-text line) nil)
+      (setf (chomp-line-uniform-attr line) nil))
     (setf (chomp-line-wrapped line) nil)
     (setf (chomp-line-dirty line) t)
     (chomp--mark-dirty screen row)))
@@ -830,10 +863,13 @@ Handles LF, VT, FF."
          (end (min (+ cx count) width)))
     (cl-loop for i from cx below end
              do (aset cells i (copy-chomp-cell ecell)))
-    (if (and (null (chomp-cell-attr ecell)) (chomp-line-text line))
+    (if (and (null (chomp-cell-attr ecell))
+             (chomp-line-text line)
+             (null (chomp-line-uniform-attr line)))
         (cl-loop for i from cx below end
                  do (aset (chomp-line-text line) i ?\s))
-      (setf (chomp-line-text line) nil))
+      (setf (chomp-line-text line) nil)
+      (setf (chomp-line-uniform-attr line) nil))
     (setf (chomp-line-dirty line) t)
     (chomp--mark-dirty screen cy)))
 
@@ -895,6 +931,7 @@ Handles LF, VT, FF."
          (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
          (n (min count (- width cx))))
     (setf (chomp-line-text line) nil)
+        (setf (chomp-line-uniform-attr line) nil)
     ;; Shift right
     (cl-loop for i from (1- width) downto (+ cx n)
              do (aset cells i (aref cells (- i n))))
@@ -913,6 +950,7 @@ Handles LF, VT, FF."
          (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
          (n (min count (- width cx))))
     (setf (chomp-line-text line) nil)
+        (setf (chomp-line-uniform-attr line) nil)
     ;; Shift left
     (cl-loop for i from cx below (- width n)
              do (aset cells i (aref cells (+ i n))))

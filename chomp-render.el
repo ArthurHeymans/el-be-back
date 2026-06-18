@@ -247,6 +247,16 @@ state are reconciled independently so metadata-only updates are visible."
   "Convert LINE to a string of WIDTH terminal columns."
   (cond
    ((and (chomp-line-text line)
+         (chomp-line-uniform-attr line)
+         (= (length (chomp-line-text line)) width))
+    (let ((s (copy-sequence (chomp-line-text line)))
+          (face (chomp-render--attr-to-face (chomp-line-uniform-attr line))))
+      (when face
+        (put-text-property 0 width 'face face s))
+      (setf (chomp-line-rendered line) s)
+      (setf (chomp-line-dirty line) nil)
+      s))
+   ((and (chomp-line-text line)
          (= (length (chomp-line-text line)) width))
     (setf (chomp-line-dirty line) nil)
     (chomp-line-text line))
@@ -265,7 +275,7 @@ state are reconciled independently so metadata-only updates are visible."
 (defun chomp-render--update-line (render row)
   "Re-render display line ROW in the buffer."
   (let* ((screen (chomp-render-state-screen render))
-         (line (chomp-screen-get-line screen row))
+         (line (chomp--line-at screen row))
          (width (chomp-screen-width screen))
          (display-begin (chomp-render-state-display-begin render)))
     (when line
@@ -290,6 +300,7 @@ state are reconciled independently so metadata-only updates are visible."
   "Convert a vector of chomp-cells to a propertized string.
 Handles double-width characters by inserting invisible spacers."
   (or (chomp-render--cells-to-string-fast cells width)
+      (chomp-render--cells-to-string-uniform cells width)
       (chomp-render--cells-to-string-general cells width)))
 
 (defun chomp-render--cells-to-string-fast (cells width)
@@ -321,6 +332,26 @@ lists; falls back only when a styled cell is present."
             (cl-incf pos)
             (cl-incf i)))))
       s)))
+
+(defun chomp-render--cells-to-string-uniform (cells width)
+  "Fast path for single-width rows with one shared/equal attribute."
+  (let ((attr (chomp-cell-attr (aref cells 0)))
+        (i 0))
+    (when attr
+      (while (and (< i width)
+                  (let ((cell (aref cells i)))
+                    (and (= (chomp-cell-width cell) 1)
+                         (or (eq (chomp-cell-attr cell) attr)
+                             (equal (chomp-cell-attr cell) attr)))))
+        (cl-incf i))
+      (when (= i width)
+        (let ((s (make-string width ?\s))
+              (face (chomp-render--attr-to-face attr)))
+          (dotimes (j width)
+            (aset s j (chomp-cell-char (aref cells j))))
+          (when face
+            (put-text-property 0 width 'face face s))
+          s)))))
 
 (defun chomp-render--cells-to-string-general (cells width)
   "General propertized conversion for CELLS."
