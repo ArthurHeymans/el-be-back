@@ -42,6 +42,7 @@
 (cl-defstruct (chomp-line (:copier nil))
   "A single line in the terminal."
   (cells nil)       ; vector of chomp-cell
+  (text nil)        ; plain single-width/default-attr cache string, or nil
   (wrapped nil)     ; auto-wrapped from previous line?
   (dirty t))
 
@@ -53,6 +54,7 @@
   (current-attr nil)
   (scroll-top 0) (scroll-bottom 23)
   (scrollback nil)
+  (scrollback-length 0)
   (auto-wrap t)
   (origin-mode nil)
   (insert-mode nil))
@@ -82,6 +84,7 @@
   (alt-screen nil)      ; chomp-alt-save when in alt mode, nil when main
   ;; Scrollback (main only)
   (scrollback nil)      ; list of chomp-line, newest first
+  (scrollback-length 0) ; cached length of scrollback
   (scrollback-max 10000) ; max lines
   (scrollback-dirty nil) ; non-nil when renderer must fully reconcile it
   ;; Title / CWD
@@ -148,7 +151,9 @@
 
 (defun chomp--make-empty-line (width)
   "Return a new empty chomp-line of WIDTH cells."
-  (make-chomp-line :cells (chomp--make-empty-cells width) :dirty t))
+  (make-chomp-line :cells (chomp--make-empty-cells width)
+                   :text (make-string width ?\s)
+                   :dirty t))
 
 (defun chomp--default-tab-stops (width)
   "Return default tab stop list (every 8 columns) for WIDTH."
@@ -194,6 +199,8 @@ and where COL is a continuation cell (width = 0)."
            (cells (chomp-line-cells line))
            (cell (aref cells col))
            (w (chomp-cell-width cell)))
+      (unless (= w 1)
+        (setf (chomp-line-text line) nil))
       (cond
        ;; This is a wide char start: clear it and its continuation cells
        ((> w 1)
@@ -280,7 +287,8 @@ Top lines go to scrollback (if on main screen)."
                (zerop top))
       (dotimes (i n)
         (push (aref lines (+ top i))
-              (chomp-screen-scrollback screen))))
+              (chomp-screen-scrollback screen))
+        (cl-incf (chomp-screen-scrollback-length screen))))
     ;; Shift remaining lines up
     (cl-loop for i from top to (- bot n)
              do (aset lines i (aref lines (+ i n))))
@@ -314,10 +322,14 @@ Bottom lines are discarded."
 (defun chomp--trim-scrollback (screen)
   "Trim scrollback to max lines."
   (let ((max (chomp-screen-scrollback-max screen))
-        (sb (chomp-screen-scrollback screen)))
-    (when (> (length sb) max)
-      (setf (chomp-screen-scrollback screen)
-            (cl-subseq sb 0 max))
+        (len (chomp-screen-scrollback-length screen)))
+    (when (> len max)
+      ;; Keep the newest MAX entries (the list is newest first) without
+      ;; rebuilding the whole list on every scroll after the limit.
+      (let ((tail (nthcdr (1- max) (chomp-screen-scrollback screen))))
+        (when tail
+          (setcdr tail nil)))
+      (setf (chomp-screen-scrollback-length screen) max)
       (setf (chomp-screen-scrollback-dirty screen) t))))
 
 ;;;; ---- Character Writing ----------------------------------------------
@@ -363,6 +375,9 @@ Handles double-width (CJK) characters by occupying two cells."
             (setf (chomp-cell-char cell) translated)
             (setf (chomp-cell-width cell) 1)
             (setf (chomp-cell-attr cell) attr)
+            (if (and (null attr) (chomp-line-text line))
+                (aset (chomp-line-text line) cx translated)
+              (setf (chomp-line-text line) nil))
             (setf (chomp-line-dirty line) t)
             (chomp--mark-dirty screen cy)
             (setf (chomp-screen-last-char screen) translated)
@@ -377,6 +392,7 @@ Handles double-width (CJK) characters by occupying two cells."
         ;; General path: wide chars, insert mode, or overwriting existing wide
         ;; cells.
         (progn
+          (setf (chomp-line-text line) nil)
           ;; Double-width char at last column: fill with space and wrap
           (when (and (> char-w 1) (>= cx (1- scrn-width)))
             ;; Fill last column with space
@@ -465,17 +481,23 @@ for wide/non-ASCII/insert-mode cases."
                (cells (chomp-line-cells line))
                (attr-template (chomp-screen-current-attr screen))
                (default-attr (not (chomp--attr-non-default-p attr-template)))
+               (line-text (and default-attr (chomp-line-text line)))
                (limit (min end (+ i (- width cx))))
                (start-i i))
+          (unless default-attr
+            (setf (chomp-line-text line) nil))
           ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
           (while (and (< i limit)
                       (< (aref string i) 128)
                       (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
             (let* ((cell (aref cells (+ cx (- i start-i))))
+                   (col (+ cx (- i start-i)))
                    (attr (unless default-attr (chomp-attr-copy attr-template))))
               (setf (chomp-cell-char cell) (aref string i))
               (setf (chomp-cell-width cell) 1)
-              (setf (chomp-cell-attr cell) attr))
+              (setf (chomp-cell-attr cell) attr)
+              (when line-text
+                (aset line-text col (aref string i))))
             (cl-incf i))
           (if (= i start-i)
               ;; Could not use the fast row writer for this byte.
@@ -622,6 +644,7 @@ Handles LF, VT, FF."
                 do (chomp--erase-whole-line screen r)))
       (3 ;; Erase scrollback
        (setf (chomp-screen-scrollback screen) nil)
+       (setf (chomp-screen-scrollback-length screen) 0)
        (setf (chomp-screen-scrollback-dirty screen) t)))))
 
 (defun chomp-screen-erase-in-line (screen mode)
@@ -635,13 +658,24 @@ Handles LF, VT, FF."
     (pcase mode
       (0 ;; cursor to end
        (cl-loop for i from cx below width
-                do (aset cells i (copy-chomp-cell ecell))))
+                do (aset cells i (copy-chomp-cell ecell)))
+       (if (and (null (chomp-cell-attr ecell)) (chomp-line-text line))
+           (cl-loop for i from cx below width
+                    do (aset (chomp-line-text line) i ?\s))
+         (setf (chomp-line-text line) nil)))
       (1 ;; start to cursor
        (cl-loop for i from 0 to cx
-                do (aset cells i (copy-chomp-cell ecell))))
+                do (aset cells i (copy-chomp-cell ecell)))
+       (if (and (null (chomp-cell-attr ecell)) (chomp-line-text line))
+           (cl-loop for i from 0 to cx
+                    do (aset (chomp-line-text line) i ?\s))
+         (setf (chomp-line-text line) nil)))
       (2 ;; whole line
        (cl-loop for i from 0 below width
-                do (aset cells i (copy-chomp-cell ecell)))))
+                do (aset cells i (copy-chomp-cell ecell)))
+       (if (null (chomp-cell-attr ecell))
+           (setf (chomp-line-text line) (make-string width ?\s))
+         (setf (chomp-line-text line) nil))))
     (setf (chomp-line-dirty line) t)
     (chomp--mark-dirty screen cy)))
 
@@ -653,6 +687,9 @@ Handles LF, VT, FF."
          (ecell (chomp--make-erase-cell screen)))
     (cl-loop for i from 0 below width
              do (aset cells i (copy-chomp-cell ecell)))
+    (if (null (chomp-cell-attr ecell))
+        (setf (chomp-line-text line) (make-string width ?\s))
+      (setf (chomp-line-text line) nil))
     (setf (chomp-line-wrapped line) nil)
     (setf (chomp-line-dirty line) t)
     (chomp--mark-dirty screen row)))
@@ -668,6 +705,10 @@ Handles LF, VT, FF."
          (end (min (+ cx count) width)))
     (cl-loop for i from cx below end
              do (aset cells i (copy-chomp-cell ecell)))
+    (if (and (null (chomp-cell-attr ecell)) (chomp-line-text line))
+        (cl-loop for i from cx below end
+                 do (aset (chomp-line-text line) i ?\s))
+      (setf (chomp-line-text line) nil))
     (setf (chomp-line-dirty line) t)
     (chomp--mark-dirty screen cy)))
 
@@ -732,6 +773,7 @@ Handles LF, VT, FF."
          (line (aref (chomp-screen-lines screen) cy))
          (cells (chomp-line-cells line))
          (n (min count (- width cx))))
+    (setf (chomp-line-text line) nil)
     ;; Shift right
     (cl-loop for i from (1- width) downto (+ cx n)
              do (aset cells i (aref cells (- i n))))
@@ -749,6 +791,7 @@ Handles LF, VT, FF."
          (line (aref (chomp-screen-lines screen) cy))
          (cells (chomp-line-cells line))
          (n (min count (- width cx))))
+    (setf (chomp-line-text line) nil)
     ;; Shift left
     (cl-loop for i from cx below (- width n)
              do (aset cells i (aref cells (+ i n))))
@@ -833,6 +876,7 @@ Handles LF, VT, FF."
            :scroll-top (chomp-screen-scroll-top screen)
            :scroll-bottom (chomp-screen-scroll-bottom screen)
            :scrollback (chomp-screen-scrollback screen)
+           :scrollback-length (chomp-screen-scrollback-length screen)
            :auto-wrap (chomp-screen-auto-wrap screen)
            :origin-mode (chomp-screen-origin-mode screen)
            :insert-mode (chomp-screen-insert-mode screen)))
@@ -848,6 +892,7 @@ Handles LF, VT, FF."
       (setf (chomp-screen-scroll-top screen) 0)
       (setf (chomp-screen-scroll-bottom screen) (1- h))
       (setf (chomp-screen-scrollback screen) nil)
+      (setf (chomp-screen-scrollback-length screen) 0)
       (setf (chomp-screen-scrollback-dirty screen) t)
       (setf (chomp-screen-dirty-lines screen)
             (number-sequence 0 (1- h))))))
@@ -865,6 +910,8 @@ Handles LF, VT, FF."
     (setf (chomp-screen-scroll-top screen) (chomp-alt-save-scroll-top saved))
     (setf (chomp-screen-scroll-bottom screen) (chomp-alt-save-scroll-bottom saved))
     (setf (chomp-screen-scrollback screen) (chomp-alt-save-scrollback saved))
+    (setf (chomp-screen-scrollback-length screen)
+          (chomp-alt-save-scrollback-length saved))
     (setf (chomp-screen-scrollback-dirty screen) t)
     (setf (chomp-screen-auto-wrap screen) (chomp-alt-save-auto-wrap saved))
     (setf (chomp-screen-origin-mode screen) (chomp-alt-save-origin-mode saved))
@@ -1116,6 +1163,7 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
     (setf (chomp-screen-charset-active screen) 'g0)
     ;; Reset scrollback
     (setf (chomp-screen-scrollback screen) nil)
+    (setf (chomp-screen-scrollback-length screen) 0)
     (setf (chomp-screen-scrollback-dirty screen) t)
     ;; Reset tab stops
     (setf (chomp-screen-tab-stops screen)

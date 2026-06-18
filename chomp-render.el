@@ -173,7 +173,7 @@ state are reconciled independently so metadata-only updates are visible."
   "Reconcile rendered scrollback with the screen model."
   (let* ((screen (chomp-render-state-screen render))
          (sb (chomp-screen-scrollback screen))
-         (model-count (length sb))
+         (model-count (chomp-screen-scrollback-length screen))
          (rendered-count (chomp-render-state-scrollback-count render))
          (new-count (- model-count rendered-count)))
     (cond
@@ -209,10 +209,15 @@ state are reconciled independently so metadata-only updates are visible."
 (defun chomp-render--lines-to-string (lines width)
   "Return LINES as one string with trailing newlines."
   (mapconcat (lambda (line)
-               (concat (chomp-render--cells-to-string
-                        (chomp-line-cells line) width)
-                       "\n"))
+               (concat (chomp-render--line-to-string line width) "\n"))
              lines ""))
+
+(defun chomp-render--line-to-string (line width)
+  "Convert LINE to a string of WIDTH terminal columns."
+  (or (and (chomp-line-text line)
+           (= (length (chomp-line-text line)) width)
+           (chomp-line-text line))
+      (chomp-render--cells-to-string (chomp-line-cells line) width)))
 
 ;;;; ---- Display Line Rendering -----------------------------------------
 
@@ -229,7 +234,7 @@ state are reconciled independently so metadata-only updates are visible."
         (let ((bol (point))
               (eol (line-end-position)))
           (delete-region bol eol)
-          (insert (chomp-render--cells-to-string (chomp-line-cells line) width)))))))
+          (insert (chomp-render--line-to-string line width)))))))
 
 ;;;; ---- Cell-to-String Conversion --------------------------------------
 
@@ -452,9 +457,7 @@ Used after resize when the display area size has changed."
           (erase-buffer)
           ;; Re-render scrollback
           (let ((sb-lines (chomp-screen-scrollback-lines screen)))
-            (dolist (line sb-lines)
-              (insert (chomp-render--cells-to-string (chomp-line-cells line) w)
-                      "\n"))
+            (insert (chomp-render--lines-to-string sb-lines w))
             (setf (chomp-render-state-scrollback-count render) (length sb-lines)))
           ;; Place display-begin marker
           (let ((m (chomp-render-state-display-begin render)))
@@ -466,7 +469,7 @@ Used after resize when the display area size has changed."
           (dotimes (i h)
             (let ((line (chomp-screen-get-line screen i)))
               (insert (if line
-                          (chomp-render--cells-to-string (chomp-line-cells line) w)
+                          (chomp-render--line-to-string line w)
                         (make-string w ?\s)))
               (when (< i (1- h))
                 (insert "\n"))))
