@@ -620,9 +620,8 @@ for wide/non-ASCII/insert-mode cases."
            ;; ASCII.  Mixed Unicode lines would otherwise pay to materialize the
            ;; lazy prefix before every wide/non-ASCII character.
            ((and default-attr line-text (= ascii-end limit))
-            (while (< i limit)
-              (aset line-text (+ cx (- i start-i)) (aref string i))
-              (cl-incf i))
+            (store-substring line-text cx (substring string i limit))
+            (setq i limit)
             (setf (chomp-line-uniform-attr line) nil)
             (setf (chomp-line-cells-valid line) nil))
            ((and (not default-attr)
@@ -630,9 +629,8 @@ for wide/non-ASCII/insert-mode cases."
                  (= ascii-end limit)
                  (zerop cx)
                  (= (- limit start-i) width))
-            (while (< i limit)
-              (aset line-text (- i start-i) (aref string i))
-              (cl-incf i))
+            (store-substring line-text 0 (substring string i limit))
+            (setq i limit)
             (setf (chomp-line-uniform-attr line) attr-template)
             (setf (chomp-line-cells-valid line) nil))
            (t
