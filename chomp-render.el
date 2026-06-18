@@ -55,6 +55,15 @@
 (defvar chomp-render--color-faces (make-vector 256 nil)
   "Vector of face symbols for palette indices 0-255.")
 
+(defvar chomp-render--indexed-color-cache (make-vector 256 nil)
+  "Cached face-resolved color strings for indexed palette entries.")
+
+(defvar chomp-render--attr-face-cache (make-hash-table :test #'equal)
+  "Cache from immutable `chomp-attr' values to rendered face plists.")
+
+(defconst chomp-render--attr-face-cache-limit 4096
+  "Maximum number of cached attribute face specs before clearing the cache.")
+
 (dotimes (i 256)
   (let* ((sym (intern (format "chomp-color-%d" i)))
          (hex (chomp-render--256color-hex i)))
@@ -90,9 +99,12 @@ allowing theme/user customization."
             (chomp--clamp (caddr color) 0 255)))
    ((and (integerp color) (<= 0 color 255))
     ;; Use the named face's foreground for customizability
-    (let ((face-sym (aref chomp-render--color-faces color)))
-      (or (face-foreground face-sym nil t)
-          (chomp-render--256color-hex color))))
+    (or (aref chomp-render--indexed-color-cache color)
+        (let* ((face-sym (aref chomp-render--color-faces color))
+               (value (or (face-foreground face-sym nil t)
+                          (chomp-render--256color-hex color))))
+          (aset chomp-render--indexed-color-cache color value)
+          value)))
    (t nil)))
 
 ;;;; ---- Faces ----------------------------------------------------------
@@ -454,10 +466,11 @@ lists; falls back only when a styled cell is present."
 (defun chomp-render--attr-to-face (attr)
   "Convert chomp-attr ATTR to an Emacs face spec (plist or list)."
   (when (and attr (chomp--attr-non-default-p attr))
-    (let ((face nil)
-          (fg (chomp-attr-fg attr))
-          (bg (chomp-attr-bg attr))
-          (inv (chomp-attr-inverse attr)))
+    (or (gethash attr chomp-render--attr-face-cache)
+        (let ((face nil)
+              (fg (chomp-attr-fg attr))
+              (bg (chomp-attr-bg attr))
+              (inv (chomp-attr-inverse attr)))
       ;; Handle inverse: swap fg/bg, using actual Emacs default colors
       ;; when fg or bg is nil (matches eat's behavior)
       (when inv
@@ -514,8 +527,13 @@ lists; falls back only when a styled cell is present."
       (when (chomp-attr-conceal attr)
         (let ((bg-str (or (plist-get face :background) "black")))
           (setq face (plist-put face :foreground bg-str))))
-      ;; Return as anonymous face (a plist)
-      face)))
+          ;; Return as anonymous face (a plist), caching because styled terminal
+          ;; output tends to reuse a small set of attributes across many cells.
+          (when (> (hash-table-count chomp-render--attr-face-cache)
+                   chomp-render--attr-face-cache-limit)
+            (clrhash chomp-render--attr-face-cache))
+          (puthash attr face chomp-render--attr-face-cache)
+          face))))
 
 ;;;; ---- Cursor Rendering -----------------------------------------------
 
