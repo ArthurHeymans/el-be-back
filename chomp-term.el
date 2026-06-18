@@ -42,6 +42,7 @@
 (cl-defstruct (chomp-line (:copier nil))
   "A single line in the terminal."
   (cells nil)       ; vector of chomp-cell
+  (cells-valid t)   ; nil when CELLS must be materialized from TEXT
   (text nil)        ; plain single-width/default-attr cache string, or nil
   (rendered nil)    ; cached rendered/propertized string for non-plain lines
   (wrapped nil)     ; auto-wrapped from previous line?
@@ -171,6 +172,25 @@
   "Return logical ROW from SCREEN."
   (aref (chomp-screen-lines screen) (chomp--line-index screen row)))
 
+(defun chomp--line-ensure-cells (line width)
+  "Ensure LINE's cell vector reflects its plain text cache."
+  (unless (chomp-line-cells-valid line)
+    (let ((text (or (chomp-line-text line) (make-string width ?\s)))
+          (cells (chomp-line-cells line)))
+      (unless (and cells (= (length cells) width))
+        (setq cells (chomp--make-empty-cells width))
+        (setf (chomp-line-cells line) cells))
+      (let ((i 0))
+        (while (< i width)
+          (let ((cell (aref cells i)))
+            (setf (chomp-cell-char cell)
+                  (if (< i (length text)) (aref text i) ?\s))
+            (setf (chomp-cell-width cell) 1)
+            (setf (chomp-cell-attr cell) nil))
+          (cl-incf i)))
+      (setf (chomp-line-cells-valid line) t)))
+  (chomp-line-cells line))
+
 (defsubst chomp--set-line-at (screen row line)
   "Set logical ROW on SCREEN to LINE."
   (aset (chomp-screen-lines screen) (chomp--line-index screen row) line))
@@ -224,7 +244,7 @@ This handles both the case where COL is the start of a wide char (width > 1)
 and where COL is a continuation cell (width = 0)."
   (when (and (>= col 0) (< col (chomp-screen-width screen)))
     (let* ((line (chomp--line-at screen row))
-           (cells (chomp-line-cells line))
+           (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
            (cell (aref cells col))
            (w (chomp-cell-width cell)))
       (unless (= w 1)
@@ -442,7 +462,7 @@ Handles double-width (CJK) characters by occupying two cells."
            (cy (chomp-screen-cursor-y screen))
            (translated (chomp--translate-charset screen char))
            (line (chomp--line-at screen cy))
-           (cells (chomp-line-cells line))
+           (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
            (attr (chomp--cell-attr-for-write screen))
            (cell (aref cells cx)))
 
@@ -491,7 +511,7 @@ Handles double-width (CJK) characters by occupying two cells."
                   (setq cx 0)
                   (setq cy (chomp-screen-cursor-y screen))
                   (setq line (chomp--line-at screen cy))
-                  (setq cells (chomp-line-cells line)))
+                  (setq cells (chomp--line-ensure-cells line (chomp-screen-width screen))))
               ;; No auto-wrap: just stay at last column
               (setq cx (1- scrn-width))))
 
@@ -558,44 +578,57 @@ for wide/non-ASCII/insert-mode cases."
         (let* ((cx (chomp-screen-cursor-x screen))
                (cy (chomp-screen-cursor-y screen))
                (line (chomp--line-at screen cy))
-               (cells (chomp-line-cells line))
                (attr-template (chomp-screen-current-attr screen))
                (default-attr (not (chomp--attr-non-default-p attr-template)))
                (line-text (and default-attr (chomp-line-text line)))
                (limit (min end (+ i (- width cx))))
-               (start-i i))
-          (unless default-attr
-            (setf (chomp-line-text line) nil))
-          ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
-          ;; Split the default-attribute path to avoid per-byte attr checks and
-          ;; copies for ordinary command output.
-          (if default-attr
-              (while (and (< i limit)
-                          (< (aref string i) 128)
-                          (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
-                (let* ((col (+ cx (- i start-i)))
-                       (cell (aref cells col))
-                       (ch (aref string i)))
-                  (setf (chomp-cell-char cell) ch)
-                  (setf (chomp-cell-width cell) 1)
-                  (setf (chomp-cell-attr cell) nil)
-                  (when line-text
-                    (aset line-text col ch)))
-                (cl-incf i))
-            (while (and (< i limit)
-                        (< (aref string i) 128)
-                        (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
-              (let* ((cell (aref cells (+ cx (- i start-i))))
-                     (ch (aref string i)))
-                (setf (chomp-cell-char cell) ch)
-                (setf (chomp-cell-width cell) 1)
-                (setf (chomp-cell-attr cell) (chomp-attr-copy attr-template)))
-              (cl-incf i)))
+               (start-i i)
+               (ascii-only
+                (and line-text
+                     (let ((j i))
+                       (while (and (< j limit) (< (aref string j) 128))
+                         (cl-incf j))
+                       (= j limit)))))
+          (cond
+           ;; Text-first hot path: use it only when this row segment is entirely
+           ;; ASCII.  Mixed Unicode lines would otherwise pay to materialize the
+           ;; lazy prefix before every wide/non-ASCII character.
+           (ascii-only
+            (while (< i limit)
+              (aset line-text (+ cx (- i start-i)) (aref string i))
+              (cl-incf i))
+            (setf (chomp-line-cells-valid line) nil))
+           (t
+            (let ((cells (chomp--line-ensure-cells line width)))
+              (unless default-attr
+                (setf (chomp-line-text line) nil))
+              ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
+              (if default-attr
+                  (while (and (< i limit)
+                              (< (aref string i) 128)
+                              (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
+                    (let* ((col (+ cx (- i start-i)))
+                           (cell (aref cells col))
+                           (ch (aref string i)))
+                      (setf (chomp-cell-char cell) ch)
+                      (setf (chomp-cell-width cell) 1)
+                      (setf (chomp-cell-attr cell) nil))
+                    (cl-incf i))
+                (while (and (< i limit)
+                            (< (aref string i) 128)
+                            (= (chomp-cell-width (aref cells (+ cx (- i start-i)))) 1))
+                  (let* ((cell (aref cells (+ cx (- i start-i))))
+                         (ch (aref string i)))
+                    (setf (chomp-cell-char cell) ch)
+                    (setf (chomp-cell-width cell) 1)
+                    (setf (chomp-cell-attr cell) (chomp-attr-copy attr-template)))
+                  (cl-incf i))))))
           (if (= i start-i)
               ;; Could not use the fast row writer for this byte.
               (progn
                 (chomp-screen-write-char screen (aref string i))
                 (cl-incf i))
+            (setf (chomp-line-rendered line) nil)
             (setf (chomp-line-dirty line) t)
             (chomp--mark-dirty screen cy)
             (setf (chomp-screen-last-char screen) (aref string (1- i)))
@@ -745,7 +778,7 @@ Handles LF, VT, FF."
          (cy (chomp-screen-cursor-y screen))
          (width (chomp-screen-width screen))
          (line (chomp--line-at screen cy))
-         (cells (chomp-line-cells line))
+         (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
          (ecell (chomp--make-erase-cell screen)))
     (pcase mode
       (0 ;; cursor to end
@@ -775,7 +808,7 @@ Handles LF, VT, FF."
   "Erase entire line ROW with BCE."
   (let* ((width (chomp-screen-width screen))
          (line (chomp--line-at screen row))
-         (cells (chomp-line-cells line))
+         (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
          (ecell (chomp--make-erase-cell screen)))
     (cl-loop for i from 0 below width
              do (aset cells i (copy-chomp-cell ecell)))
@@ -792,7 +825,7 @@ Handles LF, VT, FF."
          (cy (chomp-screen-cursor-y screen))
          (width (chomp-screen-width screen))
          (line (chomp--line-at screen cy))
-         (cells (chomp-line-cells line))
+         (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
          (ecell (chomp--make-erase-cell screen))
          (end (min (+ cx count) width)))
     (cl-loop for i from cx below end
@@ -859,7 +892,7 @@ Handles LF, VT, FF."
          (cy (chomp-screen-cursor-y screen))
          (width (chomp-screen-width screen))
          (line (chomp--line-at screen cy))
-         (cells (chomp-line-cells line))
+         (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
          (n (min count (- width cx))))
     (setf (chomp-line-text line) nil)
     ;; Shift right
@@ -877,7 +910,7 @@ Handles LF, VT, FF."
          (cy (chomp-screen-cursor-y screen))
          (width (chomp-screen-width screen))
          (line (chomp--line-at screen cy))
-         (cells (chomp-line-cells line))
+         (cells (chomp--line-ensure-cells line (chomp-screen-width screen)))
          (n (min count (- width cx))))
     (setf (chomp-line-text line) nil)
     ;; Shift left
@@ -1121,7 +1154,7 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
           (setf (chomp-screen-tab-stops screen)
                 (chomp--default-tab-stops new-width)))))))
 
-(defun chomp--unwrap-lines (lines _old-width)
+(defun chomp--unwrap-lines (lines old-width)
   "Merge wrapped physical lines into logical lines.
 Returns list of (CELLS . TRAILING-WRAP-P)."
   (let ((result nil)
@@ -1129,7 +1162,8 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
     (dotimes (i (length lines))
       (let ((line (aref lines i)))
         (setq current-cells
-              (vconcat (or current-cells []) (chomp-line-cells line)))
+              (vconcat (or current-cells [])
+                       (chomp--line-ensure-cells line old-width)))
         (unless (chomp-line-wrapped line)
           ;; A non-wrapped line's right-padding is presentation, not logical
           ;; content.  Keeping it would make resize/reflow invent large runs of
@@ -1304,11 +1338,16 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
 (defun chomp-screen-get-line (screen row)
   "Return the chomp-line at ROW."
   (when (and (>= row 0) (< row (chomp-screen-height screen)))
-    (chomp--line-at screen row)))
+    (let ((line (chomp--line-at screen row)))
+      (chomp--line-ensure-cells line (chomp-screen-width screen))
+      line)))
 
 (defun chomp-screen-scrollback-lines (screen)
   "Return scrollback lines, oldest first."
-  (reverse (chomp-screen-scrollback screen)))
+  (let ((lines (reverse (chomp-screen-scrollback screen))))
+    (dolist (line lines)
+      (chomp--line-ensure-cells line (chomp-screen-width screen)))
+    lines))
 
 ;;;; ---- Cell copying helper (used by erase) ----------------------------
 
