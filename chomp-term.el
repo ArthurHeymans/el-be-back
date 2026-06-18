@@ -44,6 +44,7 @@
   (cells nil)       ; vector of chomp-cell
   (cells-valid t)   ; nil when CELLS must be materialized from TEXT
   (text nil)        ; single-width text cache string, or nil
+  (attr-runs nil)   ; list of (START END ATTR) for styled TEXT ranges
   (uniform-attr nil) ; non-nil when TEXT has one shared non-default attr
   (rendered nil)    ; cached rendered/propertized string for non-plain lines
   (wrapped nil)     ; auto-wrapped from previous line?
@@ -193,8 +194,58 @@ from allocating a full vector of cell structs for every blank bottom row."
             (setf (chomp-cell-width cell) 1)
             (setf (chomp-cell-attr cell) (chomp-line-uniform-attr line)))
           (cl-incf i)))
+      (dolist (run (chomp-line-attr-runs line))
+        (let ((i (nth 0 run))
+              (end (min width (nth 1 run)))
+              (attr (nth 2 run)))
+          (while (< i end)
+            (setf (chomp-cell-attr (aref cells i)) attr)
+            (cl-incf i))))
       (setf (chomp-line-cells-valid line) t)))
   (chomp-line-cells line))
+
+(defun chomp--line-set-attr-run (line start end attr)
+  "Set LINE's attribute over [START, END) to ATTR in its text run cache."
+  (when (< start end)
+    (let ((runs (chomp-line-attr-runs line))
+          (out nil)
+          (inserted nil))
+      (dolist (run runs)
+        (let ((rs (nth 0 run))
+              (re (nth 1 run))
+              (ra (nth 2 run)))
+          (cond
+           ((<= re start)
+            (push run out))
+           ((>= rs end)
+            (unless inserted
+              (when attr (push (list start end attr) out))
+              (setq inserted t))
+            (push run out))
+           (t
+            (when (< rs start)
+              (push (list rs start ra) out))
+            (unless inserted
+              (when attr (push (list start end attr) out))
+              (setq inserted t))
+            (when (> re end)
+              (push (list end re ra) out))))))
+      (unless inserted
+        (when attr (push (list start end attr) out)))
+      (setf (chomp-line-attr-runs line)
+            (chomp--merge-attr-runs (nreverse out))))))
+
+(defun chomp--merge-attr-runs (runs)
+  "Merge adjacent equal attribute RUNS."
+  (let ((merged nil))
+    (dolist (run runs)
+      (let ((prev (car merged)))
+        (if (and prev
+                 (= (nth 1 prev) (nth 0 run))
+                 (equal (nth 2 prev) (nth 2 run)))
+            (setcar (cdr prev) (nth 1 run))
+          (push run merged))))
+    (nreverse merged)))
 
 (defsubst chomp--set-line-at (screen row line)
   "Set logical ROW on SCREEN to LINE."
@@ -487,11 +538,13 @@ Handles double-width (CJK) characters by occupying two cells."
             (setf (chomp-cell-attr cell) attr)
             (let ((uniform (chomp-line-uniform-attr line)))
               (if (and (chomp-line-text line)
+                       (null (chomp-line-attr-runs line))
                        (or (and (null attr) (null uniform))
                            (and attr uniform
                                 (or (eq attr uniform) (equal attr uniform)))))
                   (aset (chomp-line-text line) cx translated)
                 (setf (chomp-line-text line) nil)
+                (setf (chomp-line-attr-runs line) nil)
                 (setf (chomp-line-uniform-attr line) nil)))
             (setf (chomp-line-dirty line) t)
             (chomp--mark-dirty screen cy)
@@ -508,6 +561,7 @@ Handles double-width (CJK) characters by occupying two cells."
         ;; cells.
         (progn
           (setf (chomp-line-text line) nil)
+          (setf (chomp-line-attr-runs line) nil)
         (setf (chomp-line-uniform-attr line) nil)
           ;; Double-width char at last column: fill with space and wrap
           (when (and (> char-w 1) (>= cx (1- scrn-width)))
@@ -621,22 +675,22 @@ for wide/non-ASCII/insert-mode cases."
            ;; lazy prefix before every wide/non-ASCII character.
            ((and default-attr line-text (= ascii-end limit))
             (store-substring line-text cx (substring string i limit))
+            (when (chomp-line-attr-runs line)
+              (chomp--line-set-attr-run line cx (+ cx (- limit start-i)) nil))
             (setq i limit)
             (setf (chomp-line-uniform-attr line) nil)
             (setf (chomp-line-cells-valid line) nil))
-           ((and (not default-attr)
-                 line-text
-                 (= ascii-end limit)
-                 (zerop cx)
-                 (= (- limit start-i) width))
-            (store-substring line-text 0 (substring string i limit))
+           ((and (not default-attr) line-text (= ascii-end limit))
+            (store-substring line-text cx (substring string i limit))
+            (chomp--line-set-attr-run line cx (+ cx (- limit start-i)) attr-template)
             (setq i limit)
-            (setf (chomp-line-uniform-attr line) attr-template)
+            (setf (chomp-line-uniform-attr line) nil)
             (setf (chomp-line-cells-valid line) nil))
            (t
             (let ((cells (chomp--line-ensure-cells line width)))
               (unless default-attr
                 (setf (chomp-line-text line) nil)
+                (setf (chomp-line-attr-runs line) nil)
         (setf (chomp-line-uniform-attr line) nil))
               ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
               (if default-attr

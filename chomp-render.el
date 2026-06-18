@@ -262,6 +262,11 @@ compactly."
   "Convert LINE for scrollback rendering."
   (cond
    ((and (chomp-line-text line)
+         (chomp-line-attr-runs line)
+         (= (length (chomp-line-text line)) width))
+    (setf (chomp-line-dirty line) nil)
+    (chomp-render--text-runs-to-string line width))
+   ((and (chomp-line-text line)
          (= (length (chomp-line-text line)) width))
     (setf (chomp-line-dirty line) nil)
     (if-let ((attr (chomp-line-uniform-attr line)))
@@ -301,6 +306,13 @@ compactly."
   "Convert LINE to a string of WIDTH terminal columns."
   (cond
    ((and (chomp-line-text line)
+         (chomp-line-attr-runs line)
+         (= (length (chomp-line-text line)) width))
+    (let ((s (chomp-render--text-runs-to-string line width)))
+      (setf (chomp-line-rendered line) s)
+      (setf (chomp-line-dirty line) nil)
+      s))
+   ((and (chomp-line-text line)
          (chomp-line-uniform-attr line)
          (= (length (chomp-line-text line)) width))
     (let ((s (copy-sequence (chomp-line-text line)))
@@ -323,6 +335,15 @@ compactly."
       (setf (chomp-line-rendered line) s)
       (setf (chomp-line-dirty line) nil)
       s))))
+
+(defun chomp-render--text-runs-to-string (line width)
+  "Render LINE's text plus attribute runs into a propertized string."
+  (let ((s (copy-sequence (chomp-line-text line))))
+    (dolist (run (chomp-line-attr-runs line))
+      (let ((face (chomp-render--attr-to-face (nth 2 run))))
+        (when face
+          (put-text-property (nth 0 run) (min width (nth 1 run)) 'face face s))))
+    s))
 
 ;;;; ---- Display Line Rendering -----------------------------------------
 
