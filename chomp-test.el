@@ -691,6 +691,20 @@ Binds `screen' and `parser' in BODY."
       (should (car responses))
       (should (string-match-p "rgb:" (car responses))))))
 
+(ert-deftest chomp-test-osc-4-palette-query ()
+  "OSC 4 palette queries return xterm rgb replies."
+  (chomp-test-with-screen (:width 20 :height 6)
+    (let ((responses nil))
+      (setf (chomp-parser-write-fn parser)
+            (lambda (s) (push s responses)))
+      (chomp-test-output parser "\e]4;1;?\a")
+      (should (equal "\e]4;1;rgb:cdcd/0000/0000\e\\" (car responses)))
+      (setq responses nil)
+      (chomp-test-output parser "\e]4;0;?;15;?\a")
+      (should (= 2 (length responses)))
+      (should (member "\e]4;0;rgb:0000/0000/0000\e\\" responses))
+      (should (member "\e]4;15;rgb:ffff/ffff/ffff\e\\" responses)))))
+
 (ert-deftest chomp-test-input-backspace-variants ()
   "Input translation handles backspace modifier variants."
   (let ((screen (chomp-screen-create 80 24)))

@@ -56,13 +56,46 @@
 
 (defun chomp-parse--color-to-xterm (color-str)
   "Convert an Emacs color string to xterm rgb:RRRR/GGGG/BBBB format."
-  (if color-str
-      (let ((rgb (color-values color-str)))
-        (if rgb
-            (format "rgb:%04x/%04x/%04x"
-                    (nth 0 rgb) (nth 1 rgb) (nth 2 rgb))
-          "rgb:ffff/ffff/ffff"))
-    "rgb:ffff/ffff/ffff"))
+  (cond
+   ((not color-str)
+    "rgb:ffff/ffff/ffff")
+   ;; Avoid display-color approximation for exact palette replies.
+   ((string-match "\\`#\\([[:xdigit:]][[:xdigit:]]\\)\\([[:xdigit:]][[:xdigit:]]\\)\\([[:xdigit:]][[:xdigit:]]\\)\\'" color-str)
+    (format "rgb:%s%s/%s%s/%s%s"
+            (match-string 1 color-str) (match-string 1 color-str)
+            (match-string 2 color-str) (match-string 2 color-str)
+            (match-string 3 color-str) (match-string 3 color-str)))
+   (t
+    (let ((rgb (color-values color-str)))
+      (if rgb
+          (format "rgb:%04x/%04x/%04x"
+                  (nth 0 rgb) (nth 1 rgb) (nth 2 rgb))
+        "rgb:ffff/ffff/ffff")))))
+
+(defun chomp-parse--256color-hex (n)
+  "Return the default xterm 256-color palette entry N as #RRGGBB."
+  (cond
+   ((< n 16)
+    (aref ["#000000" "#cd0000" "#00cd00" "#cdcd00"
+           "#0000ee" "#cd00cd" "#00cdcd" "#e5e5e5"
+           "#7f7f7f" "#ff0000" "#00ff00" "#ffff00"
+           "#5c5cff" "#ff00ff" "#00ffff" "#ffffff"]
+          n))
+   ((< n 232)
+    (let* ((idx (- n 16))
+           (b-idx (% idx 6))
+           (g-idx (% (/ idx 6) 6))
+           (r-idx (/ idx 36))
+           (vals [0 95 135 175 215 255]))
+      (format "#%02x%02x%02x"
+              (aref vals r-idx) (aref vals g-idx) (aref vals b-idx))))
+   (t
+    (let ((v (chomp--clamp (+ 8 (* 10 (- n 232))) 0 255)))
+      (format "#%02x%02x%02x" v v v)))))
+
+(defun chomp-parse--palette-color-to-xterm (n)
+  "Return palette index N as an xterm rgb:RRRR/GGGG/BBBB string."
+  (chomp-parse--color-to-xterm (chomp-parse--256color-hex n)))
 
 (defun chomp-parse--emit (parser type &rest args)
   "Emit an event TYPE with ARGS via the parser callback."
@@ -1104,7 +1137,27 @@ Pm=1: read, Pm=4: read maximum."
              (t nil)))
           (cl-incf i))))))
 
-;;;; ---- OSC 52 Clipboard -----------------------------------------------
+;;;; ---- OSC Helpers ----------------------------------------------------
+
+(defun chomp-parse--handle-osc-4 (parser payload)
+  "Handle OSC 4 color palette queries in PAYLOAD.
+Supports xterm-style query pairs such as 4;2;? and 4;0;?;1;?.
+Palette-setting requests are ignored."
+  (let ((parts (vconcat (split-string payload ";"))))
+    (cl-loop for i from 0 below (length parts) by 2
+             for index-str = (aref parts i)
+             for spec = (and (< (1+ i) (length parts))
+                             (aref parts (1+ i)))
+             when (and spec
+                       (string-match-p "\\`[0-9]+\\'" index-str)
+                       (string= spec "?"))
+             do (let ((index (string-to-number index-str)))
+                  (when (<= 0 index 255)
+                    (chomp-parse--respond
+                     parser
+                     (format "\e]4;%d;%s\e\\"
+                             index
+                             (chomp-parse--palette-color-to-xterm index))))))))
 
 (defun chomp-parse--handle-osc-52 (parser payload)
   "Handle OSC 52 clipboard manipulation.
@@ -1159,6 +1212,9 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
                               payload)))
                    (setf (chomp-screen-cwd screen) cwd)
                    (chomp-parse--emit parser 'cwd cwd)))
+                ;; Query palette entries
+                (4
+                 (chomp-parse--handle-osc-4 parser payload))
                 ;; Query foreground
                 (10
                  (when (string= payload "?")
