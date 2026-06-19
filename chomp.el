@@ -81,6 +81,8 @@ Options: `char', `semi-char', `emacs'."
 (defvar-local chomp--parser nil "The chomp-parser for this buffer.")
 (defvar-local chomp--render nil "The chomp-render-state for this buffer.")
 (defvar-local chomp--input-mode nil "Current input mode symbol.")
+(defvar-local chomp--mouse-drag-transient-map-exit nil
+  "Function that exits the active mouse drag transient map.")
 
 (defvar chomp--focus-change-installed nil
   "Non-nil when `chomp--focus-change' is installed globally.")
@@ -96,6 +98,11 @@ Options: `char', `semi-char', `emacs'."
   "Minor mode for char input."
   :lighter " Char"
   :keymap chomp-char-mode-map)
+
+(define-minor-mode chomp--mouse-mode
+  "Minor mode for forwarding DEC mouse events to the terminal."
+  :lighter nil
+  :keymap chomp-mouse-mode-map)
 
 ;;;; ---- Input Mode Switching -------------------------------------------
 
@@ -188,6 +195,38 @@ If bracketed paste mode is active, wraps in bracketed paste sequences."
               (chomp-io-send chomp--io (chomp-input-bracketed-paste-end)))
           (chomp-io-send chomp--io text))))))
 
+(defun chomp-mouse-input (event)
+  "Send mouse EVENT to the terminal when DEC mouse tracking is active."
+  (interactive "e")
+  (when-let ((win (posn-window (event-start event))))
+    (when (windowp win)
+      (select-window win)))
+  (when (and chomp--io chomp--screen chomp--render
+             (chomp-screen-mouse-mode chomp--screen))
+    (when (and (memq 'down (event-modifiers event))
+               (not chomp--mouse-drag-transient-map-exit))
+      (let ((old-track-mouse track-mouse)
+            (buffer (current-buffer)))
+        (setq track-mouse 'dragging)
+        (setq chomp--mouse-drag-transient-map-exit
+              (set-transient-map
+               chomp-mouse-mode-map
+               #'always
+               (lambda ()
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (setq track-mouse old-track-mouse)
+                     (setq chomp--mouse-drag-transient-map-exit nil))))))))
+    (when-let ((seq (chomp-input-encode-mouse
+                     event chomp--screen
+                     (marker-position
+                      (chomp-render-state-display-begin chomp--render)))))
+      (chomp-io-send chomp--io seq))
+    (when (and chomp--mouse-drag-transient-map-exit
+               (chomp-input--mouse-release-p event))
+      (funcall chomp--mouse-drag-transient-map-exit)
+      (setq chomp--mouse-drag-transient-map-exit nil))))
+
 ;;;; ---- Process Management Commands ------------------------------------
 
 (defun chomp-kill-process ()
@@ -241,8 +280,12 @@ If bracketed paste mode is active, wraps in bracketed paste sequences."
        ;; Handle modes that need buffer-level action
        (pcase mode
          ((or 1000 1002 1003)
-          ;; Mouse tracking -- could enable mouse events here
-          nil)
+          (chomp--mouse-mode (if (chomp-screen-mouse-mode chomp--screen) 1 -1))
+          (unless (chomp-screen-mouse-mode chomp--screen)
+            (setf (chomp-screen-mouse-pressed chomp--screen) nil)
+            (when chomp--mouse-drag-transient-map-exit
+              (funcall chomp--mouse-drag-transient-map-exit)
+              (setq chomp--mouse-drag-transient-map-exit nil))))
          (1004
           ;; Focus events -- could enable focus tracking here
           nil)

@@ -81,7 +81,7 @@
   (auto-wrap t) (insert-mode nil) (origin-mode nil)
   (keypad-mode nil) (bracketed-paste nil)
   ;; Mouse
-  (mouse-mode nil) (mouse-sgr nil) (focus-events nil)
+  (mouse-mode nil) (mouse-sgr nil) (mouse-pressed nil) (focus-events nil)
   ;; Character sets
   (charset-g0 'us-ascii) (charset-g1 'us-ascii)
   (charset-g2 'us-ascii) (charset-g3 'us-ascii)

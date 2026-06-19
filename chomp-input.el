@@ -18,6 +18,7 @@
 (declare-function chomp-quoted-input "chomp")
 (declare-function chomp-yank "chomp")
 (declare-function chomp-yank-pop "chomp")
+(declare-function chomp-mouse-input "chomp")
 (declare-function chomp-char-mode "chomp")
 (declare-function chomp-semi-char-mode "chomp")
 (declare-function chomp-emacs-mode "chomp")
@@ -205,25 +206,26 @@ SCREEN is consulted for mode flags.  Returns a string or nil."
 
 ;;;; ---- Mouse Encoding -------------------------------------------------
 
-(defun chomp-input-encode-mouse (event screen _pos-offset)
+(defun chomp-input-encode-mouse (event screen pos-offset)
   "Encode mouse EVENT as terminal escape sequence.
 POS-OFFSET is the buffer position of display line 0, col 0.
 Returns a string or nil."
   (when-let ((mouse-mode (chomp-screen-mouse-mode screen)))
-    (let* ((posn (event-start event))
-           (coords (posn-col-row posn))
-           (x (car coords))
-           (y (cdr coords))
-           (event-type (car event))
-           (button (chomp-input--mouse-button event-type))
-           (mod-bits (chomp-input--mouse-mod-bits event)))
-      (when button
-        (let ((code (+ button mod-bits)))
+    (when (chomp-input--mouse-event-allowed-p event mouse-mode screen)
+      (when-let* ((coords (chomp-input--mouse-coordinates event screen pos-offset))
+                  (x (car coords))
+                  (y (cdr coords))
+                  (button (chomp-input--mouse-button event screen)))
+        (when (chomp-input--mouse-press-p event)
+          (chomp-input--mouse-remember-press event screen button))
+        (let ((code (+ button (chomp-input--mouse-mod-bits event))))
+          (when (chomp-input--mouse-release-p event)
+            (chomp-input--mouse-forget-press event screen))
           (if (chomp-screen-mouse-sgr screen)
               ;; SGR encoding
               (format "\e[<%d;%d;%d%c"
                       code (1+ x) (1+ y)
-                      (if (chomp-input--mouse-release-p event-type) ?m ?M))
+                      (if (chomp-input--mouse-release-p event) ?m ?M))
             ;; Legacy encoding (coordinates limited to 223)
             (when (and (<= x 222) (<= y 222))
               (format "\e[M%c%c%c"
@@ -231,26 +233,97 @@ Returns a string or nil."
                       (+ x 33)
                       (+ y 33)))))))))
 
-(defun chomp-input--mouse-button (event-type)
-  "Return button code for EVENT-TYPE, or nil."
-  (pcase event-type
-    ((or 'mouse-1 'down-mouse-1) 0)
-    ((or 'mouse-2 'down-mouse-2) 1)
-    ((or 'mouse-3 'down-mouse-3) 2)
-    ((or 'mouse-4 'down-mouse-4 'wheel-up) 64)
-    ((or 'mouse-5 'down-mouse-5 'wheel-down) 65)
-    ((or 'mouse-6 'down-mouse-6 'wheel-left) 66)
-    ((or 'mouse-7 'down-mouse-7 'wheel-right) 67)
-    ((or 'mouse-8 'down-mouse-8) 128)
-    ((or 'mouse-9 'down-mouse-9) 129)
-    ((or 'mouse-10 'down-mouse-10) 130)
-    ((or 'mouse-11 'down-mouse-11) 131)
-    ('mouse-movement 35)
-    (_ nil)))
+(defun chomp-input--mouse-posn (event)
+  "Return the position object for mouse EVENT."
+  (or (and (memq 'drag (event-modifiers event))
+           (ignore-errors (event-end event)))
+      (event-start event)))
 
-(defun chomp-input--mouse-release-p (event-type)
-  "Return non-nil if EVENT-TYPE is a release event."
-  (memq event-type '(mouse-1 mouse-2 mouse-3 mouse-8 mouse-9 mouse-10 mouse-11)))
+(defun chomp-input--mouse-coordinates (event screen pos-offset)
+  "Return zero-based terminal coordinates for mouse EVENT on SCREEN."
+  (let* ((posn (chomp-input--mouse-posn event))
+         (pt (posn-point posn))
+         coords)
+    (setq coords
+          (cond
+           ((and pos-offset (integer-or-marker-p pt))
+            (save-excursion
+              (goto-char pt)
+              (let ((row (- (line-number-at-pos pt)
+                            (line-number-at-pos pos-offset)))
+                    (col (current-column)))
+                (cons col row))))
+           (t
+            (posn-col-row posn))))
+    (when (and coords
+               (<= 0 (car coords))
+               (< (car coords) (chomp-screen-width screen))
+               (<= 0 (cdr coords))
+               (< (cdr coords) (chomp-screen-height screen)))
+      coords)))
+
+(defun chomp-input--mouse-event-allowed-p (event mode screen)
+  "Return non-nil if EVENT should be reported in DEC mouse MODE."
+  (let ((mods (event-modifiers event))
+        (basic (event-basic-type event)))
+    (pcase mode
+      ('x10
+       (and (memq 'down mods) (memq basic '(mouse-1 mouse-2 mouse-3))))
+      ('normal
+       (not (or (mouse-movement-p event) (memq 'drag mods))))
+      ('button-event
+       (or (not (mouse-movement-p event))
+           (chomp-screen-mouse-pressed screen)))
+      ('any-event t)
+      (_ nil))))
+
+(defun chomp-input--mouse-button (event screen)
+  "Return xterm mouse button code for EVENT on SCREEN, or nil."
+  (let ((basic (event-basic-type event)))
+    (cond
+     ((mouse-movement-p event)
+      (if-let ((pressed (car (chomp-screen-mouse-pressed screen))))
+          (+ pressed 32)
+        35))
+     ((eq basic 'mouse-1) 0)
+     ((eq basic 'mouse-2) 1)
+     ((eq basic 'mouse-3) 2)
+     ((memq basic '(mouse-4 wheel-up)) 64)
+     ((memq basic '(mouse-5 wheel-down)) 65)
+     ((memq basic '(mouse-6 wheel-left)) 66)
+     ((memq basic '(mouse-7 wheel-right)) 67)
+     ((eq basic 'mouse-8) 128)
+     ((eq basic 'mouse-9) 129)
+     ((eq basic 'mouse-10) 130)
+     ((eq basic 'mouse-11) 131)
+     (t nil))))
+
+(defun chomp-input--mouse-press-p (event)
+  "Return non-nil if EVENT is a button press."
+  (memq 'down (event-modifiers event)))
+
+(defun chomp-input--mouse-release-p (event)
+  "Return non-nil if EVENT is a button release."
+  (let ((basic (event-basic-type event))
+        (mods (event-modifiers event)))
+    (and (memq basic '(mouse-1 mouse-2 mouse-3))
+         (or (memq 'click mods) (memq 'drag mods)))))
+
+(defun chomp-input--mouse-remember-press (event screen button)
+  "Remember pressed mouse BUTTON from EVENT on SCREEN."
+  (when (and (memq (event-basic-type event) '(mouse-1 mouse-2 mouse-3))
+             (< button 3))
+    (setf (chomp-screen-mouse-pressed screen)
+          (sort (cons button (chomp-screen-mouse-pressed screen)) #'<))))
+
+(defun chomp-input--mouse-forget-press (event screen)
+  "Forget the released button from EVENT on SCREEN."
+  (let ((button (pcase (event-basic-type event)
+                  ('mouse-1 0) ('mouse-2 1) ('mouse-3 2))))
+    (when button
+      (setf (chomp-screen-mouse-pressed screen)
+            (cl-delete-if (lambda (b) (= b button))
+                          (chomp-screen-mouse-pressed screen))))))
 
 (defun chomp-input--mouse-mod-bits (event)
   "Return modifier bits for mouse EVENT."
@@ -378,6 +451,41 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
         (cl-loop for i from 1 to 63
                  do (bind (vector (intern (format "f%d" i)))))))
     map))
+
+;;;; ---- Mouse Keymap ---------------------------------------------------
+
+(defconst chomp-input--mouse-mod-prefixes
+  '("" "C-" "M-" "S-" "C-M-" "C-S-" "M-S-" "C-M-S-")
+  "Modifier prefixes used for mouse event symbols.")
+
+(defun chomp-input--mouse-event-symbols ()
+  "Return mouse event symbols that Chomp should pass through to TUIs."
+  (let (events)
+    (dolist (prefix chomp-input--mouse-mod-prefixes)
+      (dotimes (i 11)
+        (push (intern (format "%smouse-%d" prefix (1+ i))) events))
+      (dotimes (i 3)
+        (push (intern (format "%sdown-mouse-%d" prefix (1+ i))) events)
+        (push (intern (format "%sdrag-mouse-%d" prefix (1+ i))) events))
+      (dolist (wheel '(wheel-up wheel-down wheel-left wheel-right))
+        (push (intern (concat prefix (symbol-name wheel))) events)))
+    (push 'mouse-movement events)
+    events))
+
+(defun chomp--prepare-mouse-mode-map ()
+  "Build the transient DEC mouse tracking keymap."
+  (let ((map (make-sparse-keymap)))
+    (dolist (key (chomp-input--mouse-event-symbols))
+      (define-key map (vector key) #'chomp-mouse-input))
+    ;; Mouse events can arrive through window decoration prefixes while dragging.
+    (dolist (prefix '(mode-line header-line tab-line vertical-line
+                      right-divider bottom-divider))
+      (define-key map (vector prefix) map))
+    map))
+
+(defvar chomp-mouse-mode-map
+  (ignore-errors (chomp--prepare-mouse-mode-map))
+  "Keymap active while a child program has enabled DEC mouse tracking.")
 
 ;;;; ---- Semi-Char Keymap -----------------------------------------------
 

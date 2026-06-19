@@ -728,10 +728,62 @@ Binds `screen' and `parser' in BODY."
     (should (string-match-p "stty .* rows 24 columns 80 sane" (nth 3 cmd)))
     (should (equal '(".." "/bin/sh") (nthcdr 4 cmd)))))
 
+(defun chomp-test--mouse-event (type point)
+  "Return a synthetic mouse event of TYPE at buffer POINT."
+  (list type (list nil point '(0 . 0) 0 nil point '(0 . 0) nil)))
+
 (ert-deftest chomp-test-mouse-wheel-left-right ()
   "Mouse wheel-left/right produce correct button codes."
-  (should (= 66 (chomp-input--mouse-button 'wheel-left)))
-  (should (= 67 (chomp-input--mouse-button 'wheel-right))))
+  (let ((screen (chomp-screen-create 80 24)))
+    (should (= 66 (chomp-input--mouse-button
+                   (chomp-test--mouse-event 'wheel-left 1) screen)))
+    (should (= 67 (chomp-input--mouse-button
+                   (chomp-test--mouse-event 'wheel-right 1) screen)))))
+
+(ert-deftest chomp-test-mouse-keymap-bindings ()
+  "DEC mouse keymap forwards press, release, drag, and movement events."
+  (should (eq (lookup-key chomp-mouse-mode-map [down-mouse-1])
+              #'chomp-mouse-input))
+  (should (eq (lookup-key chomp-mouse-mode-map [drag-mouse-1])
+              #'chomp-mouse-input))
+  (should (eq (lookup-key chomp-mouse-mode-map [mouse-1])
+              #'chomp-mouse-input))
+  (should (eq (lookup-key chomp-mouse-mode-map [mouse-movement])
+              #'chomp-mouse-input)))
+
+(ert-deftest chomp-test-mouse-sgr-encoding ()
+  "Mouse events encode as SGR mouse reports relative to display-begin."
+  (let ((screen (chomp-screen-create 10 3)))
+    (setf (chomp-screen-mouse-mode screen) 'button-event)
+    (setf (chomp-screen-mouse-sgr screen) t)
+    (with-temp-buffer
+      (insert "scrollback\nabcdefghij\nklmnopqrst\nuvwxyz    \n")
+      (let ((display-begin (save-excursion
+                             (goto-char (point-min))
+                             (forward-line 1)
+                             (point))))
+        ;; Button 1 press at display row 0, column 1.
+        (should (equal "\e[<0;2;1M"
+                       (chomp-input-encode-mouse
+                        (chomp-test--mouse-event 'down-mouse-1
+                                                 (1+ display-begin))
+                        screen display-begin)))
+        ;; Movement while button 1 is pressed reports button+32.
+        (should (equal "\e[<32;3;1M"
+                       (chomp-input-encode-mouse
+                        (chomp-test--mouse-event 'mouse-movement
+                                                 (+ display-begin 2))
+                        screen display-begin)))
+        ;; Release clears the pressed-button state.
+        (should (equal "\e[<0;2;1m"
+                       (chomp-input-encode-mouse
+                        (chomp-test--mouse-event 'mouse-1 (1+ display-begin))
+                        screen display-begin)))
+        (should-not (chomp-screen-mouse-pressed screen))
+        ;; Clicks in scrollback above the display are not sent to TUIs.
+        (should-not (chomp-input-encode-mouse
+                     (chomp-test--mouse-event 'down-mouse-1 (point-min))
+                     screen display-begin))))))
 
 (ert-deftest chomp-test-render-cursor-type-mapping ()
   "Cursor style maps to correct Emacs cursor-type."
