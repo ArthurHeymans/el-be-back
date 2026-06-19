@@ -195,6 +195,17 @@ If bracketed paste mode is active, wraps in bracketed paste sequences."
               (chomp-io-send chomp--io (chomp-input-bracketed-paste-end)))
           (chomp-io-send chomp--io text))))))
 
+(defun chomp-send-password (&optional password)
+  "Read PASSWORD from the minibuffer and send it to the terminal.
+Interactively, this uses `read-passwd' so password keystrokes do not go through
+normal terminal input handling or appear in `view-lossage'."
+  (interactive)
+  (unless chomp--io
+    (user-error "Process not running"))
+  (let ((password (or password (read-passwd "Password: "))))
+    (chomp-io-send chomp--io password)
+    (chomp-io-send chomp--io "\r")))
+
 (defun chomp-mouse-input (event)
   "Send mouse EVENT to the terminal when DEC mouse tracking is active."
   (interactive "e")

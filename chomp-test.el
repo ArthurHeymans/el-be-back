@@ -12,6 +12,7 @@
 (require 'chomp-render)
 (require 'chomp-io)
 (require 'chomp-input)
+(require 'chomp)
 
 ;;;; ---- Test Helpers ---------------------------------------------------
 
@@ -733,6 +734,16 @@ Binds `screen' and `parser' in BODY."
   "deletechar key translates to ESC[3~."
   (let ((screen (chomp-screen-create 80 24)))
     (should (equal "\e[3~" (chomp-input-translate 'deletechar screen)))))
+
+(ert-deftest chomp-test-send-password ()
+  "Password command sends the password followed by return."
+  (let (sent)
+    (with-temp-buffer
+      (setq-local chomp--io 'fake)
+      (cl-letf (((symbol-function 'chomp-io-send)
+                 (lambda (_io s) (push s sent))))
+        (chomp-send-password "secret")))
+    (should (equal '("\r" "secret") sent))))
 
 (ert-deftest chomp-test-io-command-sets-stty-sane ()
   "PTY command wrapper initializes terminal settings like Eat."
