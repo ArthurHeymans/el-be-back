@@ -843,6 +843,54 @@ Binds `screen' and `parser' in BODY."
               (forward-line 1)
               (should (= after (+ (point) 2))))))))))
 
+(ert-deftest chomp-test-render-emacs-mode-preserves-view ()
+  "Emacs input mode preserves the reading view while the cursor advances."
+  (let* ((screen (chomp-screen-create 20 40))
+         (parser (chomp-parse-create screen))
+         (buffer (generate-new-buffer " *chomp-test-view*")))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (let ((render (chomp-render-create screen buffer)))
+            (setq-local chomp--input-mode 'emacs)
+            (goto-char (point-min))
+            (forward-line 10)
+            (forward-char 3)
+            (set-mark (save-excursion (forward-line 2) (point)))
+            (setq mark-active t)
+            (set-window-start (selected-window)
+                              (save-excursion
+                                (goto-char (point-min))
+                                (forward-line 5)
+                                (point)) t)
+            (let ((saved-point (point))
+                  (saved-mark (mark))
+                  (saved-start (window-start))
+                  (old-cursor (overlay-start
+                               (chomp-render-state-cursor-overlay render))))
+              (chomp-test-output parser "\e[21;3H")
+              (chomp-render-refresh render)
+              (should (/= old-cursor
+                          (overlay-start
+                           (chomp-render-state-cursor-overlay render))))
+              (should (= saved-point (point)))
+              (should (= saved-mark (mark)))
+              (should mark-active)
+              (should (= saved-start (window-start)))
+              (chomp-render-full-reset render)
+              (should (= saved-point (point)))
+              (should (= saved-mark (mark)))
+              (should mark-active)
+              (should (= saved-start (window-start))))
+            (setq-local chomp--input-mode 'semi-char)
+            (chomp-test-output parser "\e[26;4H")
+            (chomp-render-refresh render)
+            (should (= (point)
+                       (overlay-start
+                        (chomp-render-state-cursor-overlay render))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest chomp-test-render-scrollback-clear-reconciles-buffer ()
   "ED 3 clears both model scrollback and rendered scrollback."
   (let* ((screen (chomp-screen-create 3 2))

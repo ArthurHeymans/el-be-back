@@ -604,8 +604,9 @@ lists; falls back only when a styled cell is present."
         (if (chomp-render--cursor-blink-p style)
             (blink-cursor-mode 1)
           (blink-cursor-mode -1))
-        ;; Move point to cursor position for scrolling
-        (goto-char (overlay-start ov))))))
+        ;; Keep point on the terminal cursor except while the user is reading.
+        (unless (eq (bound-and-true-p chomp--input-mode) 'emacs)
+          (goto-char (overlay-start ov)))))))
 
 ;;;; ---- Invalidation ---------------------------------------------------
 
@@ -627,10 +628,21 @@ Used after resize when the display area size has changed."
          (h (chomp-screen-height screen)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (let ((inhibit-read-only t)
-              (inhibit-modification-hooks t)
-              (buffer-undo-list t))
-          (erase-buffer)
+        (let* ((preserve-view
+                (eq (bound-and-true-p chomp--input-mode) 'emacs))
+               (saved-point (and preserve-view (point)))
+               (saved-mark (and preserve-view (mark t)))
+               (saved-mark-active (and preserve-view mark-active))
+               (saved-window
+                (and preserve-view
+                     (eq (window-buffer (selected-window)) buffer)
+                     (selected-window)))
+               (saved-window-start
+                (and saved-window (window-start saved-window))))
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t)
+                (buffer-undo-list t))
+            (erase-buffer)
           ;; Re-render scrollback
           (let ((sb-lines (chomp-screen-scrollback-lines screen)))
             (insert (chomp-render--lines-to-string sb-lines w))
@@ -659,9 +671,18 @@ Used after resize when the display area size has changed."
               (move-overlay ov (point-min) (1+ (point-min)))))
           ;; Update cursor
           (chomp-render--update-cursor render)
-          ;; Clear dirty since we just rendered everything
-          (chomp-screen-clear-dirty screen)
-          (chomp-screen-clear-scrollback-dirty screen))))))
+            ;; Clear dirty since we just rendered everything
+            (chomp-screen-clear-dirty screen)
+            (chomp-screen-clear-scrollback-dirty screen))
+          (when preserve-view
+            (goto-char (min saved-point (point-max)))
+            (if saved-mark
+                (set-marker (mark-marker) (min saved-mark (point-max)))
+              (set-marker (mark-marker) nil))
+            (setq mark-active saved-mark-active)
+            (when (window-live-p saved-window)
+              (set-window-start saved-window
+                                (min saved-window-start (point-max)) t))))))))
 
 ;;;; ---- Cleanup --------------------------------------------------------
 
