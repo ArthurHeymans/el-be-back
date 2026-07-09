@@ -159,6 +159,17 @@ that persists across renders."
 
 ;;;; ---- OSC 51 Dispatch (called during parsing) ------------------------
 
+(defun chomp-shell--mark-prompt (screen kind)
+  "Record a prompt marker of KIND at SCREEN's cursor."
+  (let* ((row (chomp-screen-cursor-y screen))
+         (column (chomp-screen-cursor-x screen))
+         (line (chomp--line-at screen row)))
+    (pcase kind
+      ('begin (cl-pushnew column (chomp-line-prompt-begins line)))
+      ('end (cl-pushnew column (chomp-line-prompt-ends line))))
+    (setf (chomp-line-dirty line) t)
+    (chomp--mark-dirty screen row)))
+
 (defun chomp-shell-handle-osc51 (payload screen)
   "Handle an OSC 51 shell integration sequence with PAYLOAD.
 SCREEN is the chomp-screen model (for cursor position).
@@ -173,14 +184,20 @@ post-render processing."
       (pcase cmd
         ;; CWD: immediate (no buffer position needed)
         (?A (chomp-shell--set-cwd args))
-        ;; Prompt boundaries are metadata used by navigation even when visual
-        ;; annotations are disabled.
-        (?B (setq chomp-shell--prompt-start-line
-                  (chomp-shell--absolute-line screen))
-            (push '(prompt-start) chomp-shell--pending-events))
-        (?C (push (cons 'prompt-end
-                        (chomp-shell--absolute-line screen))
-                  chomp-shell--pending-events))
+        ;; Prompt boundaries live on screen lines so rendering, scrolling, and
+        ;; batched OSC events cannot lose them.
+        (?B (chomp-shell--mark-prompt screen 'begin)
+            (when chomp-enable-shell-prompt-annotation
+              (push (list 'prompt-start
+                          (chomp-shell--absolute-line screen)
+                          (chomp-screen-cursor-x screen))
+                    chomp-shell--pending-events)))
+        (?C (chomp-shell--mark-prompt screen 'end)
+            (when chomp-enable-shell-prompt-annotation
+              (push (list 'prompt-end
+                          (chomp-shell--absolute-line screen)
+                          (chomp-screen-cursor-x screen))
+                    chomp-shell--pending-events)))
         (?D nil)  ; continuation prompt start (unused)
         (?E nil)  ; continuation prompt end
         ;; Command text: immediate
@@ -239,20 +256,17 @@ after `chomp-render-refresh'."
       (dolist (event events)
         (pcase (car event)
           ('prompt-start
-           (chomp-shell--apply-prompt-start render))
+           (chomp-shell--apply-prompt-start render (nth 1 event) (nth 2 event)))
           ('prompt-end
-           (let ((abs-line (cdr event)))
-             (chomp-shell--apply-prompt-end render abs-line)))
+           (chomp-shell--apply-prompt-end render (nth 1 event) (nth 2 event)))
           ('pre-exec
            (chomp-shell--apply-pre-exec)))))
     ;; Schedule overlay correction only when prompt overlays are enabled.
     (when chomp-enable-shell-prompt-annotation
       (chomp-shell--schedule-overlay-correction))))
 
-(defun chomp-shell--line-to-buffer-pos (render abs-line)
-  "Convert absolute line number ABS-LINE to a buffer position.
-RENDER is the chomp-render-state.  Returns the position of the
-beginning of the line, or nil if out of buffer range."
+(defun chomp-shell--line-to-buffer-pos (render abs-line &optional column)
+  "Convert ABS-LINE and COLUMN to a buffer position in RENDER."
   (let* ((display-begin (chomp-render-state-display-begin render))
          (screen (chomp-render-state-screen render))
          (sb-count (length (chomp-screen-scrollback screen))))
@@ -268,24 +282,19 @@ beginning of the line, or nil if out of buffer range."
          (t
           (let ((display-row (- abs-line sb-count)))
             (goto-char (marker-position display-begin))
-            (forward-line display-row)
-            (point))))))))
+            (forward-line display-row))))
+        (move-to-column (or column 0))
+        (point)))))
 
-(defun chomp-shell--apply-prompt-start (render)
-  "Apply prompt-start annotation using the recorded line number.
-RENDER is the chomp-render-state."
-  (when chomp-shell--prompt-start-line
-    (when-let ((pos (chomp-shell--line-to-buffer-pos
-                     render chomp-shell--prompt-start-line)))
-      ;; Save a marker at the prompt start position
-      (let ((m (copy-marker pos)))
-        (set-marker-insertion-type m t)  ; advances with insertions
-        (setq chomp-shell--prompt-start-line m)))))
+(defun chomp-shell--apply-prompt-start (render abs-line column)
+  "Remember an annotation start at ABS-LINE and COLUMN in RENDER."
+  (when-let ((pos (chomp-shell--line-to-buffer-pos render abs-line column)))
+    (let ((m (copy-marker pos)))
+      (set-marker-insertion-type m t)
+      (setq chomp-shell--prompt-start-line m))))
 
-(defun chomp-shell--apply-prompt-end (render abs-line)
-  "Apply prompt-end annotation.
-RENDER is the chomp-render-state.  ABS-LINE is the absolute line
-of the prompt end."
+(defun chomp-shell--apply-prompt-end (render abs-line column)
+  "Apply a prompt annotation ending at ABS-LINE and COLUMN in RENDER."
   (let ((prompt-begin chomp-shell--prompt-start-line))
     (when (and prompt-begin (markerp prompt-begin)
                (marker-position prompt-begin))
@@ -294,31 +303,21 @@ of the prompt end."
         (setf (cadr chomp-shell--prompt-mark)
               (chomp-shell--status-indicator chomp-shell--command-status))
         (setq chomp-shell--prompt-mark nil))
-      ;; Get buffer position for prompt end
-      (when-let ((end-pos (chomp-shell--line-to-buffer-pos render abs-line)))
-        (let* ((beg (marker-position prompt-begin))
-               (end (save-excursion
-                      (goto-char end-pos)
-                      (line-end-position))))
+      (when-let ((end (chomp-shell--line-to-buffer-pos
+                       render abs-line column)))
+        (let ((beg (marker-position prompt-begin)))
           (when (< beg end)
-            ;; Set text properties for prompt navigation.
-            (put-text-property beg (min (1+ beg) end)
-                               'chomp-shell-prompt-begin t)
-            (put-text-property (max (1- end) beg) end
-                               'chomp-shell-prompt-end t)
-            (when chomp-enable-shell-prompt-annotation
-              (let* ((indicator (chomp-shell--running-indicator))
-                     (display-spec
-                      (list
-                       (list 'margin chomp-shell-prompt-annotation-position)
-                       indicator))
-                     (before-str (propertize " " 'display display-spec))
-                     (ov (make-overlay beg (min (1+ beg) end) nil t nil)))
-                (overlay-put ov 'before-string before-str)
-                (overlay-put ov 'chomp-shell-prompt t)
-                (push ov chomp-shell--prompt-overlays)
-                ;; Save display spec for in-place mutation later.
-                (setq chomp-shell--prompt-mark display-spec))))))))
+            (let* ((indicator (chomp-shell--running-indicator))
+                   (display-spec
+                    (list
+                     (list 'margin chomp-shell-prompt-annotation-position)
+                     indicator))
+                   (before-str (propertize " " 'display display-spec))
+                   (ov (make-overlay beg (min (1+ beg) end) nil t nil)))
+              (overlay-put ov 'before-string before-str)
+              (overlay-put ov 'chomp-shell-prompt t)
+              (push ov chomp-shell--prompt-overlays)
+              (setq chomp-shell--prompt-mark display-spec)))))))
   ;; Reset prompt-start-line for next cycle
   (setq chomp-shell--prompt-start-line nil))
 

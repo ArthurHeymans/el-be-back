@@ -47,6 +47,8 @@
   (attr-runs nil)   ; list of (START END ATTR) for styled TEXT ranges
   (uniform-attr nil) ; non-nil when TEXT has one shared non-default attr
   (rendered nil)    ; cached rendered/propertized string for non-plain lines
+  (prompt-begins nil) ; OSC shell prompt start columns
+  (prompt-ends nil)   ; OSC shell prompt end columns
   (wrapped nil)     ; auto-wrapped from previous line?
   (dirty t))
 
@@ -905,6 +907,8 @@ Handles LF, VT, FF."
       (2 ;; whole line
        (cl-loop for i from 0 below width
                 do (aset cells i (copy-chomp-cell ecell)))
+       (setf (chomp-line-prompt-begins line) nil)
+       (setf (chomp-line-prompt-ends line) nil)
        (if (null (chomp-cell-attr ecell))
            (progn
              (setf (chomp-line-text line) (make-string width ?\s))
@@ -928,6 +932,8 @@ Handles LF, VT, FF."
           (setf (chomp-line-uniform-attr line) nil))
       (setf (chomp-line-text line) nil)
       (setf (chomp-line-uniform-attr line) nil))
+    (setf (chomp-line-prompt-begins line) nil)
+    (setf (chomp-line-prompt-ends line) nil)
     (setf (chomp-line-wrapped line) nil)
     (setf (chomp-line-dirty line) t)
     (chomp--mark-dirty screen row)))

@@ -296,7 +296,10 @@ Unlike display rows, scrollback rows do not need invisible spacer characters for
 cursor column addressing, so default wide-character rows can be emitted more
 compactly."
   (mapconcat (lambda (line)
-               (concat (chomp-render--line-to-string-scrollback line width) "\n"))
+               (concat
+                (chomp-render--apply-line-metadata
+                 line (chomp-render--line-to-string-scrollback line width) width)
+                "\n"))
              lines ""))
 
 (defun chomp-render--line-to-string-scrollback (line width)
@@ -386,6 +389,23 @@ compactly."
           (put-text-property (nth 0 run) (min width (nth 1 run)) 'face face s))))
     s))
 
+(defun chomp-render--apply-line-metadata (line string width)
+  "Apply shell metadata from LINE to STRING of WIDTH columns."
+  (if (not (or (chomp-line-prompt-begins line)
+               (chomp-line-prompt-ends line)))
+      string
+    (let ((result (copy-sequence string)))
+      (dolist (column (chomp-line-prompt-begins line))
+        (when (< column width)
+          (put-text-property column (1+ column)
+                             'chomp-shell-prompt-begin t result)))
+      (dolist (column (chomp-line-prompt-ends line))
+        (let ((position (max 0 (1- column))))
+          (when (< position width)
+            (put-text-property position (1+ position)
+                               'chomp-shell-prompt-end t result))))
+      result)))
+
 ;;;; ---- Display Line Rendering -----------------------------------------
 
 (defun chomp-render--update-line (render row)
@@ -400,7 +420,8 @@ compactly."
         (forward-line row)
         (let* ((bol (point))
                (eol (line-end-position))
-               (new (chomp-render--line-to-string line width)))
+               (new (chomp-render--apply-line-metadata
+                     line (chomp-render--line-to-string line width) width)))
           ;; TUI programs often repaint rows with identical content.  Avoid a
           ;; buffer modification when the rendered text/properties are already
           ;; correct; cursor overlay movement is handled separately.
@@ -702,7 +723,8 @@ Used after resize when the display area size has changed."
           (dotimes (i h)
             (let ((line (chomp-screen-get-line screen i)))
               (insert (if line
-                          (chomp-render--line-to-string line w)
+                          (chomp-render--apply-line-metadata
+                           line (chomp-render--line-to-string line w) w)
                         (make-string w ?\s)))
               (when (< i (1- h))
                 (insert "\n"))))

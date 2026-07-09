@@ -256,13 +256,17 @@ normal terminal input handling or appear in `view-lossage'."
       (chomp-render-full-reset chomp--render))))
 
 (defun chomp-previous-prompt (&optional n)
-  "Move to the Nth previous shell prompt."
+  "Enter Emacs mode and move to the Nth previous shell prompt."
   (interactive "p")
+  (unless (eq chomp--input-mode 'emacs)
+    (chomp-emacs-mode))
   (chomp-shell-previous-prompt n))
 
 (defun chomp-next-prompt (&optional n)
-  "Move to the Nth next shell prompt."
+  "Enter Emacs mode and move to the Nth next shell prompt."
   (interactive "p")
+  (unless (eq chomp--input-mode 'emacs)
+    (chomp-emacs-mode))
   (chomp-shell-next-prompt n))
 
 ;;;; ---- Event Handler --------------------------------------------------
