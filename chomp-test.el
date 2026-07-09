@@ -1584,6 +1584,36 @@ Binds `screen' and `parser' in BODY."
                        (overlay-get ov 'chomp-shell-prompt))
                      (overlays-in (point-min) (point-max))))))))
 
+(ert-deftest chomp-test-shell-prompt-imenu ()
+  "Prompt metadata produces ordered command entries and navigable positions."
+  (let* ((screen (chomp-screen-create 30 5))
+         (parser (chomp-parse-create screen)))
+    (with-temp-buffer
+      (chomp-mode)
+      (should (eq #'chomp-shell-imenu-create-index
+                  imenu-create-index-function))
+      (should (eq #'chomp-shell-imenu-goto imenu-default-goto-function))
+      (let ((render (chomp-render-create screen (current-buffer))))
+        (dolist (prompt-command '(("$ " . "  echo one  ")
+                                  ("> " . "printf two")
+                                  ("# " . "")))
+          (chomp-shell-handle-osc51 "e;B" screen)
+          (chomp-test-output parser (car prompt-command))
+          (chomp-shell-handle-osc51 "e;C" screen)
+          (chomp-test-output parser (concat (cdr prompt-command) "\r\n")))
+        (chomp-render-refresh render)
+        (let ((index (chomp-shell-imenu-create-index)))
+          (should (equal '("echo one" "printf two") (mapcar #'car index)))
+          (setq-local chomp--input-mode 'semi-char)
+          (chomp-shell-imenu-goto (caar index) (cdar index))
+          (should (eq chomp--input-mode 'emacs))
+          (should (= (point) (marker-position (cdar index))))
+          (should (looking-at-p "  echo one")))
+        ;; Once model rows are erased/evicted, their properties yield no index.
+        (chomp-screen-erase-in-display screen 2)
+        (chomp-render-refresh render)
+        (should-not (chomp-shell-imenu-create-index))))))
+
 (ert-deftest chomp-test-shell-pending-events ()
   "OSC 51 B and C sequences queue pending events."
   (let ((screen (chomp-screen-create 20 6)))
