@@ -133,6 +133,64 @@ Options: `char', `semi-char', `emacs'."
 
 ;;;; ---- Self-Input Command ---------------------------------------------
 
+(defun chomp--require-running-terminal ()
+  "Return the current terminal I/O state or signal `user-error'."
+  (unless (eq major-mode 'chomp-mode)
+    (user-error "Not in a Chomp buffer"))
+  (let ((process (and chomp--io (chomp-io-process chomp--io))))
+    (unless (and process (process-live-p process))
+      (user-error "Process not running")))
+  chomp--io)
+
+;;;###autoload
+(defun chomp-send-string (string)
+  "Send STRING unchanged to the current terminal."
+  (interactive "sSend string: ")
+  (chomp-io-send (chomp--require-running-terminal) string))
+
+(defun chomp--key-event (key modifiers)
+  "Return an Emacs key event for KEY and comma-separated MODIFIERS."
+  (let* ((basic (cond ((characterp key) key)
+                      ((and (stringp key) (= (length key) 1)) (aref key 0))
+                      ((stringp key) (intern (downcase key)))
+                      ((symbolp key) key)
+                      (t (user-error "Invalid key: %S" key))))
+         (mods (mapcar
+                (lambda (name)
+                  (let ((modifier (intern (downcase (string-trim name)))))
+                    (cond ((eq modifier 'alt) 'meta)
+                          ((memq modifier '(control meta shift super hyper))
+                           modifier)
+                          (t (user-error "Unknown modifier: %s" name)))))
+                (if (or (null modifiers) (string-empty-p modifiers))
+                    nil
+                  (split-string modifiers "," t "[[:space:]]*")))))
+    (if mods (event-convert-list (append mods (list basic))) basic)))
+
+;;;###autoload
+(defun chomp-send-key (key &optional modifiers)
+  "Send named KEY with comma-separated MODIFIERS to the current terminal."
+  (interactive (list (read-string "Key: ")
+                     (read-string "Modifiers (comma-separated): ")))
+  (let* ((io (chomp--require-running-terminal))
+         (sequence (chomp-input-translate
+                    (chomp--key-event key modifiers) chomp--screen)))
+    (unless sequence
+      (user-error "Unsupported key: %s" key))
+    (chomp-io-send io sequence)))
+
+;;;###autoload
+(defun chomp-paste-string (string)
+  "Paste STRING, using bracketed paste when terminal mode 2004 is active."
+  (interactive "sPaste string: ")
+  (let ((io (chomp--require-running-terminal)))
+    (chomp-io-send
+     io
+     (if (and chomp--screen (chomp-screen-bracketed-paste chomp--screen))
+         (concat (chomp-input-bracketed-paste-start) string
+                 (chomp-input-bracketed-paste-end))
+       string))))
+
 (defun chomp-self-input (n &optional e)
   "Send the key event E to the terminal N times.
 N defaults to 1, E defaults to `last-command-event'."
@@ -174,27 +232,16 @@ If bracketed paste mode is active, wraps in bracketed paste sequences."
   (when chomp--io
     (let ((text (current-kill 0)))
       (when text
-        (if (and chomp--screen (chomp-screen-bracketed-paste chomp--screen))
-            (progn
-              (chomp-io-send chomp--io (chomp-input-bracketed-paste-start))
-              (chomp-io-send chomp--io text)
-              (chomp-io-send chomp--io (chomp-input-bracketed-paste-end)))
-          (chomp-io-send chomp--io text))))))
+        (chomp-paste-string text)))))
 
 (defun chomp-yank-pop ()
   "Yank-pop: replace the last yank with the next kill ring entry."
   (interactive)
   (when chomp--io
-    ;; Rotate kill ring
     (current-kill 1)
     (let ((text (current-kill 0)))
       (when text
-        (if (and chomp--screen (chomp-screen-bracketed-paste chomp--screen))
-            (progn
-              (chomp-io-send chomp--io (chomp-input-bracketed-paste-start))
-              (chomp-io-send chomp--io text)
-              (chomp-io-send chomp--io (chomp-input-bracketed-paste-end)))
-          (chomp-io-send chomp--io text))))))
+        (chomp-paste-string text)))))
 
 (defun chomp-send-password (&optional password)
   "Read PASSWORD from the minibuffer and send it to the terminal.

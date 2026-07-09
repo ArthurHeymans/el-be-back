@@ -806,6 +806,38 @@ Binds `screen' and `parser' in BODY."
         (chomp-send-password "secret")))
     (should (equal '("\r" "secret") sent))))
 
+(ert-deftest chomp-test-public-input-api ()
+  "Public input commands preserve strings and encode keys and paste mode."
+  (let (sent)
+    (with-temp-buffer
+      (setq major-mode 'chomp-mode)
+      (setq-local chomp--screen (chomp-screen-create 10 3))
+      (setq-local chomp--io (make-chomp-io :process 'fake))
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'chomp-io-send)
+                 (lambda (_io string) (push string sent))))
+        (chomp-send-string (string 0 255 ?x))
+        (chomp-send-key "up")
+        (chomp-send-key "up" "control, shift")
+        (chomp-paste-string "plain")
+        (setf (chomp-screen-bracketed-paste chomp--screen) t)
+        (chomp-paste-string "bracketed")))
+    (should (equal (list "\e[200~bracketed\e[201~" "plain"
+                         "\e[1;6A" "\e[A" (string 0 255 ?x))
+                   sent))))
+
+(ert-deftest chomp-test-public-input-api-requires-running-terminal ()
+  "Public input commands reject non-terminal and stopped terminal buffers."
+  (dolist (function '(chomp-send-string chomp-paste-string))
+    (with-temp-buffer
+      (should-error (funcall function "x") :type 'user-error)
+      (setq major-mode 'chomp-mode)
+      (should-error (funcall function "x") :type 'user-error)))
+  (with-temp-buffer
+    (should-error (chomp-send-key "up") :type 'user-error)
+    (setq major-mode 'chomp-mode)
+    (should-error (chomp-send-key "up") :type 'user-error)))
+
 (ert-deftest chomp-test-io-list-command-keeps-shell-integration ()
   "Shell argv from the program prompt retains startup integration."
   (let* ((dir (make-temp-file "chomp-integration-" t))
