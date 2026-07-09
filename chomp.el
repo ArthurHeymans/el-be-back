@@ -422,10 +422,14 @@ or `$SHELL'."
     (cond
      ;; C-u C-u: prompt for program
      ((equal current-prefix-arg '(16))
-      (read-shell-command "Run program: "
-                          (or chomp-default-shell
-                              (getenv "SHELL")
-                              shell-file-name)))
+      (let ((command
+             (read-shell-command "Run program: "
+                                 (or chomp-default-shell
+                                     (getenv "SHELL")
+                                     shell-file-name))))
+        (when (string-match-p "\\`[[:space:]]*\\'" command)
+          (user-error "Program cannot be empty"))
+        (split-string-shell-command command)))
      (t nil))))
   ;; With numeric prefix: switch to Nth chomp buffer
   (when (and (numberp current-prefix-arg) (not program))

@@ -952,6 +952,36 @@ Binds `screen' and `parser' in BODY."
       (when (buffer-live-p target-buffer)
         (kill-buffer target-buffer)))))
 
+(ert-deftest chomp-test-interactive-program-arguments ()
+  "Interactive program input is split into argv without changing API input."
+  (cl-labels
+      ((start (program interactive)
+         (let (buffer started)
+           (unwind-protect
+               (save-window-excursion
+                 (cl-letf (((symbol-function 'read-shell-command)
+                            (lambda (&rest _) program))
+                           ((symbol-function 'chomp-io-start)
+                            (lambda (_io command _buffer &optional _env)
+                              (setq started command))))
+                   (setq buffer
+                         (if interactive
+                             (let ((current-prefix-arg '(16)))
+                               (call-interactively #'chomp))
+                           (chomp program)))
+                   started))
+             (when (buffer-live-p buffer)
+               (kill-buffer buffer))))))
+    (should (equal '("htop" "-d" "2")
+                   (start "htop -d 2" t)))
+    (should (equal '("printf" "%s %s" "a" "b")
+                   (start "printf '%s %s' a b" t)))
+    (should-error (start "   " t) :type 'user-error)
+    (should (equal "/tmp/program with spaces"
+                   (start "/tmp/program with spaces" nil)))
+    (should (equal '("printf" "%s" "unchanged")
+                   (start '("printf" "%s" "unchanged") nil)))))
+
 ;;;; ---- Shell Integration Tests ----------------------------------------
 
 (require 'chomp-shell)
