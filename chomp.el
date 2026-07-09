@@ -310,6 +310,8 @@ normal terminal input handling or appear in `view-lossage'."
   (chomp-screen-erase-in-display chomp--screen 2)
   (when scrollback
     (chomp-screen-erase-in-display chomp--screen 3))
+  (chomp-shell-cleanup)
+  (chomp-shell-setup-margins)
   (when chomp--render
     (chomp-render-refresh chomp--render))
   (chomp-send-key "l" "control"))

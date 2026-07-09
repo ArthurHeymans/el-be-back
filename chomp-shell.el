@@ -444,8 +444,9 @@ N defaults to 1."
 ;;;; ---- Margin Setup ---------------------------------------------------
 
 (defun chomp-shell-setup-margins ()
-  "Set up buffer margins for prompt annotation display.
-Should be called during buffer initialization."
+  "Apply the configured prompt annotation margin to this buffer."
+  (setq left-margin-width nil
+        right-margin-width nil)
   (when chomp-enable-shell-prompt-annotation
     (let ((margin-width
            (max (string-width chomp-shell-prompt-annotation-running-indicator)
@@ -453,10 +454,10 @@ Should be called during buffer initialization."
                 (string-width chomp-shell-prompt-annotation-failure-indicator))))
       (pcase chomp-shell-prompt-annotation-position
         ('left-margin (setq left-margin-width margin-width))
-        ('right-margin (setq right-margin-width margin-width)))
-      ;; Force windows to pick up new margin settings
-      (dolist (win (get-buffer-window-list))
-        (set-window-buffer win (current-buffer))))))
+        ('right-margin (setq right-margin-width margin-width)))))
+  ;; Existing windows cache margin widths until their buffer is reset.
+  (dolist (win (get-buffer-window-list))
+    (set-window-buffer win (current-buffer))))
 
 ;;;; ---- Cleanup --------------------------------------------------------
 
