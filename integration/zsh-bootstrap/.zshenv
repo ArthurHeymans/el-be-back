@@ -1,10 +1,13 @@
 # Chomp zsh startup bootstrap.
-if [[ -n "$CHOMP_ZSH_ZDOTDIR" ]]; then
-  export ZDOTDIR="$CHOMP_ZSH_ZDOTDIR"
+if [[ "$CHOMP_ZSH_ZDOTDIR_SET" == 1 ]]; then
+  export CHOMP_ZSH_USER_ZDOTDIR="$CHOMP_ZSH_ZDOTDIR"
+  export CHOMP_ZSH_RESTORE_ZDOTDIR=1
 else
-  unset ZDOTDIR
+  unset CHOMP_ZSH_USER_ZDOTDIR
+  export CHOMP_ZSH_RESTORE_ZDOTDIR=0
 fi
-unset CHOMP_ZSH_ZDOTDIR
+unset CHOMP_ZSH_ZDOTDIR CHOMP_ZSH_ZDOTDIR_SET
 
-[[ -r "${ZDOTDIR:-$HOME}/.zshenv" ]] && source "${ZDOTDIR:-$HOME}/.zshenv"
-source "$CHOMP_SHELL_INTEGRATION_DIR/zsh"
+__chomp_user_zdotdir="${CHOMP_ZSH_USER_ZDOTDIR:-$HOME}"
+[[ -r "$__chomp_user_zdotdir/.zshenv" ]] && source "$__chomp_user_zdotdir/.zshenv"
+unset __chomp_user_zdotdir

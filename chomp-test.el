@@ -1020,7 +1020,19 @@ Binds `screen' and `parser' in BODY."
                              (car prepared)))
               (should (equal "CHOMP_ZSH_ZDOTDIR=/user/zsh"
                              (cadr prepared)))
+              (should (equal "CHOMP_ZSH_ZDOTDIR_SET=1"
+                             (nth 2 prepared)))
               (should (equal command (chomp-io--build-command command env)))))
+          (let ((process-environment '("ZDOTDIR="))
+                (chomp-enable-shell-integration t))
+            (let ((prepared (chomp-io--prepare-environment command env)))
+              (should (equal "CHOMP_ZSH_ZDOTDIR=" (cadr prepared)))
+              (should (equal "CHOMP_ZSH_ZDOTDIR_SET=1"
+                             (nth 2 prepared)))))
+          (let ((process-environment nil)
+                (chomp-enable-shell-integration t))
+            (should (equal "CHOMP_ZSH_ZDOTDIR_SET=0"
+                           (nth 2 (chomp-io--prepare-environment command env)))))
           (let ((chomp-enable-shell-integration nil))
             (should (equal env (chomp-io--prepare-environment command env)))
             (should (equal command (chomp-io--build-command command env)))))
@@ -1031,6 +1043,8 @@ Binds `screen' and `parser' in BODY."
   (skip-unless (executable-find "zsh"))
   (let* ((home (make-temp-file "chomp-zsh-home-" t))
          (zsh (executable-find "zsh"))
+         (default-directory (file-name-as-directory
+                             (file-truename default-directory)))
          (process-environment (copy-sequence process-environment))
          (extra-env (chomp-shell-env-vars)))
     (unwind-protect
@@ -1038,7 +1052,7 @@ Binds `screen' and `parser' in BODY."
           (with-temp-file (expand-file-name ".zshenv" home)
             (insert "print USER_ZSHENV\n"))
           (with-temp-file (expand-file-name ".zshrc" home)
-            (insert "print USER_ZSHRC\n"))
+            (insert "print USER_ZSHRC\nPS1='USER> '\n"))
           (setenv "HOME" home)
           (setenv "TERM" "eat-truecolor")
           (setenv "ZDOTDIR" nil)
@@ -1053,7 +1067,8 @@ Binds `screen' and `parser' in BODY."
               (should (zerop status)))
             (should (string-match-p "USER_ZSHENV" (buffer-string)))
             (should (string-match-p "USER_ZSHRC" (buffer-string)))
-            (should (string-match-p "\e]51;e;" (buffer-string)))))
+            (should (string-match-p "\e]51;e;B" (buffer-string)))
+            (should (string-match-p "\e]51;e;C" (buffer-string)))))
       (delete-directory home t))))
 
 (ert-deftest chomp-test-io-command-sets-stty-sane ()

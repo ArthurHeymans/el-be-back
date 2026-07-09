@@ -230,14 +230,19 @@ EXTRA-ENV is the env var list (used to find integration dir)."
                       (chomp-io--integration-script shell-type extra-env))))
     (if (and (eq shell-type 'zsh) script)
         (let* ((environment (append extra-env process-environment))
-               (old-zdotdir (or (chomp-io--environment-value
-                                  "ZDOTDIR" environment)
-                                 ""))
+               (old-entry (cl-find-if
+                           (lambda (entry)
+                             (string-prefix-p "ZDOTDIR=" entry))
+                           environment))
+               (old-zdotdir (and old-entry
+                                  (substring old-entry (length "ZDOTDIR="))))
                (bootstrap (expand-file-name
                            "zsh-bootstrap"
                            (file-name-directory script))))
           (append (list (concat "ZDOTDIR=" bootstrap)
-                        (concat "CHOMP_ZSH_ZDOTDIR=" old-zdotdir))
+                        (concat "CHOMP_ZSH_ZDOTDIR=" (or old-zdotdir ""))
+                        (concat "CHOMP_ZSH_ZDOTDIR_SET="
+                                (if old-entry "1" "0")))
                   extra-env))
       extra-env)))
 

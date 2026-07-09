@@ -37,17 +37,24 @@ __chomp_preexec () {
          "$__chomp_current_command"
 }
 
+__chomp_wrap_prompts ()
+{
+  local __chomp_prompt_start="$(printf '\e]51;e;B\e\\')"
+  local __chomp_prompt_end="$(printf '\e]51;e;C\e\\')"
+  local __chomp_continuation_start="$(printf '\e]51;e;D\e\\')"
+  local __chomp_continuation_end="$(printf '\e]51;e;E\e\\')"
+  [[ "$PS1" == *"$__chomp_prompt_start"* ]] ||
+    PS1="%{$__chomp_prompt_start%}$PS1%{$__chomp_prompt_end%}"
+  [[ "$PS2" == *"$__chomp_continuation_start"* ]] ||
+    PS2="%{$__chomp_continuation_start%}$PS2%{$__chomp_continuation_end%}"
+}
+
 __chomp_enable_integration ()
 {
   __chomp_integration_enabled=yes
   __chomp_current_command=""
   __chomp_exit_status=0
-  local __chomp_prompt_start="$(printf '\e]51;e;B\e\\')"
-  local __chomp_prompt_end="$(printf '\e]51;e;C\e\\')"
-  local __chomp_continuation_start="$(printf '\e]51;e;D\e\\')"
-  local __chomp_continuation_end="$(printf '\e]51;e;E\e\\')"
-  PS1="%{$__chomp_prompt_start%}$PS1%{$__chomp_prompt_end%}"
-  PS2="%{$__chomp_continuation_start%}$PS2%{$__chomp_continuation_end%}"
+  __chomp_wrap_prompts
   autoload -Uz add-zsh-hook
   add-zsh-hook precmd __chomp_precmd
   add-zsh-hook preexec __chomp_preexec
@@ -68,8 +75,9 @@ if test -z "$__chomp_integration_enabled" && \
     { test "${TERM:0:6}" = "chomp-" || test "${TERM:0:4}" = "eat-"; }
 then
   __chomp_enable_integration
-else
-  true
+elif test -n "$__chomp_integration_enabled"
+then
+  __chomp_wrap_prompts
 fi
 
 # Local Variables:
