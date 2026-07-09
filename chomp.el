@@ -751,6 +751,7 @@ or `$SHELL'."
   "Return custom PROPERTY from bookmark RECORD."
   (alist-get property (if (stringp (car-safe record)) (cdr record) record)))
 
+;;;###autoload
 (defun chomp-bookmark-jump (record)
   "Jump to the terminal session described by bookmark RECORD."
   (let* ((directory (chomp--bookmark-property record 'chomp-directory))
