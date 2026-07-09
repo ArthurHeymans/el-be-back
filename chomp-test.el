@@ -913,6 +913,8 @@ Binds `screen' and `parser' in BODY."
         (save-window-excursion
           (switch-to-buffer buffer)
           (let ((render (chomp-render-create screen buffer)))
+            (chomp-test-output parser "\e[11;1H0123456789")
+            (chomp-render-refresh render)
             (setq-local chomp--input-mode 'emacs)
             (goto-char (point-min))
             (forward-line 10)
@@ -925,11 +927,17 @@ Binds `screen' and `parser' in BODY."
                                 (forward-line 5)
                                 (point)) t)
             (let ((saved-point (point))
+                  (saved-point-line (line-number-at-pos))
+                  (saved-point-column (current-column))
                   (saved-mark (mark))
+                  (saved-mark-line (line-number-at-pos (mark)))
                   (saved-start (window-start))
+                  (saved-start-line (line-number-at-pos (window-start)))
+                  (saved-char (char-after))
                   (old-cursor (overlay-start
                                (chomp-render-state-cursor-overlay render))))
-              (chomp-test-output parser "\e[21;3H")
+              ;; Replacing the row containing point must not collapse point or mark.
+              (chomp-test-output parser "\e[11;1Habc")
               (chomp-render-refresh render)
               (should (/= old-cursor
                           (overlay-start
@@ -938,11 +946,17 @@ Binds `screen' and `parser' in BODY."
               (should (= saved-mark (mark)))
               (should mark-active)
               (should (= saved-start (window-start)))
+              (should (= saved-char (char-after)))
+              ;; A width change must preserve line/column, not a raw offset.
+              (chomp-screen-resize screen 25 40)
               (chomp-render-full-reset render)
-              (should (= saved-point (point)))
-              (should (= saved-mark (mark)))
+              (should (= saved-point-line (line-number-at-pos)))
+              (should (= saved-point-column (current-column)))
+              (should (= saved-mark-line (line-number-at-pos (mark))))
               (should mark-active)
-              (should (= saved-start (window-start))))
+              (should (= saved-start-line
+                         (line-number-at-pos (window-start))))
+              (should (= saved-char (char-after))))
             (setq-local chomp--input-mode 'semi-char)
             (chomp-test-output parser "\e[26;4H")
             (chomp-render-refresh render)

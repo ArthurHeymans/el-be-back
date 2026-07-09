@@ -158,6 +158,19 @@ allowing theme/user customization."
 
 ;;;; ---- Main Refresh ---------------------------------------------------
 
+(defun chomp-render--save-position (pos)
+  "Return POS as a buffer line and terminal column."
+  (when pos
+    (save-excursion
+      (goto-char pos)
+      (cons (1- (line-number-at-pos)) (current-column)))))
+
+(defun chomp-render--restore-position (saved)
+  "Restore point to SAVED buffer line and terminal column."
+  (goto-char (point-min))
+  (forward-line (car saved))
+  (move-to-column (cdr saved)))
+
 (defun chomp-render-refresh (render)
   "Refresh the buffer from the screen model.
 Only dirty display lines are re-rendered, but scrollback and cursor
@@ -167,16 +180,44 @@ state are reconciled independently so metadata-only updates are visible."
          (dirty (chomp-screen-get-dirty screen)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (let ((inhibit-read-only t)
-              (inhibit-modification-hooks t)
-              (buffer-undo-list t))
-          ;; Reconcile scrollback independently of dirty display rows.
-          (chomp-render--update-scrollback render)
-          ;; Render dirty display lines.
-          (dolist (row dirty)
-            (chomp-render--update-line render row))
-          ;; Cursor movement/visibility/style can change without dirtying a row.
-          (chomp-render--update-cursor render)))
+        (let* ((preserve-view
+                (eq (bound-and-true-p chomp--input-mode) 'emacs))
+               (saved-point (and preserve-view
+                                 (chomp-render--save-position (point))))
+               (saved-mark (and preserve-view (mark t)
+                                (chomp-render--save-position (mark t))))
+               (saved-mark-active (and preserve-view mark-active))
+               (saved-window
+                (and preserve-view
+                     (eq (window-buffer (selected-window)) buffer)
+                     (selected-window)))
+               (saved-window-start
+                (and saved-window
+                     (chomp-render--save-position
+                      (window-start saved-window)))))
+          (let ((inhibit-read-only t)
+                (inhibit-modification-hooks t)
+                (buffer-undo-list t))
+            ;; Reconcile scrollback independently of dirty display rows.
+            (chomp-render--update-scrollback render)
+            ;; Render dirty display lines.
+            (dolist (row dirty)
+              (chomp-render--update-line render row))
+            ;; Cursor movement/visibility/style can change without dirtying a row.
+            (chomp-render--update-cursor render))
+          (when preserve-view
+            (chomp-render--restore-position saved-point)
+            (if saved-mark
+                (progn
+                  (save-excursion
+                    (chomp-render--restore-position saved-mark)
+                    (set-marker (mark-marker) (point)))
+                  (setq mark-active saved-mark-active))
+              (set-marker (mark-marker) nil))
+            (when (window-live-p saved-window)
+              (save-excursion
+                (chomp-render--restore-position saved-window-start)
+                (set-window-start saved-window (point) t))))))
       (chomp-screen-clear-dirty screen))))
 
 ;;;; ---- Scrollback Rendering -------------------------------------------
@@ -630,15 +671,19 @@ Used after resize when the display area size has changed."
       (with-current-buffer buffer
         (let* ((preserve-view
                 (eq (bound-and-true-p chomp--input-mode) 'emacs))
-               (saved-point (and preserve-view (point)))
-               (saved-mark (and preserve-view (mark t)))
+               (saved-point (and preserve-view
+                                 (chomp-render--save-position (point))))
+               (saved-mark (and preserve-view (mark t)
+                                (chomp-render--save-position (mark t))))
                (saved-mark-active (and preserve-view mark-active))
                (saved-window
                 (and preserve-view
                      (eq (window-buffer (selected-window)) buffer)
                      (selected-window)))
                (saved-window-start
-                (and saved-window (window-start saved-window))))
+                (and saved-window
+                     (chomp-render--save-position
+                      (window-start saved-window)))))
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
@@ -675,14 +720,18 @@ Used after resize when the display area size has changed."
             (chomp-screen-clear-dirty screen)
             (chomp-screen-clear-scrollback-dirty screen))
           (when preserve-view
-            (goto-char (min saved-point (point-max)))
+            (chomp-render--restore-position saved-point)
             (if saved-mark
-                (set-marker (mark-marker) (min saved-mark (point-max)))
+                (progn
+                  (save-excursion
+                    (chomp-render--restore-position saved-mark)
+                    (set-marker (mark-marker) (point)))
+                  (setq mark-active saved-mark-active))
               (set-marker (mark-marker) nil))
-            (setq mark-active saved-mark-active)
             (when (window-live-p saved-window)
-              (set-window-start saved-window
-                                (min saved-window-start (point-max)) t))))))))
+              (save-excursion
+                (chomp-render--restore-position saved-window-start)
+                (set-window-start saved-window (point) t)))))))))
 
 ;;;; ---- Cleanup --------------------------------------------------------
 
