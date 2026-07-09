@@ -351,7 +351,7 @@ the process environment."
                 :buffer nil  ; no associated buffer (we manage our own)
                 :command cmd
                 :connection-type 'pty
-                :coding '(utf-8-unix . utf-8-unix)
+                :coding '(utf-8-unix . no-conversion)
                 :noquery t
                 :filter (lambda (proc output)
                           (chomp-io--filter io proc output))
@@ -385,10 +385,15 @@ the process environment."
 ;;;; ---- Send to Process ------------------------------------------------
 
 (defun chomp-io-send (io string)
-  "Send STRING to the terminal process."
+  "Send STRING to the terminal process.
+Multibyte text is encoded as UTF-8; unibyte strings are sent unchanged."
   (when-let ((proc (chomp-io-process io)))
     (when (process-live-p proc)
-      (process-send-string proc string))))
+      (process-send-string
+       proc
+       (if (multibyte-string-p string)
+           (encode-coding-string string 'utf-8 t)
+         string)))))
 
 ;;;; ---- Resize ---------------------------------------------------------
 

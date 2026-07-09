@@ -933,7 +933,7 @@ Binds `screen' and `parser' in BODY."
       (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
                 ((symbol-function 'chomp-io-send)
                  (lambda (_io string) (push string sent))))
-        (chomp-send-string (string 0 255 ?x))
+        (chomp-send-string (unibyte-string 0 255 ?x))
         (chomp-send-key "up")
         (chomp-send-key "up" "control, shift")
         (chomp-send-key "c" "ctrl")
@@ -941,7 +941,7 @@ Binds `screen' and `parser' in BODY."
         (setf (chomp-screen-bracketed-paste chomp--screen) t)
         (chomp-paste-string "bracketed")))
     (should (equal (list "\e[200~bracketed\e[201~" "plain" "\C-c"
-                         "\e[1;6A" "\e[A" (string 0 255 ?x))
+                         "\e[1;6A" "\e[A" (unibyte-string 0 255 ?x))
                    sent))))
 
 (ert-deftest chomp-test-public-input-api-requires-running-terminal ()
@@ -955,6 +955,33 @@ Binds `screen' and `parser' in BODY."
     (should-error (chomp-send-key "up") :type 'user-error)
     (setq major-mode 'chomp-mode)
     (should-error (chomp-send-key "up") :type 'user-error)))
+
+(ert-deftest chomp-test-io-send-preserves-bytes ()
+  "Process writes preserve unibyte data and UTF-8 encode text."
+  (let ((io (make-chomp-io :process 'fake))
+        sent)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+              ((symbol-function 'process-send-string)
+               (lambda (_process string) (push string sent))))
+      (chomp-io-send io (unibyte-string 0 255 ?x))
+      (chomp-io-send io "λ"))
+    (should (equal (encode-coding-string "λ" 'utf-8 t) (car sent)))
+    (should (equal (unibyte-string 0 255 ?x) (cadr sent)))))
+
+(ert-deftest chomp-test-io-process-uses-binary-writes ()
+  "PTY output is decoded as UTF-8 while input remains byte-preserving."
+  (let* ((screen (chomp-screen-create 10 3))
+         (parser (chomp-parse-create screen))
+         (io (make-chomp-io :screen screen :parser parser))
+         coding)
+    (cl-letf (((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq coding (plist-get args :coding))
+                 'fake))
+              ((symbol-function 'set-process-window-size) #'ignore))
+      (let ((chomp-enable-shell-integration nil))
+        (chomp-io-start io "/bin/sh" (current-buffer))))
+    (should (equal '(utf-8-unix . no-conversion) coding))))
 
 (ert-deftest chomp-test-io-list-command-keeps-shell-integration ()
   "Shell argv from the program prompt retains startup integration."
