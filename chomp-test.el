@@ -936,10 +936,11 @@ Binds `screen' and `parser' in BODY."
         (chomp-send-string (string 0 255 ?x))
         (chomp-send-key "up")
         (chomp-send-key "up" "control, shift")
+        (chomp-send-key "c" "ctrl")
         (chomp-paste-string "plain")
         (setf (chomp-screen-bracketed-paste chomp--screen) t)
         (chomp-paste-string "bracketed")))
-    (should (equal (list "\e[200~bracketed\e[201~" "plain"
+    (should (equal (list "\e[200~bracketed\e[201~" "plain" "\C-c"
                          "\e[1;6A" "\e[A" (string 0 255 ?x))
                    sent))))
 
@@ -1430,9 +1431,13 @@ Binds `screen' and `parser' in BODY."
 (ert-deftest chomp-test-buffer-cycle-wraps ()
   "Next and previous session navigation wrap around."
   (let ((a (chomp-test--session-buffer " *chomp-cycle-a*"))
-        (b (chomp-test--session-buffer " *chomp-cycle-b*")))
+        (b (chomp-test--session-buffer " *chomp-cycle-b*"))
+        (ordinary (generate-new-buffer " *chomp-cycle-ordinary*")))
     (unwind-protect
         (cl-letf (((symbol-function 'pop-to-buffer-same-window) #'identity))
+          (with-current-buffer ordinary
+            (should (eq a (chomp-next)))
+            (should (eq b (chomp-previous))))
           (with-current-buffer a
             (should (eq b (chomp-next))))
           (with-current-buffer b
@@ -1441,7 +1446,7 @@ Binds `screen' and `parser' in BODY."
             (should (eq b (chomp-previous)))))
       (mapc (lambda (buffer)
               (when (buffer-live-p buffer) (kill-buffer buffer)))
-            (list a b)))))
+            (list a b ordinary)))))
 
 (ert-deftest chomp-test-other-reuses-or-creates ()
   "`chomp-other' chooses another session or creates one."

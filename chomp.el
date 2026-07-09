@@ -173,6 +173,7 @@ Options: `char', `semi-char', `emacs'."
                 (lambda (name)
                   (let ((modifier (intern (downcase (string-trim name)))))
                     (cond ((eq modifier 'alt) 'meta)
+                          ((eq modifier 'ctrl) 'control)
                           ((memq modifier '(control meta shift super hyper))
                            modifier)
                           (t (user-error "Unknown modifier: %s" name)))))
@@ -573,8 +574,10 @@ normal terminal input handling or appear in `view-lossage'."
   (let ((buffers (chomp--buffers)))
     (unless buffers
       (user-error "No Chomp sessions"))
-    (let* ((position (or (cl-position (current-buffer) buffers) 0))
-           (target (nth (mod (+ position step) (length buffers)) buffers)))
+    (let* ((position (cl-position (current-buffer) buffers))
+           (target (if position
+                       (nth (mod (+ position step) (length buffers)) buffers)
+                     (if (> step 0) (car buffers) (car (last buffers))))))
       (pop-to-buffer-same-window target)
       target)))
 
