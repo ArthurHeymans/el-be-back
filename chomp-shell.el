@@ -173,16 +173,14 @@ post-render processing."
       (pcase cmd
         ;; CWD: immediate (no buffer position needed)
         (?A (chomp-shell--set-cwd args))
-        ;; Prompt start: record screen position
-        (?B (when chomp-enable-shell-prompt-annotation
-              (setq chomp-shell--prompt-start-line
-                    (chomp-shell--absolute-line screen))
-              (push '(prompt-start) chomp-shell--pending-events)))
-        ;; Prompt end: record screen position
-        (?C (when chomp-enable-shell-prompt-annotation
-              (push (cons 'prompt-end
-                          (chomp-shell--absolute-line screen))
-                    chomp-shell--pending-events)))
+        ;; Prompt boundaries are metadata used by navigation even when visual
+        ;; annotations are disabled.
+        (?B (setq chomp-shell--prompt-start-line
+                  (chomp-shell--absolute-line screen))
+            (push '(prompt-start) chomp-shell--pending-events))
+        (?C (push (cons 'prompt-end
+                        (chomp-shell--absolute-line screen))
+                  chomp-shell--pending-events))
         (?D nil)  ; continuation prompt start (unused)
         (?E nil)  ; continuation prompt end
         ;; Command text: immediate
@@ -247,8 +245,9 @@ after `chomp-render-refresh'."
              (chomp-shell--apply-prompt-end render abs-line)))
           ('pre-exec
            (chomp-shell--apply-pre-exec)))))
-    ;; Schedule overlay correction
-    (chomp-shell--schedule-overlay-correction)))
+    ;; Schedule overlay correction only when prompt overlays are enabled.
+    (when chomp-enable-shell-prompt-annotation
+      (chomp-shell--schedule-overlay-correction))))
 
 (defun chomp-shell--line-to-buffer-pos (render abs-line)
   "Convert absolute line number ABS-LINE to a buffer position.
@@ -300,25 +299,26 @@ of the prompt end."
         (let* ((beg (marker-position prompt-begin))
                (end (save-excursion
                       (goto-char end-pos)
-                      (line-end-position)))
-               (indicator (chomp-shell--running-indicator))
-               (display-spec
-                (list (list 'margin chomp-shell-prompt-annotation-position)
-                      indicator))
-               (before-str (propertize " " 'display display-spec)))
+                      (line-end-position))))
           (when (< beg end)
-            ;; Set text properties for prompt navigation
+            ;; Set text properties for prompt navigation.
             (put-text-property beg (min (1+ beg) end)
                                'chomp-shell-prompt-begin t)
             (put-text-property (max (1- end) beg) end
                                'chomp-shell-prompt-end t)
-            ;; Create the overlay
-            (let ((ov (make-overlay beg (min (1+ beg) end) nil t nil)))
-              (overlay-put ov 'before-string before-str)
-              (overlay-put ov 'chomp-shell-prompt t)
-              (push ov chomp-shell--prompt-overlays))
-            ;; Save display spec for in-place mutation later
-            (setq chomp-shell--prompt-mark display-spec))))))
+            (when chomp-enable-shell-prompt-annotation
+              (let* ((indicator (chomp-shell--running-indicator))
+                     (display-spec
+                      (list
+                       (list 'margin chomp-shell-prompt-annotation-position)
+                       indicator))
+                     (before-str (propertize " " 'display display-spec))
+                     (ov (make-overlay beg (min (1+ beg) end) nil t nil)))
+                (overlay-put ov 'before-string before-str)
+                (overlay-put ov 'chomp-shell-prompt t)
+                (push ov chomp-shell--prompt-overlays)
+                ;; Save display spec for in-place mutation later.
+                (setq chomp-shell--prompt-mark display-spec))))))))
   ;; Reset prompt-start-line for next cycle
   (setq chomp-shell--prompt-start-line nil))
 

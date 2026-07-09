@@ -1037,6 +1037,57 @@ Binds `screen' and `parser' in BODY."
     (should (string-prefix-p "EAT_SHELL_INTEGRATION_DIR=" (cadr vars)))
     (should (string-prefix-p "TERMINFO=" (caddr vars)))))
 
+(ert-deftest chomp-test-shell-prompt-metadata-without-annotations ()
+  "Prompt navigation metadata does not require visual annotations."
+  (let* ((screen (chomp-screen-create 20 6))
+         (parser (chomp-parse-create screen)))
+    (with-temp-buffer
+      (setq-local chomp-enable-shell-prompt-annotation nil)
+      (setq-local chomp-shell--pending-events nil)
+      (setq-local chomp-shell--prompt-start-line nil)
+      (setq-local chomp-shell--prompt-overlays nil)
+      (let ((render (chomp-render-create screen (current-buffer))))
+        (chomp-shell-handle-osc51 "e;B" screen)
+        (chomp-test-output parser "first")
+        (chomp-shell-handle-osc51 "e;C" screen)
+        (chomp-render-refresh render)
+        (chomp-shell-post-render render)
+        (chomp-test-output parser "\r\n\r\n")
+        (chomp-shell-handle-osc51 "e;B" screen)
+        (chomp-test-output parser "second")
+        (chomp-shell-handle-osc51 "e;C" screen)
+        (chomp-render-refresh render)
+        (chomp-shell-post-render render)
+        (let* ((first-begin
+                (text-property-any (point-min) (point-max)
+                                   'chomp-shell-prompt-begin t))
+               (first-end
+                (text-property-any (point-min) (point-max)
+                                   'chomp-shell-prompt-end t))
+               (second-end
+                (and first-end
+                     (text-property-any (1+ first-end) (point-max)
+                                        'chomp-shell-prompt-end t))))
+          (should first-begin)
+          (should first-end)
+          (should second-end)
+          (goto-char (point-max))
+          (chomp-shell-previous-prompt)
+          (should (= (point) (1+ second-end)))
+          (chomp-shell-previous-prompt)
+          (should (= (point) (1+ first-end)))
+          (goto-char (point-min))
+          (chomp-shell-next-prompt)
+          (should (= (point) (1+ first-end)))
+          (chomp-shell-next-prompt)
+          (should (= (point) (1+ second-end))))
+        (should-not chomp-shell--prompt-overlays)
+        (should-not chomp-shell--prompt-mark)
+        (should-not
+         (cl-find-if (lambda (ov)
+                       (overlay-get ov 'chomp-shell-prompt))
+                     (overlays-in (point-min) (point-max))))))))
+
 (ert-deftest chomp-test-shell-pending-events ()
   "OSC 51 B and C sequences queue pending events."
   (let ((screen (chomp-screen-create 20 6)))
