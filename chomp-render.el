@@ -428,8 +428,12 @@ compactly."
           (unless (and (= (- eol bol) (length new))
                        (equal-including-properties
                         new (buffer-substring bol eol)))
-            (delete-region bol eol)
-            (insert new)))))))
+            (let ((display-start (marker-position display-begin)))
+              (delete-region bol eol)
+              (insert new)
+              ;; Replacing row zero must not move the marker that separates
+              ;; scrollback from the terminal viewport.
+              (set-marker display-begin display-start))))))))
 
 ;;;; ---- Cell-to-String Conversion --------------------------------------
 

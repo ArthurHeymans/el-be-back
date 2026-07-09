@@ -1169,6 +1169,32 @@ Binds `screen' and `parser' in BODY."
               (forward-line 1)
               (should (= after (+ (point) 2))))))))))
 
+(ert-deftest chomp-test-render-keeps-display-begin-at-viewport-start ()
+  "Updating row zero does not move the scrollback/display boundary."
+  (let* ((screen (chomp-screen-create 6 4))
+         (parser (chomp-parse-create screen)))
+    (with-temp-buffer
+      (let ((render (chomp-render-create screen (current-buffer))))
+        (chomp-render-refresh render)
+        (chomp-test-output parser "prompt")
+        (chomp-render-refresh render)
+        (should (= (point-min)
+                   (marker-position
+                    (chomp-render-state-display-begin render))))
+        ;; A full-screen program must own every viewport row even when the
+        ;; shell cursor was previously in the middle of the screen.
+        (chomp-test-output
+         parser
+         "\e[3;1Hmiddle\e[?1049h\e[1;1HAAAAA\e[2;1HBBBBB\e[3;1HCCCCC\e[4;1HDDDDD")
+        (chomp-render-refresh render)
+        (should (= (point-min)
+                   (marker-position
+                    (chomp-render-state-display-begin render))))
+        (should (equal '("AAAAA" "BBBBB" "CCCCC" "DDDDD")
+                       (chomp-test-display-text screen)))
+        (should (equal "AAAAA \nBBBBB \nCCCCC \nDDDDD "
+                       (buffer-string)))))))
+
 (ert-deftest chomp-test-render-emacs-mode-preserves-view ()
   "Emacs input mode preserves the reading view while the cursor advances."
   (let* ((screen (chomp-screen-create 20 40))
