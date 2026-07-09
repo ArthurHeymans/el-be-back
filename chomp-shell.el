@@ -124,16 +124,19 @@ The second element is mutated in place to update the indicator.")
 ;;;; ---- Helpers --------------------------------------------------------
 
 (defun chomp-shell--base64-decode (str)
-  "Decode base64 STR, returning nil on error."
+  "Decode base64 STR as valid UTF-8, returning nil on error."
   (condition-case nil
-      (decode-coding-string (base64-decode-string str) 'utf-8)
+      (let ((decoded (decode-coding-string (base64-decode-string str) 'utf-8)))
+        (and (cl-loop for char across decoded
+                      never (eq (char-charset char) 'eight-bit))
+             decoded))
     (error nil)))
 
 (defun chomp-shell--split-payload (payload start)
   "Split PAYLOAD from position START on semicolons.
 Returns a list of strings."
   (when (< start (length payload))
-    (split-string (substring payload start) ";" t)))
+    (split-string (substring payload start) ";" nil)))
 
 (defun chomp-shell--absolute-line (screen)
   "Return the current absolute line number in SCREEN.

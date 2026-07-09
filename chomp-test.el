@@ -1669,16 +1669,25 @@ Binds `screen' and `parser' in BODY."
                  (chomp-test-base64 "héllo")
                  (chomp-test-base64 "世界")) nil)
         (chomp-shell-handle-osc51
+         (format "e;M;%s;;%s"
+                 (base64-encode-string "allowed" t)
+                 (base64-encode-string "tail" t)) nil)
+        (chomp-shell-handle-osc51
          (format "e;M;%s;%s" (base64-encode-string "unknown" t)
                  (base64-encode-string "ignored" t)) nil)
         (chomp-shell-handle-osc51 "e;M;not-base64" nil)
+        (chomp-shell-handle-osc51
+         (format "e;M;%s;%s"
+                 (base64-encode-string "allowed" t)
+                 (base64-encode-string (unibyte-string 255) t)) nil)
         (chomp-shell-handle-osc51
          (format "e;M;%s" (base64-encode-string "error" t)) nil)
         ;; A failed handler must not prevent the next message from parsing.
         (chomp-shell-handle-osc51
          (format "e;M;%s;%s" (base64-encode-string "allowed" t)
                  (base64-encode-string "after" t)) nil)))
-    (should (equal '(("after") ("héllo" "世界")) calls))))
+    (should (equal '(("after") ("" "tail") ("héllo" "世界"))
+                   calls))))
 
 (ert-deftest chomp-test-shell-osc51-cwd ()
   "OSC 51 CWD tracking decodes base64 host and path."
