@@ -1078,6 +1078,99 @@ Binds `screen' and `parser' in BODY."
     (should (equal '("printf" "%s" "unchanged")
                    (start '("printf" "%s" "unchanged") nil)))))
 
+;;;; ---- Session Tests --------------------------------------------------
+
+(defun chomp-test--session-buffer (name &optional identity)
+  "Create a lightweight Chomp buffer named NAME with IDENTITY."
+  (let ((buffer (generate-new-buffer name)))
+    (with-current-buffer buffer
+      (setq major-mode 'chomp-mode)
+      (setq-local chomp--session-id (or identity name)))
+    buffer))
+
+(ert-deftest chomp-test-buffer-list-sorted-and-filtered ()
+  "Session lists are sorted and completion contains only Chomp buffers."
+  (let ((z (chomp-test--session-buffer " *chomp-z*"))
+        (a (chomp-test--session-buffer " *chomp-a*"))
+        (ordinary (generate-new-buffer " *ordinary*")))
+    (unwind-protect
+        (progn
+          (should (equal (list a z) (chomp--buffers)))
+          (with-current-buffer a
+            (let (collection default)
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (_prompt choices &rest args)
+                           (setq collection choices default (nth 4 args))
+                           default))
+                        ((symbol-function 'pop-to-buffer-same-window) #'identity))
+                (should (eq z (chomp-list-buffers))))
+              (should (equal '(" *chomp-a*" " *chomp-z*") collection))
+              (should (equal " *chomp-z*" default)))))
+      (mapc (lambda (buffer)
+              (when (buffer-live-p buffer) (kill-buffer buffer)))
+            (list z a ordinary)))))
+
+(ert-deftest chomp-test-buffer-cycle-wraps ()
+  "Next and previous session navigation wrap around."
+  (let ((a (chomp-test--session-buffer " *chomp-cycle-a*"))
+        (b (chomp-test--session-buffer " *chomp-cycle-b*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer-same-window) #'identity))
+          (with-current-buffer a
+            (should (eq b (chomp-next))))
+          (with-current-buffer b
+            (should (eq a (chomp-next))))
+          (with-current-buffer a
+            (should (eq b (chomp-previous)))))
+      (mapc (lambda (buffer)
+              (when (buffer-live-p buffer) (kill-buffer buffer)))
+            (list a b)))))
+
+(ert-deftest chomp-test-other-reuses-or-creates ()
+  "`chomp-other' chooses another session or creates one."
+  (let ((a (chomp-test--session-buffer " *chomp-other-a*"))
+        (b (chomp-test--session-buffer " *chomp-other-b*"))
+        created)
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer-same-window) #'identity))
+          (with-current-buffer a
+            (should (eq b (chomp-other))))
+          (kill-buffer b)
+          (with-current-buffer a
+            (cl-letf (((symbol-function 'chomp)
+                       (lambda (&optional _) (setq created t))))
+              (should (chomp-other))
+              (should created))))
+      (mapc (lambda (buffer)
+              (when (buffer-live-p buffer) (kill-buffer buffer)))
+            (list a b)))))
+
+(ert-deftest chomp-test-project-reuses-renamed-buffer ()
+  "Project terminals use project names and stable identities after OSC titles."
+  (let* ((root (file-name-as-directory (make-temp-file "chomp-project-" t)))
+         (project 'fake-project)
+         buffer started name-called)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'project-current) (lambda (&rest _) project))
+                    ((symbol-function 'project-root) (lambda (_) root))
+                    ((symbol-function 'project-prefixed-buffer-name)
+                     (lambda (mode) (setq name-called mode) "*fake-chomp*"))
+                    ((symbol-function 'chomp-io-start)
+                     (lambda (&rest _) (setq started (1+ (or started 0)))))
+                    ((symbol-function 'pop-to-buffer-same-window) #'identity))
+            (setq buffer (chomp-project))
+            (should (equal "chomp" name-called))
+            (should (equal "*fake-chomp*" (buffer-name buffer)))
+            (should (equal (file-truename root)
+                           (buffer-local-value 'chomp--session-id buffer)))
+            (with-current-buffer buffer
+              (chomp--handle-event 'title "renamed"))
+            (should (eq buffer (chomp-project)))
+            (should (= 1 started))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory root t))))
+
 ;;;; ---- Shell Integration Tests ----------------------------------------
 
 (require 'chomp-shell)

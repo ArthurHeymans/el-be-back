@@ -81,6 +81,7 @@ Options: `char', `semi-char', `emacs'."
 (defvar-local chomp--parser nil "The chomp-parser for this buffer.")
 (defvar-local chomp--render nil "The chomp-render-state for this buffer.")
 (defvar-local chomp--input-mode nil "Current input mode symbol.")
+(defvar-local chomp--session-id nil "Stable identity of this terminal session.")
 (defvar-local chomp--mouse-drag-transient-map-exit nil
   "Function that exits the active mouse drag transient map.")
 
@@ -414,6 +415,68 @@ normal terminal input handling or appear in `view-lossage'."
 
 ;;;; ---- Entry Points ---------------------------------------------------
 
+(defun chomp--buffers ()
+  "Return live Chomp buffers sorted by name."
+  (sort (seq-filter (lambda (buffer)
+                      (eq (buffer-local-value 'major-mode buffer) 'chomp-mode))
+                    (buffer-list))
+        (lambda (a b) (string< (buffer-name a) (buffer-name b)))))
+
+(defun chomp--find-session (identity)
+  "Return the Chomp buffer with stable IDENTITY, if any."
+  (seq-find (lambda (buffer)
+              (equal identity
+                     (buffer-local-value 'chomp--session-id buffer)))
+            (chomp--buffers)))
+
+(defun chomp--cycle (step)
+  "Switch STEP places through the sorted Chomp buffer list, wrapping."
+  (let ((buffers (chomp--buffers)))
+    (unless buffers
+      (user-error "No Chomp sessions"))
+    (let* ((position (or (cl-position (current-buffer) buffers) 0))
+           (target (nth (mod (+ position step) (length buffers)) buffers)))
+      (pop-to-buffer-same-window target)
+      target)))
+
+;;;###autoload
+(defun chomp-next ()
+  "Switch to the next Chomp session, wrapping at the end."
+  (interactive)
+  (chomp--cycle 1))
+
+;;;###autoload
+(defun chomp-previous ()
+  "Switch to the previous Chomp session, wrapping at the beginning."
+  (interactive)
+  (chomp--cycle -1))
+
+;;;###autoload
+(defun chomp-list-buffers ()
+  "Choose a Chomp session, defaulting to the next one."
+  (interactive)
+  (let* ((buffers (chomp--buffers))
+         (next (and buffers
+                    (nth (mod (1+ (or (cl-position (current-buffer) buffers) -1))
+                              (length buffers))
+                         buffers))))
+    (unless buffers
+      (user-error "No Chomp sessions"))
+    (pop-to-buffer-same-window
+     (get-buffer
+      (completing-read "Chomp session: "
+                       (mapcar #'buffer-name buffers) nil t nil nil
+                       (buffer-name next))))))
+
+;;;###autoload
+(defun chomp-other (&optional program)
+  "Switch to another Chomp session, or create one with PROGRAM."
+  (interactive)
+  (if-let ((other (seq-find (lambda (buffer) (not (eq buffer (current-buffer))))
+                            (chomp--buffers))))
+      (pop-to-buffer-same-window other)
+    (chomp program)))
+
 ;;;###autoload
 (defun chomp (&optional program)
   "Start a terminal emulator.
@@ -439,10 +502,7 @@ or `$SHELL'."
   ;; With numeric prefix: switch to Nth chomp buffer
   (when (and (numberp current-prefix-arg) (not program))
     (let* ((n current-prefix-arg)
-           (chomp-bufs (seq-filter
-                        (lambda (b)
-                          (eq (buffer-local-value 'major-mode b) 'chomp-mode))
-                        (buffer-list)))
+           (chomp-bufs (chomp--buffers))
            (existing (nth (1- n) chomp-bufs)))
       (when existing
         (pop-to-buffer-same-window existing)
@@ -456,6 +516,7 @@ or `$SHELL'."
     ;; Set up mode first
     (with-current-buffer buf
       (chomp-mode)
+      (setq chomp--session-id (buffer-name buf))
       ;; Determine initial size from a window
       (let* ((win (or (get-buffer-window buf)
                       (selected-window)))
@@ -508,13 +569,22 @@ or `$SHELL'."
 
 ;;;###autoload
 (defun chomp-project ()
-  "Start a terminal in the current project root."
+  "Switch to or start a terminal in the current project root."
   (interactive)
-  (let ((default-directory
-         (or (when-let ((proj (project-current)))
-               (project-root proj))
-             default-directory)))
-    (chomp)))
+  (let* ((project (project-current))
+         (root (and project (file-truename (project-root project))))
+         (existing (and root (chomp--find-session root))))
+    (if existing
+        (pop-to-buffer-same-window existing)
+      (let ((default-directory (or root default-directory))
+            (chomp-buffer-name (if project
+                                   (project-prefixed-buffer-name "chomp")
+                                 chomp-buffer-name)))
+        (let ((buffer (chomp)))
+          (when root
+            (with-current-buffer buffer
+              (setq chomp--session-id root)))
+          buffer)))))
 
 ;;;###autoload
 (defun chomp-project-other-window ()
