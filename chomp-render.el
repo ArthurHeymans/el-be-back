@@ -672,6 +672,37 @@ lists; falls back only when a styled cell is present."
 
 ;;;; ---- Invalidation ---------------------------------------------------
 
+(defun chomp-render--invalidate-screen-lines (screen)
+  "Discard rendered face caches stored on every line in SCREEN."
+  (dolist (line (append (chomp-screen-scrollback-lines-raw screen)
+                        (append (chomp--ordered-lines-vector screen) nil)))
+    (setf (chomp-line-rendered line) nil)
+    (setf (chomp-line-dirty line) t)))
+
+(defun chomp-render--theme-changed (&rest _)
+  "Clear theme-derived caches and fully redraw live Chomp render states."
+  (fillarray chomp-render--indexed-color-cache nil)
+  (clrhash chomp-render--attr-face-cache)
+  (when (boundp 'chomp--render)
+    (dolist (buffer (buffer-list))
+      (when (and (buffer-live-p buffer)
+                 (eq (buffer-local-value 'major-mode buffer) 'chomp-mode))
+        (when-let ((render (buffer-local-value 'chomp--render buffer)))
+          (chomp-render--invalidate-screen-lines
+           (chomp-render-state-screen render))
+          (chomp-render-full-reset render))))))
+
+(defun chomp-render--after-load-theme (&rest _)
+  "Emacs 28 fallback advice for invalidating colors after `load-theme'."
+  (chomp-render--theme-changed))
+
+(defun chomp-render--install-theme-invalidation ()
+  "Install the available theme-change invalidation path."
+  (if (boundp 'enable-theme-functions)
+      (add-hook 'enable-theme-functions #'chomp-render--theme-changed)
+    (unless (advice-member-p #'chomp-render--after-load-theme 'load-theme)
+      (advice-add 'load-theme :after #'chomp-render--after-load-theme))))
+
 (defun chomp-render-invalidate-all (render)
   "Mark all display lines as needing re-render."
   (let* ((screen (chomp-render-state-screen render))
@@ -763,6 +794,8 @@ Used after resize when the display area size has changed."
     (delete-overlay ov))
   (when-let ((m (chomp-render-state-display-begin render)))
     (set-marker m nil)))
+
+(chomp-render--install-theme-invalidation)
 
 (provide 'chomp-render)
 ;;; chomp-render.el ends here

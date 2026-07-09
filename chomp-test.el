@@ -546,6 +546,90 @@ Binds `screen' and `parser' in BODY."
   ;; nil
   (should (null (chomp-render--color-to-string nil))))
 
+(ert-deftest chomp-test-render-theme-cache-invalidation ()
+  "Theme changes clear color caches and redraw every live Chomp render state."
+  (let ((buffers nil)
+        (color "#111111")
+        (resets 0)
+        cleared
+        (original-face-foreground (symbol-function 'face-foreground))
+        (original-reset (symbol-function 'chomp-render-full-reset)))
+    (unwind-protect
+        (progn
+          (fillarray chomp-render--indexed-color-cache nil)
+          (clrhash chomp-render--attr-face-cache)
+          (dotimes (i 2)
+            (let* ((buffer (generate-new-buffer (format " *theme-chomp-%d*" i)))
+                   (screen (chomp-screen-create 5 2)))
+              (push buffer buffers)
+              (with-current-buffer buffer
+                (chomp-mode)
+                (setq-local chomp--screen screen)
+                (setq-local chomp--render (chomp-render-create screen buffer))
+                (chomp-screen-set-attr screen :fg 1)
+                (chomp-screen-write-char screen ?x))))
+          (cl-letf (((symbol-function 'face-foreground)
+                     (lambda (face &rest args)
+                       (if (eq face 'chomp-color-1)
+                           color
+                         (apply original-face-foreground face args))))
+                    ((symbol-function 'chomp-render-full-reset)
+                     (lambda (render)
+                       (cl-incf resets)
+                       (push (and (cl-every #'null
+                                           chomp-render--indexed-color-cache)
+                                  (zerop (hash-table-count
+                                          chomp-render--attr-face-cache)))
+                             cleared)
+                       (funcall original-reset render))))
+            ;; Seed both caches with the old theme color.
+            (should (equal "#111111" (chomp-render--color-to-string 1)))
+            (chomp-render--attr-to-face (make-chomp-attr :fg 1))
+            (should (> (hash-table-count chomp-render--attr-face-cache) 0))
+            (setq color "#222222")
+            ;; Invoke the Emacs 29+ hook callback.
+            (chomp-render--theme-changed 'test-theme)
+            (should (= 2 resets))
+            (should (memq t cleared))
+            (should (equal "#222222" (chomp-render--color-to-string 1)))
+            ;; Exercise the Emacs 28 load-theme advice callback too.
+            (setq color "#333333" cleared nil)
+            (chomp-render--after-load-theme)
+            (should (= 4 resets))
+            (should (memq t cleared))
+            (should (equal "#333333" (chomp-render--color-to-string 1)))))
+      (mapc (lambda (buffer)
+              (when (buffer-live-p buffer) (kill-buffer buffer)))
+            buffers))))
+
+(ert-deftest chomp-test-render-theme-hook-installation-paths ()
+  "Theme invalidation installs the modern hook and Emacs 28 advice fallback."
+  (let ((original-boundp (symbol-function 'boundp))
+        hook advice)
+    (cl-letf (((symbol-function 'boundp)
+               (lambda (symbol)
+                 (if (eq symbol 'enable-theme-functions)
+                     t
+                   (funcall original-boundp symbol))))
+              ((symbol-function 'add-hook)
+               (lambda (symbol function &rest _)
+                 (setq hook (list symbol function)))))
+      (chomp-render--install-theme-invalidation))
+    (should (equal '(enable-theme-functions chomp-render--theme-changed)
+                   hook))
+    (cl-letf (((symbol-function 'boundp)
+               (lambda (symbol)
+                 (if (eq symbol 'enable-theme-functions)
+                     nil
+                   (funcall original-boundp symbol))))
+              ((symbol-function 'advice-member-p) (lambda (&rest _) nil))
+              ((symbol-function 'advice-add)
+               (lambda (symbol where function &rest _)
+                 (setq advice (list symbol where function)))))
+      (chomp-render--install-theme-invalidation))
+    (should (equal '(load-theme :after chomp-render--after-load-theme)
+                   advice))))
+
 (ert-deftest chomp-test-render-attr-to-face ()
   "Attribute to face conversion works."
   ;; Default attr -> nil
