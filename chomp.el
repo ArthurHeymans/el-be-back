@@ -286,6 +286,41 @@ normal terminal input handling or appear in `view-lossage'."
       (funcall chomp--mouse-drag-transient-map-exit)
       (setq chomp--mouse-drag-transient-map-exit nil))))
 
+;;;; ---- Display Commands -----------------------------------------------
+
+(defun chomp--clear-screen (scrollback)
+  "Clear the viewport, and history too when SCROLLBACK is non-nil."
+  (chomp--require-running-terminal)
+  (chomp-screen-cursor-goto chomp--screen 0 0)
+  (chomp-screen-erase-in-display chomp--screen 2)
+  (when scrollback
+    (chomp-screen-erase-in-display chomp--screen 3))
+  (when chomp--render
+    (chomp-render-refresh chomp--render))
+  (chomp-send-key "l" "control"))
+
+;;;###autoload
+(defun chomp-clear ()
+  "Clear the viewport, retaining scrollback, and request a prompt redraw."
+  (interactive)
+  (chomp--clear-screen nil))
+
+;;;###autoload
+(defun chomp-clear-scrollback ()
+  "Clear the viewport and scrollback, then request a prompt redraw."
+  (interactive)
+  (chomp--clear-screen t))
+
+;;;###autoload
+(defun chomp-copy-all ()
+  "Copy all terminal scrollback and viewport text to the kill ring."
+  (interactive)
+  (unless (and (eq major-mode 'chomp-mode) chomp--screen)
+    (user-error "Not in a Chomp buffer"))
+  (let ((text (chomp-screen-plain-text chomp--screen)))
+    (kill-new text)
+    text))
+
 ;;;; ---- Process Management Commands ------------------------------------
 
 (defun chomp-kill-process ()

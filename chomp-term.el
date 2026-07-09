@@ -1457,6 +1457,31 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
   "Invoke G0 character set (SI)."
   (setf (chomp-screen-charset-active screen) 'g0))
 
+;;;; ---- Plain Text -----------------------------------------------------
+
+(defun chomp--line-plain-text (line width)
+  "Return LINE as plain text with terminal padding removed."
+  (let ((cells (chomp--line-ensure-cells line width))
+        chars)
+    (dotimes (i width)
+      (let ((cell (aref cells i)))
+        (unless (zerop (chomp-cell-width cell))
+          (push (chomp-cell-char cell) chars))))
+    (string-trim-right (apply #'string (nreverse chars)))))
+
+(defun chomp-screen-plain-text (screen)
+  "Return scrollback and viewport text from SCREEN.
+Rows joined by a soft wrap have no intervening newline."
+  (let* ((width (chomp-screen-width screen))
+         (lines (append (chomp-screen-scrollback-lines-raw screen)
+                        (append (chomp--ordered-lines-vector screen) nil)))
+         parts)
+    (dolist (line lines)
+      (push (chomp--line-plain-text line width) parts)
+      (unless (chomp-line-wrapped line)
+        (push "\n" parts)))
+    (string-trim-right (apply #'concat (nreverse parts)))))
+
 ;;;; ---- Query ----------------------------------------------------------
 
 (defun chomp-screen-get-line (screen row)

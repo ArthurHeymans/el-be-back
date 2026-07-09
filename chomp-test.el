@@ -1110,6 +1110,51 @@ Binds `screen' and `parser' in BODY."
     (should (equal '("printf" "%s" "unchanged")
                    (start '("printf" "%s" "unchanged") nil)))))
 
+;;;; ---- Clear and Copy Tests -------------------------------------------
+
+(ert-deftest chomp-test-clear-and-clear-scrollback ()
+  "Clear commands erase the viewport, optionally history, and redraw prompt."
+  (dolist (clear '((chomp-clear . nil) (chomp-clear-scrollback . t)))
+    (let* ((screen (chomp-screen-create 5 2))
+           (parser (chomp-parse-create screen))
+           redraw)
+      (chomp-test-output parser "abc\r\ndef")
+      (setf (chomp-screen-scrollback screen)
+            (list (make-chomp-line :text "old  " :cells-valid nil)))
+      (setf (chomp-screen-scrollback-length screen) 1)
+      (with-temp-buffer
+        (setq major-mode 'chomp-mode)
+        (setq-local chomp--screen screen)
+        (setq-local chomp--io (make-chomp-io :process 'fake))
+        (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                  ((symbol-function 'chomp-send-key)
+                   (lambda (key modifiers) (setq redraw (list key modifiers)))))
+          (funcall (car clear))))
+      (should (equal '(0 . 0) (chomp-test-cursor screen)))
+      (should (equal '("" "") (chomp-test-display-text screen)))
+      (should (equal '("l" "control") redraw))
+      (if (cdr clear)
+          (should-not (chomp-screen-scrollback screen))
+        (should (= 1 (chomp-screen-scrollback-length screen)))))))
+
+(ert-deftest chomp-test-copy-all-plain-text-soft-wraps ()
+  "Copy-all trims padding and omits newlines across soft-wrapped rows."
+  (let* ((screen (chomp-screen-create 4 3))
+         (parser (chomp-parse-create screen))
+         copied)
+    (chomp-test-output parser "abcdE\r\nlast")
+    (setf (chomp-screen-scrollback screen)
+          (list (make-chomp-line :text "old " :cells-valid nil)))
+    (setf (chomp-screen-scrollback-length screen) 1)
+    (should (equal "old\nabcdE\nlast" (chomp-screen-plain-text screen)))
+    (with-temp-buffer
+      (setq major-mode 'chomp-mode)
+      (setq-local chomp--screen screen)
+      (cl-letf (((symbol-function 'kill-new)
+                 (lambda (text &optional _) (setq copied text))))
+        (should (equal "old\nabcdE\nlast" (chomp-copy-all)))))
+    (should (equal "old\nabcdE\nlast" copied))))
+
 ;;;; ---- Session Tests --------------------------------------------------
 
 (defun chomp-test--session-buffer (name &optional identity)
