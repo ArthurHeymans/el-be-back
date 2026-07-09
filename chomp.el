@@ -475,6 +475,8 @@ normal terminal input handling or appear in `view-lossage'."
   (setq-local bidi-paragraph-direction 'left-to-right)
   (setq-local show-trailing-whitespace nil)
   (setq-local display-line-numbers nil)
+  (setq-local mode-line-process
+              '(" " (:eval (chomp--mode-line-input-mode))))
   ;; Set up shell integration margins
   (chomp-shell-setup-margins)
   ;; Add resize hook

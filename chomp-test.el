@@ -1110,6 +1110,25 @@ Binds `screen' and `parser' in BODY."
     (should (equal '("printf" "%s" "unchanged")
                    (start '("printf" "%s" "unchanged") nil)))))
 
+;;;; ---- Mode Line Tests ------------------------------------------------
+
+(ert-deftest chomp-test-mode-line-input-mode-installed ()
+  "Chomp mode keeps its major-mode name and updates the input-mode label."
+  (with-temp-buffer
+    (chomp-mode)
+    (should (equal "Chomp" mode-name))
+    (should (equal '(" " (:eval (chomp--mode-line-input-mode)))
+                   mode-line-process))
+    (chomp-semi-char-mode)
+    (should (equal "[Semi]" (chomp--mode-line-input-mode)))
+    (should (equal "Chomp" mode-name))
+    (chomp-char-mode)
+    (should (equal "[Char]" (chomp--mode-line-input-mode)))
+    (should (equal "Chomp" mode-name))
+    (chomp-emacs-mode)
+    (should (equal "[Emacs]" (chomp--mode-line-input-mode)))
+    (should (equal "Chomp" mode-name))))
+
 ;;;; ---- Clear and Copy Tests -------------------------------------------
 
 (ert-deftest chomp-test-clear-and-clear-scrollback ()
