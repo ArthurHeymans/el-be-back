@@ -221,33 +221,29 @@ EXTRA-ENV is the env var list (used to find integration dir)."
 If `chomp-enable-shell-integration' is non-nil and an integration
 script is available, wraps the command to source it.
 EXTRA-ENV is the env var list (used to find integration dir)."
-  (if (listp shell-command)
-      shell-command
-    (let* ((shell-type (chomp-io--detect-shell shell-command))
-           (script (when chomp-enable-shell-integration
-                     (chomp-io--integration-script shell-type extra-env))))
-      (pcase shell-type
-        ;; Fish: set up XDG_CONFIG_HOME to auto-source integration
-        ('fish
-         (if script
-             (progn
-               (chomp-io--fish-setup-confd script)
-               (list shell-command))
-           (list shell-command)))
-        ;; Bash: --rcfile with a wrapper that sources .bashrc then integration
-        ('bash
-         (if script
-             (list shell-command "--rcfile"
-                   (chomp-io--bash-rcfile script))
-           (list shell-command)))
-        ;; Zsh: use ZDOTDIR with a wrapper .zshrc
-        ('zsh
-         ;; For zsh, just run it; the env var + TERM check in the script
-         ;; handles it if the user has sourced it in .zshrc
-         ;; TODO: auto-inject via ZDOTDIR wrapper
-         (list shell-command))
-        ;; Unknown shell: just run it
-        (_ (list shell-command))))))
+  (let* ((command (if (listp shell-command)
+                      shell-command
+                    (list shell-command)))
+         (program (car command))
+         (args (cdr command))
+         (shell-type (chomp-io--detect-shell command))
+         (script (when chomp-enable-shell-integration
+                   (chomp-io--integration-script shell-type extra-env))))
+    (pcase shell-type
+      ;; Fish: set up XDG_CONFIG_HOME to auto-source integration.
+      ('fish
+       (when script
+         (chomp-io--fish-setup-confd script))
+       command)
+      ;; Bash: --rcfile must precede user-provided short options.
+      ('bash
+       (if script
+           (append (list program "--rcfile" (chomp-io--bash-rcfile script))
+                   args)
+         command))
+      ;; Zsh integration is sourced by the user's .zshrc for now.
+      ('zsh command)
+      (_ command))))
 
 (defun chomp-io--wrap-command-with-stty (command rows columns)
   "Wrap COMMAND to initialize PTY termios before exec.

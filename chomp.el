@@ -431,9 +431,10 @@ or `$SHELL'."
                                  (or chomp-default-shell
                                      (getenv "SHELL")
                                      shell-file-name))))
-        (when (string-match-p "\\`[[:space:]]*\\'" command)
-          (user-error "Program cannot be empty"))
-        (split-string-shell-command command)))
+        (let ((argv (split-string-shell-command command)))
+          (when (or (null argv) (string-empty-p (car argv)))
+            (user-error "Program cannot be empty"))
+          argv)))
      (t nil))))
   ;; With numeric prefix: switch to Nth chomp buffer
   (when (and (numberp current-prefix-arg) (not program))

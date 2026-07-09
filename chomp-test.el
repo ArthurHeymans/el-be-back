@@ -806,6 +806,26 @@ Binds `screen' and `parser' in BODY."
         (chomp-send-password "secret")))
     (should (equal '("\r" "secret") sent))))
 
+(ert-deftest chomp-test-io-list-command-keeps-shell-integration ()
+  "Shell argv from the program prompt retains startup integration."
+  (let* ((dir (make-temp-file "chomp-integration-" t))
+         (script (expand-file-name "bash" dir))
+         (env (list (concat "CHOMP_SHELL_INTEGRATION_DIR=" dir)))
+         command)
+    (unwind-protect
+        (progn
+          (with-temp-file script (insert "# integration\n"))
+          (let ((chomp-enable-shell-integration t))
+            (setq command
+                  (chomp-io--build-command '("/bin/bash" "-i") env)))
+          (should (equal "/bin/bash" (nth 0 command)))
+          (should (equal "--rcfile" (nth 1 command)))
+          (should (file-exists-p (nth 2 command)))
+          (should (equal "-i" (nth 3 command))))
+      (when (and command (nth 2 command))
+        (delete-file (nth 2 command)))
+      (delete-directory dir t))))
+
 (ert-deftest chomp-test-io-command-sets-stty-sane ()
   "PTY command wrapper initializes terminal settings like Eat."
   (let ((cmd (chomp-io--wrap-command-with-stty '("/bin/sh") 24 80)))
@@ -1052,6 +1072,7 @@ Binds `screen' and `parser' in BODY."
     (should (equal '("printf" "%s %s" "a" "b")
                    (start "printf '%s %s' a b" t)))
     (should-error (start "   " t) :type 'user-error)
+    (should-error (start "''" t) :type 'user-error)
     (should (equal "/tmp/program with spaces"
                    (start "/tmp/program with spaces" nil)))
     (should (equal '("printf" "%s" "unchanged")
