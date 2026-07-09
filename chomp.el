@@ -19,6 +19,7 @@
 
 (require 'cl-lib)
 (require 'project)
+(require 'bookmark)
 (require 'chomp-term)
 (require 'chomp-parse)
 (require 'chomp-render)
@@ -526,6 +527,7 @@ normal terminal input handling or appear in `view-lossage'."
   (setq-local bidi-paragraph-direction 'left-to-right)
   (setq-local show-trailing-whitespace nil)
   (setq-local display-line-numbers nil)
+  (setq-local bookmark-make-record-function #'chomp-bookmark-make-record)
   (setq-local imenu-create-index-function #'chomp-shell-imenu-create-index)
   (setq-local imenu-default-goto-function #'chomp-shell-imenu-goto)
   (setq-local mode-line-process
@@ -732,6 +734,45 @@ or `$SHELL'."
                (project-root proj))
              default-directory)))
     (chomp-other-window)))
+
+;;;; ---- Bookmarks ------------------------------------------------------
+
+(defun chomp-bookmark-make-record ()
+  "Return a bookmark record for the current local terminal session."
+  (when (file-remote-p default-directory)
+    (user-error "Remote Chomp bookmarks are unsupported"))
+  (cons (buffer-name)
+        `((handler . chomp-bookmark-jump)
+          (chomp-directory . ,default-directory)
+          (chomp-display-name . ,(buffer-name))
+          (chomp-session-id . ,chomp--session-id))))
+
+(defun chomp--bookmark-property (record property)
+  "Return custom PROPERTY from bookmark RECORD."
+  (alist-get property (if (stringp (car-safe record)) (cdr record) record)))
+
+(defun chomp-bookmark-jump (record)
+  "Jump to the terminal session described by bookmark RECORD."
+  (let* ((directory (chomp--bookmark-property record 'chomp-directory))
+         (display-name (chomp--bookmark-property record 'chomp-display-name))
+         (identity (chomp--bookmark-property record 'chomp-session-id)))
+    (when (or (null directory) (file-remote-p directory))
+      (user-error "Remote Chomp bookmarks are unsupported"))
+    (let ((buffer (chomp--find-session identity)))
+      (if buffer
+          (with-current-buffer buffer
+            (unless (file-equal-p default-directory directory)
+              (chomp-send-string
+               (concat "cd "
+                       (shell-quote-argument (directory-file-name directory))))
+              (chomp-send-key "return")))
+        (let ((default-directory directory)
+              (chomp-buffer-name (or display-name chomp-buffer-name)))
+          (setq buffer (chomp))
+          (with-current-buffer buffer
+            (setq chomp--session-id identity))))
+      (pop-to-buffer-same-window buffer)
+      buffer)))
 
 ;;;; ---- Mode Line ------------------------------------------------------
 

@@ -1404,6 +1404,93 @@ Binds `screen' and `parser' in BODY."
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory root t))))
 
+;;;; ---- Bookmark Tests -------------------------------------------------
+
+(ert-deftest chomp-test-bookmark-record-and-renamed-session-reuse ()
+  "Bookmark records retain session metadata and reuse renamed buffers."
+  (let* ((directory (file-name-as-directory
+                     (make-temp-file "chomp-bookmark-" t)))
+         (buffer (generate-new-buffer "*bookmark-terminal*"))
+         record)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq-local default-directory directory)
+            (chomp-mode)
+            (setq-local chomp--session-id "stable-id")
+            (should (eq #'chomp-bookmark-make-record
+                        bookmark-make-record-function))
+            (setq record (chomp-bookmark-make-record))
+            (rename-buffer "*renamed-terminal*"))
+          (should (equal "*bookmark-terminal*" (car record)))
+          (should (equal directory
+                         (alist-get 'chomp-directory (cdr record))))
+          (should (equal "*bookmark-terminal*"
+                         (alist-get 'chomp-display-name (cdr record))))
+          (should (equal "stable-id"
+                         (alist-get 'chomp-session-id (cdr record))))
+          (cl-letf (((symbol-function 'pop-to-buffer-same-window) #'identity))
+            (should (eq buffer (chomp-bookmark-jump (cdr record))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest chomp-test-bookmark-creates-missing-session-in-directory ()
+  "A missing bookmarked session is recreated in its saved directory."
+  (let* ((directory (file-name-as-directory
+                     (make-temp-file "chomp-bookmark-new-" t)))
+         (record `((chomp-directory . ,directory)
+                   (chomp-display-name . "*saved-terminal*")
+                   (chomp-session-id . "missing-id")))
+         created seen-directory seen-name)
+    (unwind-protect
+        (cl-letf (((symbol-function 'chomp)
+                   (lambda (&optional _)
+                     (setq seen-directory default-directory
+                           seen-name chomp-buffer-name
+                           created (chomp-test--session-buffer seen-name))))
+                  ((symbol-function 'pop-to-buffer-same-window) #'identity))
+          (let ((result (chomp-bookmark-jump record)))
+            (should (eq created result)))
+          (should (equal directory seen-directory))
+          (should (equal "*saved-terminal*" seen-name))
+          (should (equal "missing-id"
+                         (buffer-local-value 'chomp--session-id created))))
+      (when (buffer-live-p created) (kill-buffer created))
+      (delete-directory directory t))))
+
+(ert-deftest chomp-test-bookmark-reused-session-changes-directory ()
+  "Reusing a local session sends a quoted cd and Return via public input."
+  (let* ((old-directory (file-name-as-directory
+                         (make-temp-file "chomp-bookmark-old-" t)))
+         (directory (file-name-as-directory
+                     (make-temp-file "chomp bookmark new-" t)))
+         (buffer (chomp-test--session-buffer "*bookmark-reuse*" "reuse-id"))
+         (record `((chomp-directory . ,directory)
+                   (chomp-display-name . "*saved*")
+                   (chomp-session-id . "reuse-id")))
+         calls)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq-local default-directory old-directory))
+          (cl-letf (((symbol-function 'chomp-send-string)
+                     (lambda (string) (push (list 'string string) calls)))
+                    ((symbol-function 'chomp-send-key)
+                     (lambda (key &optional modifiers)
+                       (push (list 'key key modifiers) calls)))
+                    ((symbol-function 'pop-to-buffer-same-window) #'identity))
+            (should (eq buffer (chomp-bookmark-jump record))))
+          (should (equal
+                   `((key "return" nil)
+                     (string ,(concat
+                               "cd "
+                               (shell-quote-argument
+                                (directory-file-name directory)))))
+                   calls)))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory old-directory t)
+      (delete-directory directory t))))
+
 ;;;; ---- Shell Integration Tests ----------------------------------------
 
 (require 'chomp-shell)
