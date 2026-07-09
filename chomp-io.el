@@ -216,6 +216,31 @@ EXTRA-ENV is the env var list (used to find integration dir)."
               (f (expand-file-name name dir)))
     (when (file-exists-p f) f)))
 
+(defun chomp-io--environment-value (name environment)
+  "Return NAME's value from ENVIRONMENT, a list of NAME=VALUE strings."
+  (let ((prefix (concat name "=")))
+    (cl-loop for entry in environment
+             when (string-prefix-p prefix entry)
+             return (substring entry (length prefix)))))
+
+(defun chomp-io--prepare-environment (shell-command extra-env)
+  "Prepare EXTRA-ENV for SHELL-COMMAND startup integration."
+  (let* ((shell-type (chomp-io--detect-shell shell-command))
+         (script (and chomp-enable-shell-integration
+                      (chomp-io--integration-script shell-type extra-env))))
+    (if (and (eq shell-type 'zsh) script)
+        (let* ((environment (append extra-env process-environment))
+               (old-zdotdir (or (chomp-io--environment-value
+                                  "ZDOTDIR" environment)
+                                 ""))
+               (bootstrap (expand-file-name
+                           "zsh-bootstrap"
+                           (file-name-directory script))))
+          (append (list (concat "ZDOTDIR=" bootstrap)
+                        (concat "CHOMP_ZSH_ZDOTDIR=" old-zdotdir))
+                  extra-env))
+      extra-env)))
+
 (defun chomp-io--build-command (shell-command extra-env)
   "Build a process command list for SHELL-COMMAND.
 If `chomp-enable-shell-integration' is non-nil and an integration
@@ -302,7 +327,8 @@ on startup.  We create a symlink there pointing to our integration script."
   "Start a terminal process running SHELL-COMMAND in BUFFER.
 EXTRA-ENV is an optional list of \"VAR=VALUE\" strings to add to
 the process environment."
-  (let* ((screen (chomp-io-screen io))
+  (let* ((extra-env (chomp-io--prepare-environment shell-command extra-env))
+         (screen (chomp-io-screen io))
          (w (chomp-screen-width screen))
          (h (chomp-screen-height screen))
          ;; Environment

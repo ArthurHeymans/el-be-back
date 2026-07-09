@@ -887,6 +887,59 @@ Binds `screen' and `parser' in BODY."
         (delete-file (nth 2 command)))
       (delete-directory dir t))))
 
+(ert-deftest chomp-test-io-zsh-bootstrap-environment ()
+  "Zsh integration prepends bootstrap environment without changing argv."
+  (let* ((dir (make-temp-file "chomp-zsh-integration-" t))
+         (script (expand-file-name "zsh" dir))
+         (env (list (concat "CHOMP_SHELL_INTEGRATION_DIR=" dir)))
+         (command '("/bin/zsh" "-i" "--no-rcs")))
+    (unwind-protect
+        (progn
+          (with-temp-file script (insert "# integration\n"))
+          (let ((process-environment '("ZDOTDIR=/user/zsh"))
+                (chomp-enable-shell-integration t))
+            (let ((prepared (chomp-io--prepare-environment command env)))
+              (should (equal (concat "ZDOTDIR="
+                                     (expand-file-name "zsh-bootstrap" dir))
+                             (car prepared)))
+              (should (equal "CHOMP_ZSH_ZDOTDIR=/user/zsh"
+                             (cadr prepared)))
+              (should (equal command (chomp-io--build-command command env)))))
+          (let ((chomp-enable-shell-integration nil))
+            (should (equal env (chomp-io--prepare-environment command env)))
+            (should (equal command (chomp-io--build-command command env)))))
+      (delete-directory dir t))))
+
+(ert-deftest chomp-test-io-zsh-bootstrap-subprocess ()
+  "Bundled zsh bootstrap sources user startup files and emits OSC 51."
+  (skip-unless (executable-find "zsh"))
+  (let* ((home (make-temp-file "chomp-zsh-home-" t))
+         (zsh (executable-find "zsh"))
+         (process-environment (copy-sequence process-environment))
+         (extra-env (chomp-shell-env-vars)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name ".zshenv" home)
+            (insert "print USER_ZSHENV\n"))
+          (with-temp-file (expand-file-name ".zshrc" home)
+            (insert "print USER_ZSHRC\n"))
+          (setenv "HOME" home)
+          (setenv "TERM" "eat-truecolor")
+          (setenv "ZDOTDIR" nil)
+          (setq process-environment
+                (append (chomp-io--prepare-environment
+                         (list zsh "-i") extra-env)
+                        process-environment))
+          (with-temp-buffer
+            (insert "exit\n")
+            (let ((status (call-process-region
+                           (point-min) (point-max) zsh t t nil "-i")))
+              (should (zerop status)))
+            (should (string-match-p "USER_ZSHENV" (buffer-string)))
+            (should (string-match-p "USER_ZSHRC" (buffer-string)))
+            (should (string-match-p "\e]51;e;" (buffer-string)))))
+      (delete-directory home t))))
+
 (ert-deftest chomp-test-io-command-sets-stty-sane ()
   "PTY command wrapper initializes terminal settings like Eat."
   (let ((cmd (chomp-io--wrap-command-with-stty '("/bin/sh") 24 80)))
