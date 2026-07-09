@@ -31,6 +31,10 @@ Binds `screen' and `parser' in BODY."
   "Feed STR through PARSER."
   (chomp-parse-bytes parser str))
 
+(defun chomp-test-base64 (string)
+  "Return STRING encoded as UTF-8 base64."
+  (base64-encode-string (encode-coding-string string 'utf-8) t))
+
 (defun chomp-test-display-line (screen row)
   "Return the text content of display line ROW as a string."
   (let* ((line (chomp-screen-get-line screen row))
@@ -1436,6 +1440,42 @@ Binds `screen' and `parser' in BODY."
       (let ((cmd-b64 (base64-encode-string "ls -la" t)))
         (chomp-shell-handle-osc51 (concat "e;F;" cmd-b64) nil)
         (should (equal "ls -la" chomp-shell--current-command))))))
+
+(ert-deftest chomp-test-shell-message-default-deny ()
+  "OSC 51 messages do nothing with the default nil whitelist."
+  (should-not (default-value 'chomp-shell-message-handler-alist))
+  (let ((called nil)
+        (payload (format "e;M;%s;%s"
+                         (base64-encode-string "handler" t)
+                         (base64-encode-string "argument" t))))
+    (with-temp-buffer
+      (let ((chomp-shell-message-handler-alist nil))
+        (chomp-shell-handle-osc51 payload nil)))
+    (should-not called)))
+
+(ert-deftest chomp-test-shell-message-whitelist ()
+  "Only valid named OSC 51 messages invoke decoded handlers."
+  (let (calls)
+    (with-temp-buffer
+      (let ((chomp-shell-message-handler-alist
+             `(("allowed" . ,(lambda (&rest args) (push args calls)))
+               ("error" . ,(lambda (&rest _) (error "handler failed"))))))
+        (chomp-shell-handle-osc51
+         (format "e;M;%s;%s;%s"
+                 (base64-encode-string "allowed" t)
+                 (chomp-test-base64 "héllo")
+                 (chomp-test-base64 "世界")) nil)
+        (chomp-shell-handle-osc51
+         (format "e;M;%s;%s" (base64-encode-string "unknown" t)
+                 (base64-encode-string "ignored" t)) nil)
+        (chomp-shell-handle-osc51 "e;M;not-base64" nil)
+        (chomp-shell-handle-osc51
+         (format "e;M;%s" (base64-encode-string "error" t)) nil)
+        ;; A failed handler must not prevent the next message from parsing.
+        (chomp-shell-handle-osc51
+         (format "e;M;%s;%s" (base64-encode-string "allowed" t)
+                 (base64-encode-string "after" t)) nil)))
+    (should (equal '(("after") ("héllo" "世界")) calls))))
 
 (ert-deftest chomp-test-shell-osc51-cwd ()
   "OSC 51 CWD tracking decodes base64 host and path."

@@ -68,6 +68,11 @@ Either `left-margin' or `right-margin'."
   :type 'string
   :group 'chomp-shell)
 
+(defcustom chomp-shell-message-handler-alist nil
+  "Whitelist mapping shell message names to handler functions."
+  :type '(alist :key-type string :value-type function)
+  :group 'chomp-shell)
+
 ;;;; ---- Faces ----------------------------------------------------------
 
 (defface chomp-shell-prompt-annotation-running
@@ -238,10 +243,22 @@ ARGS is (STATUS-STRING)."
     (setq chomp-shell--command-status
           (string-to-number (car args)))))
 
-(defun chomp-shell--handle-message (_args)
-  "Handle user message (M sequence).
-Currently a no-op; can be extended for custom shell-to-Emacs messages."
-  nil)
+(defun chomp-shell--handle-message (args)
+  "Decode ARGS and invoke an explicitly whitelisted message handler."
+  (when args
+    (let* ((decoded (mapcar #'chomp-shell--base64-decode args))
+           (handler (and (not (memq nil decoded))
+                         (assoc (car decoded)
+                                chomp-shell-message-handler-alist))))
+      (when handler
+        (condition-case error-data
+            (save-restriction
+              (widen)
+              (save-excursion
+                (apply (cdr handler) (cdr decoded))))
+          (error
+           (message "[chomp-shell] Message handler error: %S" error-data)
+           nil))))))
 
 ;;;; ---- Post-Render Processing -----------------------------------------
 
