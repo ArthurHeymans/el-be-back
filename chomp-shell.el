@@ -37,7 +37,7 @@
   :group 'chomp
   :prefix "chomp-shell-")
 
-(defcustom chomp-enable-shell-prompt-annotation t
+(defcustom chomp-enable-shell-prompt-annotation nil
   "If non-nil, annotate shell prompts with status indicators."
   :type 'boolean
   :group 'chomp-shell)
