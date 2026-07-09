@@ -706,6 +706,67 @@ Binds `screen' and `parser' in BODY."
       (should (member "\e]4;0;rgb:0000/0000/0000\e\\" responses))
       (should (member "\e]4;15;rgb:ffff/ffff/ffff\e\\" responses)))))
 
+(ert-deftest chomp-test-osc-52-disabled ()
+  "OSC 52 has no clipboard or event side effects by default."
+  (should-not (default-value 'chomp-enable-osc52))
+  (let* ((screen (chomp-screen-create 20 6))
+         responses events clipboard-calls kill-calls
+         (kill-ring '("keep"))
+         (parser
+          (chomp-parse-create
+           screen
+           (lambda (response) (push response responses))
+           (lambda (type &rest args) (push (cons type args) events)))))
+    (cl-letf (((symbol-function 'gui-get-selection)
+               (lambda (&rest _)
+                 (push 'get clipboard-calls)
+                 "clipboard"))
+              ((symbol-function 'gui-set-selection)
+               (lambda (&rest args) (push args clipboard-calls)))
+              ((symbol-function 'current-kill)
+               (lambda (&rest _)
+                 (push 'get kill-calls)
+                 "kill"))
+              ((symbol-function 'kill-new)
+               (lambda (&rest args) (push args kill-calls))))
+      (let ((chomp-enable-osc52 nil))
+        (chomp-test-output parser "\e]52;c;?\a")
+        (chomp-test-output
+         parser (concat "\e]52;c;" (base64-encode-string "set" t) "\a"))
+        (chomp-test-output parser "\e]52;c;\a")))
+    (should-not responses)
+    (should-not events)
+    (should-not clipboard-calls)
+    (should-not kill-calls)
+    (should (equal '("keep") kill-ring))))
+
+(ert-deftest chomp-test-osc-52-enabled ()
+  "Opting in restores OSC 52 query and set behavior."
+  (let* ((screen (chomp-screen-create 20 6))
+         responses events selections kills
+         (parser
+          (chomp-parse-create
+           screen
+           (lambda (response) (push response responses))
+           (lambda (type &rest args) (push (cons type args) events)))))
+    (cl-letf (((symbol-function 'gui-get-selection)
+               (lambda (&rest _) "clipboard"))
+              ((symbol-function 'gui-set-selection)
+               (lambda (selection value)
+                 (push (list selection value) selections)))
+              ((symbol-function 'kill-new)
+               (lambda (text &optional _replace) (push text kills))))
+      (let ((chomp-enable-osc52 t))
+        (chomp-test-output parser "\e]52;c;?\a")
+        (should (equal (format "\e]52;c;%s\e\\"
+                               (base64-encode-string "clipboard" t))
+                       (car responses)))
+        (chomp-test-output
+         parser (concat "\e]52;c;" (base64-encode-string "set" t) "\a"))))
+    (should (equal '("set") kills))
+    (should (equal '((CLIPBOARD "set")) selections))
+    (should (equal '((clipboard "set")) events))))
+
 (ert-deftest chomp-test-input-backspace-variants ()
   "Input translation handles backspace modifier variants."
   (let ((screen (chomp-screen-create 80 24)))

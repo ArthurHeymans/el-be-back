@@ -17,6 +17,11 @@
 (require 'cl-lib)
 (require 'chomp-term)
 
+(defcustom chomp-enable-osc52 nil
+  "If non-nil, allow terminal output to access the clipboard via OSC 52."
+  :type 'boolean
+  :group 'chomp)
+
 ;;;; ---- Data Structures ------------------------------------------------
 
 (cl-defstruct (chomp-parser (:copier nil))
@@ -1164,7 +1169,8 @@ Palette-setting requests are ignored."
 PAYLOAD format: TARGET;BASE64-DATA
 TARGET is one or more of: c (clipboard), p (primary), s (secondary), etc.
 If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
-  (when (string-match "\\`\\([^;]*\\);\\(.*\\)\\'" payload)
+  (when (and chomp-enable-osc52
+             (string-match "\\`\\([^;]*\\);\\(.*\\)\\'" payload))
     (let ((_target (match-string 1 payload))
           (data (match-string 2 payload)))
       (cond
