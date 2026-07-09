@@ -453,6 +453,35 @@ Binds `screen' and `parser' in BODY."
     (chomp-test-output parser "\e]2;My Title\e\\")
     (should (equal "My Title" (chomp-screen-title screen)))))
 
+(ert-deftest chomp-test-parse-osc-notifications ()
+  "OSC 9 and 777 emit only valid normalized notifications."
+  (chomp-test-with-screen (:width 20 :height 6)
+    (let (events)
+      (setf (chomp-parser-emit-fn parser)
+            (lambda (type &rest args) (push (cons type args) events)))
+      (chomp-test-output parser "\e]9;body\a")
+      (chomp-test-output parser "\e]777;notify;title;body text\a")
+      (chomp-test-output parser "\e]9;\a")
+      (chomp-test-output parser "\e]777;notify;;\a")
+      (chomp-test-output parser "\e]777;unknown;title;body\a")
+      (should (equal '((notification "title" "body text")
+                       (notification nil "body"))
+                     events)))))
+
+(ert-deftest chomp-test-parse-osc-progress ()
+  "OSC 9;4 progress states are normalized and percentages clamped."
+  (chomp-test-with-screen (:width 20 :height 6)
+    (let (events)
+      (setf (chomp-parser-emit-fn parser)
+            (lambda (type &rest args)
+              (when (eq type 'progress) (push args events))))
+      (dolist (payload '("0;0" "1;150" "2;-5" "3;42" "4;75"
+                         "5;10" "bogus"))
+        (chomp-test-output parser (format "\e]9;4;%s\a" payload)))
+      (should (equal '((pause 75) (indeterminate 42) (error 0)
+                       (set 100) (remove 0))
+                     events)))))
+
 (ert-deftest chomp-test-parse-error-recovery ()
   "Parser recovers from malformed sequences."
   (chomp-test-with-screen (:width 20 :height 6)
@@ -1109,6 +1138,57 @@ Binds `screen' and `parser' in BODY."
                    (start "/tmp/program with spaces" nil)))
     (should (equal '("printf" "%s" "unchanged")
                    (start '("printf" "%s" "unchanged") nil)))))
+
+;;;; ---- Notification Handler Tests ------------------------------------
+
+(ert-deftest chomp-test-notification-callback-deferred-in-origin-buffer ()
+  "Notification callbacks are deferred in their terminal buffer."
+  (let ((origin (generate-new-buffer " *chomp-notify-origin*"))
+        (other (generate-new-buffer " *chomp-notify-other*"))
+        timer seen)
+    (unwind-protect
+        (with-current-buffer origin
+          (let ((chomp-notification-function
+                 (lambda (title body)
+                   (setq seen (list (current-buffer) title body)))))
+            (cl-letf (((symbol-function 'run-at-time)
+                       (lambda (_time _repeat function &rest args)
+                         (setq timer (cons function args)))))
+              (chomp--handle-event 'notification "title" "body")))
+          (should-not seen)
+          (with-current-buffer other
+            (apply (car timer) (cdr timer)))
+          (should (equal (list origin "title" "body") seen)))
+      (mapc (lambda (buffer)
+              (when (buffer-live-p buffer) (kill-buffer buffer)))
+            (list origin other)))))
+
+(ert-deftest chomp-test-notification-and-progress-callback-errors-isolated ()
+  "Terminal callback failures do not escape event handling."
+  (with-temp-buffer
+    (let ((chomp-notification-function (lambda (&rest _) (error "notify")))
+          (chomp-progress-function (lambda (&rest _) (error "progress"))))
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest args)
+                   (apply function args))))
+        (should-not (chomp--handle-event 'notification nil "body"))
+        (should-not (chomp--handle-event 'progress 'set 10))))))
+
+(ert-deftest chomp-test-progress-callback-and-mode-line-compose ()
+  "Progress callbacks receive normalized args and default display composes."
+  (with-temp-buffer
+    (chomp-mode)
+    (chomp-semi-char-mode)
+    (let* (seen
+           (chomp-progress-function
+            (lambda (state percent) (setq seen (list state percent)))))
+      (chomp--handle-event 'progress 'pause 25)
+      (should (equal '(pause 25) seen)))
+    (let ((chomp-progress-function #'chomp--default-progress))
+      (chomp--handle-event 'progress 'set 80)
+      (should (equal "[Semi] [80%]" (chomp--mode-line-input-mode)))
+      (chomp--handle-event 'progress 'remove 0)
+      (should (equal "[Semi]" (chomp--mode-line-input-mode))))))
 
 ;;;; ---- Mode Line Tests ------------------------------------------------
 

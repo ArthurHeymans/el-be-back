@@ -1164,6 +1164,21 @@ Palette-setting requests are ignored."
                              index
                              (chomp-parse--palette-color-to-xterm index))))))))
 
+(defun chomp-parse--handle-progress (parser payload)
+  "Emit a normalized progress event parsed from OSC 9;4 PAYLOAD."
+  (when (string-match "\\`\\([0-4]\\);\\(-?[0-9]+\\)\\'" payload)
+    (let ((state (aref [remove set error indeterminate pause]
+                       (string-to-number (match-string 1 payload))))
+          (progress (chomp--clamp (string-to-number (match-string 2 payload))
+                                  0 100)))
+      (chomp-parse--emit parser 'progress state progress))))
+
+(defun chomp-parse--handle-osc-777 (parser payload)
+  "Emit a notification described by OSC 777 PAYLOAD."
+  (when (string-match "\\`notify;\\([^;]+\\);\\(.+\\)\\'" payload)
+    (chomp-parse--emit parser 'notification
+                       (match-string 1 payload) (match-string 2 payload))))
+
 (defun chomp-parse--handle-osc-52 (parser payload)
   "Handle OSC 52 clipboard manipulation.
 PAYLOAD format: TARGET;BASE64-DATA
@@ -1221,6 +1236,13 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
                 ;; Query palette entries
                 (4
                  (chomp-parse--handle-osc-4 parser payload))
+                ;; Desktop notification and progress.
+                (9
+                 (cond
+                  ((string-prefix-p "4;" payload)
+                   (chomp-parse--handle-progress parser (substring payload 2)))
+                  ((not (string-empty-p payload))
+                   (chomp-parse--emit parser 'notification nil payload))))
                 ;; Query foreground
                 (10
                  (when (string= payload "?")
@@ -1243,6 +1265,9 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
                 ;; Clipboard (selection manipulation)
                 (52
                  (chomp-parse--handle-osc-52 parser payload))
+                ;; rxvt notification protocol.
+                (777
+                 (chomp-parse--handle-osc-777 parser payload))
                 ;; Unknown
                 (_ (chomp-parse--log "Unknown OSC %d" num))))
           (chomp-parse--log "Malformed OSC: %s"

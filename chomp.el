@@ -26,6 +26,8 @@
 (require 'chomp-io)
 (require 'chomp-shell)
 
+(declare-function notifications-notify "notifications")
+
 ;;;; ---- Customization --------------------------------------------------
 
 (defgroup chomp nil
@@ -74,6 +76,16 @@ Options: `char', `semi-char', `emacs'."
   :type '(choice (const char) (const semi-char) (const emacs))
   :group 'chomp)
 
+(defcustom chomp-notification-function #'chomp--default-notification
+  "Function called asynchronously with notification TITLE and BODY."
+  :type '(choice (const nil) function)
+  :group 'chomp)
+
+(defcustom chomp-progress-function #'chomp--default-progress
+  "Function called with normalized progress STATE and PERCENT."
+  :type '(choice (const nil) function)
+  :group 'chomp)
+
 ;;;; ---- Buffer-local Variables -----------------------------------------
 
 (defvar-local chomp--io nil "The chomp-io instance for this buffer.")
@@ -82,6 +94,7 @@ Options: `char', `semi-char', `emacs'."
 (defvar-local chomp--render nil "The chomp-render-state for this buffer.")
 (defvar-local chomp--input-mode nil "Current input mode symbol.")
 (defvar-local chomp--session-id nil "Stable identity of this terminal session.")
+(defvar-local chomp--progress nil "Current terminal progress mode-line string.")
 (defvar-local chomp--mouse-drag-transient-map-exit nil
   "Function that exits the active mouse drag transient map.")
 
@@ -352,6 +365,39 @@ normal terminal input handling or appear in `view-lossage'."
     (chomp-emacs-mode))
   (chomp-shell-next-prompt n))
 
+;;;; ---- Notifications and Progress -------------------------------------
+
+(defun chomp--default-notification (title body)
+  "Display a desktop notification with TITLE and BODY."
+  (require 'notifications)
+  (notifications-notify :title (or title "Terminal") :body body))
+
+(defun chomp--default-progress (state percent)
+  "Display normalized progress STATE and PERCENT in the mode line."
+  (setq chomp--progress
+        (pcase state
+          ('remove nil)
+          ('set (format "[%d%%]" percent))
+          ('error (format "[Error %d%%]" percent))
+          ('indeterminate "[…]")
+          ('pause (format "[Paused %d%%]" percent))))
+  (force-mode-line-update))
+
+(defun chomp--run-callback (buffer function args)
+  "Run FUNCTION with ARGS in BUFFER, isolating callback errors."
+  (when (and (buffer-live-p buffer) function)
+    (with-current-buffer buffer
+      (condition-case error-data
+          (apply function args)
+        (error
+         (message "[chomp] Callback error: %S" error-data)
+         nil)))))
+
+(defun chomp--defer-callback (function &rest args)
+  "Run FUNCTION later in the current buffer with ARGS."
+  (run-at-time 0 nil #'chomp--run-callback
+               (current-buffer) function args))
+
 ;;;; ---- Event Handler --------------------------------------------------
 
 (defun chomp--handle-event (type &rest args)
@@ -407,6 +453,11 @@ normal terminal input handling or appear in `view-lossage'."
     ('osc-51
      (let ((payload (car args)))
        (chomp-shell-handle-osc51 payload chomp--screen)))
+    ('notification
+     (when chomp-notification-function
+       (apply #'chomp--defer-callback chomp-notification-function args)))
+    ('progress
+     (chomp--run-callback (current-buffer) chomp-progress-function args))
     ('reset nil)
     (_ nil)))
 
@@ -683,12 +734,16 @@ or `$SHELL'."
 ;;;; ---- Mode Line ------------------------------------------------------
 
 (defun chomp--mode-line-input-mode ()
-  "Return mode-line string for current input mode."
-  (pcase chomp--input-mode
-    ('char "[Char]")
-    ('semi-char "[Semi]")
-    ('emacs "[Emacs]")
-    (_ "")))
+  "Return mode-line string for current input mode and terminal progress."
+  (string-join
+   (delq nil
+         (list (pcase chomp--input-mode
+                 ('char "[Char]")
+                 ('semi-char "[Semi]")
+                 ('emacs "[Emacs]")
+                 (_ nil))
+               chomp--progress))
+   " "))
 
 ;; Add to mode-line
 (put 'chomp--input-mode 'risky-local-variable t)
