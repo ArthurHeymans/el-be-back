@@ -145,6 +145,13 @@ allowing theme/user customization."
 (defface chomp-italic  '((t :slant italic))      "Italic text."  :group 'chomp)
 (defface chomp-crossed '((t :strike-through t))  "Struck text."  :group 'chomp)
 
+(defface chomp-default
+  '((t :inherit default))
+  "Base face for default text in chomp terminal buffers.
+Customize this to give chomp buffers a different default foreground,
+background, font, or size than the rest of Emacs."
+  :group 'chomp)
+
 (defface chomp-cursor
   '((t :inverse-video t))
   "Face for the terminal cursor."
@@ -593,9 +600,11 @@ lists; falls back only when a styled cell is present."
       ;; when fg or bg is nil (matches eat's behavior)
       (when inv
         (let* ((default-fg (or (chomp-render--color-to-string fg)
+                               (face-foreground 'chomp-default nil t)
                                (face-foreground 'default nil t)
                                "#ffffff"))
                (default-bg (or (chomp-render--color-to-string bg)
+                               (face-background 'chomp-default nil t)
                                (face-background 'default nil t)
                                "#000000")))
           ;; Swap: what was foreground becomes background and vice versa
