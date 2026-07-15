@@ -678,39 +678,46 @@ lists; falls back only when a styled cell is present."
   (memq style '(:blinking-block :blinking-underline :blinking-bar)))
 
 (defun chomp-render--update-cursor (render)
-  "Update the cursor overlay position and visibility."
+  "Update the cursor overlay position and visibility.
+
+Use the real Emacs cursor when this buffer is selected; paint the
+`chomp-cursor' overlay only as a hint when the native cursor is not
+there (other window, or point moved away in emacs mode).  Always keep
+window-point on the terminal cursor in live input modes so redisplay
+does not leave a second cursor at an old column."
   (let* ((screen (chomp-render-state-screen render))
          (ov (chomp-render-state-cursor-overlay render))
          (display-begin (chomp-render-state-display-begin render))
          (cx (chomp-screen-cursor-x screen))
          (cy (chomp-screen-cursor-y screen))
          (visible (chomp-screen-cursor-visible screen))
-         (style (chomp-screen-cursor-style screen)))
+         (style (chomp-screen-cursor-style screen))
+         (emacs-mode (eq (bound-and-true-p chomp--input-mode) 'emacs)))
     (when ov
       (if (not visible)
-          ;; Hide cursor
           (progn
             (overlay-put ov 'face nil)
             (setq-local cursor-type nil))
-        ;; Position cursor
-        (save-excursion
-          (goto-char display-begin)
-          (forward-line cy)
-          (let* ((bol (point))
-                 (eol (line-end-position))
-                 (pos (min (+ bol cx) eol))
-                 (end (min (1+ pos) (point-max))))
-            (move-overlay ov pos end)
-            (overlay-put ov 'face 'chomp-cursor)))
-        ;; Set Emacs cursor-type based on terminal cursor style
-        (setq-local cursor-type (chomp-render--cursor-type-for-style style))
-        ;; Enable/disable blink
-        (if (chomp-render--cursor-blink-p style)
-            (blink-cursor-mode 1)
-          (blink-cursor-mode -1))
-        ;; Keep point on the terminal cursor except while the user is reading.
-        (unless (eq (bound-and-true-p chomp--input-mode) 'emacs)
-          (goto-char (overlay-start ov)))))))
+        (let (pos)
+          (save-excursion
+            (goto-char display-begin)
+            (forward-line cy)
+            (let* ((bol (point))
+                   (eol (line-end-position)))
+              (setq pos (min (+ bol cx) eol))
+              (move-overlay ov pos (min (1+ pos) (point-max)))))
+          (setq-local cursor-type (chomp-render--cursor-type-for-style style))
+          (if (chomp-render--cursor-blink-p style)
+              (blink-cursor-mode 1)
+            (blink-cursor-mode -1))
+          (unless emacs-mode
+            (goto-char pos)
+            (dolist (win (get-buffer-window-list nil nil t))
+              (set-window-point win pos)))
+          ;; Overlay face only when the real cursor is not already there.
+          (let* ((selected (eq (current-buffer) (window-buffer)))
+                 (at-point (and selected (= (point) pos))))
+            (overlay-put ov 'face (and (not at-point) 'chomp-cursor))))))))
 
 ;;;; ---- Invalidation ---------------------------------------------------
 
