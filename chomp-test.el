@@ -644,8 +644,17 @@ Binds `screen' and `parser' in BODY."
                    (plist-get face :inherit))))
   ;; Foreground color
   (let ((face (chomp-render--attr-to-face (make-chomp-attr :fg 1))))
-    (should (equal (face-foreground 'chomp-color-1 nil t)
-                   (plist-get face :foreground)))))
+    (should (equal (chomp-render--color-to-string 1)
+                   (plist-get face :foreground))))
+  ;; Underline styles map to Emacs underline styles
+  (let ((face (chomp-render--attr-to-face
+               (make-chomp-attr :underline 'double))))
+    (should (equal '(:style double-line) (plist-get face :underline))))
+  (let ((face (chomp-render--attr-to-face
+               (make-chomp-attr :underline 'dotted :ul-color 1))))
+    (should (eq 'dots (plist-get (plist-get face :underline) :style)))
+    (should (equal (chomp-render--color-to-string 1)
+                   (plist-get (plist-get face :underline) :color)))))
 
 ;;;; ---- Phase 2 Tests --------------------------------------------------
 

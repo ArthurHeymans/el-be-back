@@ -625,19 +625,15 @@ lists; falls back only when a styled cell is present."
           (setq face
                 (plist-put
                  face :underline
-                 (pcase ul
-                   ('line    (if ul-color `(:color ,ul-color :style line) t))
-                   ('double  (if ul-color `(:color ,ul-color :style line) t))
-                   ('curly   (if ul-color
-                                 `(:color ,ul-color :style wave)
-                               '(:style wave)))
-                   ('dotted  (if ul-color
-                                 `(:color ,ul-color :style wave)
-                               '(:style wave)))
-                   ('dashed  (if ul-color
-                                 `(:color ,ul-color :style wave)
-                               '(:style wave)))
-                   (_ t))))))
+                 (let ((style (pcase ul
+                                ('double 'double-line)
+                                ('curly  'wave)
+                                ('dotted 'dots)
+                                ('dashed 'dashes)
+                                (_ 'line))))
+                   (if (and (eq style 'line) (null ul-color))
+                       t
+                     `(:style ,style ,@(and ul-color `(:color ,ul-color)))))))))
       ;; Strikethrough
       (when (chomp-attr-crossed attr)
         (setq face (plist-put face :strike-through t)))
