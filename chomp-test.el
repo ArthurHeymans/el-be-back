@@ -391,6 +391,18 @@ Binds `screen' and `parser' in BODY."
       (should (chomp-attr-bold attr))
       (should (= 1 (chomp-attr-fg attr))))))  ; red = 1
 
+(ert-deftest chomp-test-private-csi-m-not-sgr ()
+  "CSI > 4 ; 1 m (modifyOtherKeys) must not set underline."
+  (chomp-test-with-screen (:width 20 :height 6)
+    (chomp-test-output parser "\e[>4;1m\e[1;36mchomp\e[0m")
+    (let* ((line (chomp-screen-get-line screen 0))
+           (cell (aref (chomp-line-cells line) 0))
+           (attr (chomp-cell-attr cell)))
+      (should attr)
+      (should (chomp-attr-bold attr))
+      (should (= 6 (chomp-attr-fg attr)))
+      (should-not (chomp-attr-underline attr)))))
+
 (ert-deftest chomp-test-parse-sgr-256color ()
   "Parser handles 256-color SGR."
   (chomp-test-with-screen (:width 20 :height 6)

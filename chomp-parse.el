@@ -1014,7 +1014,11 @@ Pm=1: read, Pm=4: read maximum."
 ;;;; ---- SGR Handler (Select Graphic Rendition) -------------------------
 
 (defun chomp-parse--csi-sgr (parser params)
-  "Handle SGR (CSI m) -- the most complex single CSI handler."
+  "Handle SGR (CSI m) -- the most complex single CSI handler.
+Private CSI sequences ending in `m' (e.g. CSI > 4 ; 1 m for
+modifyOtherKeys) are not SGR and must be ignored."
+  ;; Fast path already requires null private; generic dispatch does not.
+  (unless (chomp-parser-private parser)
   (let ((screen (chomp-parser-screen parser))
         (len (length params)))
     (if (zerop len)
@@ -1140,7 +1144,7 @@ Pm=1: read, Pm=4: read maximum."
               (chomp-screen-set-attr screen :bg (+ 8 (- p 100))))
              ;; Unknown -- silently skip
              (t nil)))
-          (cl-incf i))))))
+          (cl-incf i)))))))
 
 ;;;; ---- OSC Helpers ----------------------------------------------------
 
