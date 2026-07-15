@@ -680,11 +680,11 @@ lists; falls back only when a styled cell is present."
 (defun chomp-render--update-cursor (render)
   "Update the cursor overlay position and visibility.
 
-Use the real Emacs cursor when this buffer is selected; paint the
-`chomp-cursor' overlay only as a hint when the native cursor is not
-there (other window, or point moved away in emacs mode).  Always keep
-window-point on the terminal cursor in live input modes so redisplay
-does not leave a second cursor at an old column."
+The terminal cursor is drawn with the `chomp-cursor' overlay.  Live
+input modes hide the native Emacs cursor so only one caret is visible;
+point/window-point still track the terminal cell for input and yank.
+In `emacs' mode the native cursor follows point and the overlay is a
+hint at the live terminal position."
   (let* ((screen (chomp-render-state-screen render))
          (ov (chomp-render-state-cursor-overlay render))
          (display-begin (chomp-render-state-display-begin render))
@@ -706,18 +706,19 @@ does not leave a second cursor at an old column."
                    (eol (line-end-position)))
               (setq pos (min (+ bol cx) eol))
               (move-overlay ov pos (min (1+ pos) (point-max)))))
-          (setq-local cursor-type (chomp-render--cursor-type-for-style style))
-          (if (chomp-render--cursor-blink-p style)
-              (blink-cursor-mode 1)
-            (blink-cursor-mode -1))
-          (unless emacs-mode
+          (overlay-put ov 'face 'chomp-cursor)
+          (if emacs-mode
+              (setq-local cursor-type
+                          (chomp-render--cursor-type-for-style style))
+            ;; Overlay is the only caret; native cursor would lag at an
+            ;; old window-point and look like a second/wrong cursor.
+            (setq-local cursor-type nil)
             (goto-char pos)
             (dolist (win (get-buffer-window-list nil nil t))
               (set-window-point win pos)))
-          ;; Overlay face only when the real cursor is not already there.
-          (let* ((selected (eq (current-buffer) (window-buffer)))
-                 (at-point (and selected (= (point) pos))))
-            (overlay-put ov 'face (and (not at-point) 'chomp-cursor))))))))
+          (if (chomp-render--cursor-blink-p style)
+              (blink-cursor-mode 1)
+            (blink-cursor-mode -1)))))))
 
 ;;;; ---- Invalidation ---------------------------------------------------
 
