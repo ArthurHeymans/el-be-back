@@ -578,15 +578,6 @@ lists; falls back only when a styled cell is present."
       (unless inv
         (when-let ((bg-str (chomp-render--color-to-string bg)))
           (setq face (plist-put face :background bg-str))))
-      ;; Bold
-      (when (chomp-attr-bold attr)
-        (setq face (plist-put face :weight 'bold)))
-      ;; Faint
-      (when (chomp-attr-faint attr)
-        (setq face (plist-put face :weight 'light)))
-      ;; Italic
-      (when (chomp-attr-italic attr)
-        (setq face (plist-put face :slant 'italic)))
       ;; Underline
       (when-let ((ul (chomp-attr-underline attr)))
         (let ((ul-color (chomp-render--color-to-string
@@ -614,13 +605,24 @@ lists; falls back only when a styled cell is present."
       (when (chomp-attr-conceal attr)
         (let ((bg-str (or (plist-get face :background) "black")))
           (setq face (plist-put face :foreground bg-str))))
-          ;; Return as anonymous face (a plist), caching because styled terminal
-          ;; output tends to reuse a small set of attributes across many cells.
-          (when (> (hash-table-count chomp-render--attr-face-cache)
-                   chomp-render--attr-face-cache-limit)
-            (clrhash chomp-render--attr-face-cache))
-          (puthash attr face chomp-render--attr-face-cache)
-          face))))
+      ;; Bold/faint/italic/font via named faces so users can customize them.
+      ;; Font 0 is the default face; only alternate fonts (1-9) need inherit.
+      (let* ((font (chomp-attr-font attr))
+             (inherit (delq nil
+                            (list (and (chomp-attr-bold attr) 'chomp-bold)
+                                  (and (chomp-attr-faint attr) 'chomp-faint)
+                                  (and (chomp-attr-italic attr) 'chomp-italic)
+                                  (and (integerp font) (<= 1 font 9)
+                                       (aref chomp-render--font-faces font))))))
+        (when inherit
+          (setq face (plist-put face :inherit inherit))))
+      ;; Return as anonymous face (a plist), caching because styled terminal
+      ;; output tends to reuse a small set of attributes across many cells.
+      (when (> (hash-table-count chomp-render--attr-face-cache)
+               chomp-render--attr-face-cache-limit)
+        (clrhash chomp-render--attr-face-cache))
+      (puthash attr face chomp-render--attr-face-cache)
+      face))))
 
 ;;;; ---- Cursor Rendering -----------------------------------------------
 

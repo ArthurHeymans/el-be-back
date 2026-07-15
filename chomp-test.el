@@ -635,9 +635,13 @@ Binds `screen' and `parser' in BODY."
   ;; Default attr -> nil
   (should (null (chomp-render--attr-to-face nil)))
   (should (null (chomp-render--attr-to-face (make-chomp-attr))))
-  ;; Bold
+  ;; Bold/italic/font compose via :inherit named faces
   (let ((face (chomp-render--attr-to-face (make-chomp-attr :bold t))))
-    (should (eq 'bold (plist-get face :weight))))
+    (should (equal '(chomp-bold) (plist-get face :inherit))))
+  (let ((face (chomp-render--attr-to-face
+               (make-chomp-attr :bold t :italic t :font 3))))
+    (should (equal '(chomp-bold chomp-italic chomp-font-3)
+                   (plist-get face :inherit))))
   ;; Foreground color
   (let ((face (chomp-render--attr-to-face (make-chomp-attr :fg 1))))
     (should (equal "#cd0000" (plist-get face :foreground)))))
