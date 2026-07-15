@@ -955,6 +955,38 @@ Binds `screen' and `parser' in BODY."
         (chomp-send-password "secret")))
     (should (equal '("\r" "secret") sent))))
 
+(ert-deftest chomp-test-password-prompt-detect ()
+  "Cursor-row password regex detection."
+  (let ((screen (chomp-screen-create 40 3)))
+    (with-temp-buffer
+      (setq-local chomp--screen screen)
+      (setq-local chomp--io 'fake)
+      (let ((s "[sudo] password for arthur: "))
+        (chomp-screen-write-string screen s 0 (length s)))
+      (should (chomp--password-prompt-detected-p))
+      (chomp-screen-cursor-goto screen 0 1)
+      (let ((s "hello"))
+        (chomp-screen-write-string screen s 0 (length s)))
+      (should-not (chomp--password-prompt-detected-p)))))
+
+(ert-deftest chomp-test-password-prompt-send ()
+  "Detected password prompt sends via source chain."
+  (let ((screen (chomp-screen-create 40 3))
+        sent)
+    (with-temp-buffer
+      (setq-local chomp--screen screen)
+      (setq-local chomp--io 'fake)
+      (setq-local chomp-password-prompt-functions
+                  (list (lambda (_row) "secret")))
+      (cl-letf (((symbol-function 'chomp-io-send)
+                 (lambda (_io s) (push s sent))))
+        (let ((s "Password: "))
+          (chomp-screen-write-string screen s 0 (length s)))
+        (chomp--prompt-password))
+      (should (equal '("secret\r") sent))
+      (should-not chomp--password-mode-p)
+      (should (eql 0 chomp--password-handled-y)))))
+
 (ert-deftest chomp-test-public-input-api ()
   "Public input commands preserve strings and encode keys and paste mode."
   (let (sent)

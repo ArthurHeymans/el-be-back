@@ -151,7 +151,9 @@ Ensures responsiveness."
             (chomp-render-refresh (chomp-io-render io))
             ;; Post-render shell integration (prompt annotations, etc.)
             (when (fboundp 'chomp-shell-post-render)
-              (chomp-shell-post-render (chomp-io-render io)))))
+              (chomp-shell-post-render (chomp-io-render io)))
+            (when (fboundp 'chomp--detect-password-prompt)
+              (chomp--detect-password-prompt))))
 
         ;; Reset latency tracking
         (setf (chomp-io-first-chunk-time io) nil)

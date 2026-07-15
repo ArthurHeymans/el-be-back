@@ -18,6 +18,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'comint)
 (require 'project)
 (require 'bookmark)
 (require 'face-remap)
@@ -53,6 +54,29 @@ For best shell integration, set this to your interactive shell
   "If non-nil, kill the buffer when the shell process exits.
 With the default of t, Ctrl-D / shell exit closes the chomp buffer."
   :type 'boolean
+  :group 'chomp)
+
+(defcustom chomp-detect-password-prompts t
+  "If non-nil, open `read-passwd' when the cursor row looks like a password prompt."
+  :type 'boolean
+  :group 'chomp)
+
+(defcustom chomp-password-prompt-regex comint-password-prompt-regexp
+  "Regex matched against the cursor row to detect a password prompt."
+  :type 'regexp
+  :group 'chomp)
+
+(defcustom chomp-password-prompt-debounce 0.2
+  "Seconds to wait after detecting a password prompt before opening `read-passwd'."
+  :type 'number
+  :group 'chomp)
+
+(defcustom chomp-password-prompt-functions
+  '(chomp--default-password-source)
+  "Sources tried in order when a password is needed.
+Each function receives the cursor-row text (or nil) and should return a
+password string or nil to try the next source."
+  :type 'hook
   :group 'chomp)
 
 (defcustom chomp-query-before-kill 'auto
@@ -100,6 +124,15 @@ Options: `char', `semi-char', `emacs'."
 (defvar-local chomp--progress nil "Current terminal progress mode-line string.")
 (defvar-local chomp--mouse-drag-transient-map-exit nil
   "Function that exits the active mouse drag transient map.")
+
+(defvar-local chomp--password-mode-p nil
+  "Non-nil while a password prompt is active.")
+(defvar-local chomp--password-handled-y nil
+  "Display row of the last handled password prompt, or nil.")
+(defvar-local chomp--password-confirm-timer nil
+  "Pending debounce timer for password prompt detection.")
+(defvar-local chomp--password-prompt-active nil
+  "Non-nil while the password source chain is running.")
 
 (defvar chomp--focus-change-installed nil
   "Non-nil when `chomp--focus-change' is installed globally.")
@@ -268,8 +301,100 @@ normal terminal input handling or appear in `view-lossage'."
   (unless chomp--io
     (user-error "Process not running"))
   (let ((password (or password (read-passwd "Password: "))))
-    (chomp-io-send chomp--io password)
-    (chomp-io-send chomp--io "\r")))
+    (when password
+      (chomp-io-send chomp--io password)
+      (chomp-io-send chomp--io "\r"))))
+
+;;;; ---- Password prompt detection -------------------------------------
+
+(defun chomp--cursor-row-text ()
+  "Return trimmed text of the terminal cursor row, or nil."
+  (when chomp--screen
+    (let* ((y (chomp-screen-cursor-y chomp--screen))
+           (line (chomp-screen-get-line chomp--screen y))
+           (width (chomp-screen-width chomp--screen))
+           (text (or (chomp-line-text line)
+                     (and (chomp-line-cells line)
+                          (let ((cells (chomp-line-cells line))
+                                (out (make-string width ?\s)))
+                            (dotimes (i (min width (length cells)))
+                              (aset out i (chomp-cell-char (aref cells i))))
+                            out)))))
+      (when text
+        (let ((row (string-trim-right text)))
+          (and (not (string-empty-p row)) row))))))
+
+(defun chomp--password-prompt-detected-p ()
+  "Return non-nil if the cursor row matches `chomp-password-prompt-regex'."
+  (when-let* ((row (chomp--cursor-row-text))
+              (case-fold-search t))
+    (string-match-p chomp-password-prompt-regex row)))
+
+(defun chomp--default-password-source (row)
+  "Prompt with `read-passwd', labeling with ROW when available."
+  (read-passwd (concat (or row "Password:") " ")))
+
+(defun chomp--cancel-password-confirm-timer ()
+  "Cancel a pending password-prompt debounce timer."
+  (when chomp--password-confirm-timer
+    (cancel-timer chomp--password-confirm-timer)
+    (setq chomp--password-confirm-timer nil)))
+
+(defun chomp--confirm-and-prompt (buf)
+  "Re-check password detection in BUF, then open the password minibuffer."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (setq chomp--password-confirm-timer nil)
+      (when (and chomp--password-mode-p
+                 (chomp--password-prompt-detected-p))
+        (chomp--prompt-password)))))
+
+(defun chomp--prompt-password ()
+  "Run `chomp-password-prompt-functions' and send the result to the PTY."
+  (let ((pwd nil)
+        (row (chomp--cursor-row-text))
+        (y (and chomp--screen (chomp-screen-cursor-y chomp--screen))))
+    (setq chomp--password-prompt-active t)
+    (unwind-protect
+        (setq pwd (run-hook-with-args-until-success
+                   'chomp-password-prompt-functions row))
+      (setq chomp--password-prompt-active nil)
+      (when (and pwd chomp--io)
+        ;; Send before clear-string; process-send-string may keep the string.
+        (chomp-io-send chomp--io (concat pwd "\r"))
+        (clear-string pwd))
+      (setq chomp--password-handled-y y
+            chomp--password-mode-p nil)
+      (force-mode-line-update))))
+
+(defun chomp--detect-password-prompt ()
+  "Watch the cursor row and open `read-passwd' on a password prompt.
+Called after each render.  Debounced so short-lived matches don't flash."
+  (when (and chomp-detect-password-prompts chomp--screen chomp--io
+             (not (eq chomp--input-mode 'emacs))
+             (not chomp--password-prompt-active))
+    (let ((now (chomp--password-prompt-detected-p))
+          (y (chomp-screen-cursor-y chomp--screen)))
+      (cond
+       ((not now)
+        (chomp--cancel-password-confirm-timer)
+        (when (or chomp--password-mode-p chomp--password-handled-y)
+          (setq chomp--password-mode-p nil
+                chomp--password-handled-y nil)
+          (force-mode-line-update)))
+       (chomp--password-mode-p nil)
+       ((and chomp--password-handled-y
+             (= y chomp--password-handled-y))
+        nil)
+       (t
+        (setq chomp--password-mode-p t
+              chomp--password-handled-y nil)
+        (force-mode-line-update)
+        (chomp--cancel-password-confirm-timer)
+        (setq chomp--password-confirm-timer
+              (run-at-time chomp-password-prompt-debounce nil
+                           #'chomp--confirm-and-prompt
+                           (current-buffer))))))))
 
 (defun chomp-mouse-input (event)
   "Send mouse EVENT to the terminal when DEC mouse tracking is active."
@@ -794,6 +919,8 @@ or `$SHELL'."
                  ('semi-char "[Semi]")
                  ('emacs "[Emacs]")
                  (_ nil))
+               (and chomp--password-mode-p
+                    (propertize "🔒Password" 'face 'warning))
                chomp--progress))
    " "))
 
