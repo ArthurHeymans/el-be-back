@@ -1635,6 +1635,22 @@ Binds `screen' and `parser' in BODY."
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory root t))))
 
+(ert-deftest chomp-test-buffer-name-strips-local-host ()
+  "Local user@host is stripped; remote host kept; directory names abbreviate."
+  (let ((host (system-name))
+        (user (user-login-name)))
+    (should (equal (format "*chomp: ~/src/chomp$*")
+                   (chomp-buffer-name-by-title
+                    (format "%s@%s:~/src/chomp$" user host))))
+    (should (equal (format "*chomp: alice@otherbox:~/x*")
+                   (chomp-buffer-name-by-title "alice@otherbox:~/x")))
+    (let ((default-directory "/home/arthur/src/chomp/"))
+      (should (equal "*chomp: ~/src/chomp*"
+                     (chomp-buffer-name-by-directory nil))))
+    (let ((default-directory "/ssh:remote:/home/arthur/src/"))
+      (should (string-match-p "remote"
+                              (chomp-buffer-name-by-directory nil))))))
+
 ;;;; ---- Bookmark Tests -------------------------------------------------
 
 (ert-deftest chomp-test-bookmark-record-and-renamed-session-reuse ()

@@ -88,8 +88,24 @@ password string or nil to try the next source."
   :group 'chomp)
 
 (defcustom chomp-show-title t
-  "If non-nil, display the terminal title in the mode line."
+  "If non-nil, track OSC titles for buffer naming when using title mode."
   :type 'boolean
+  :group 'chomp)
+
+(defcustom chomp-buffer-name-function #'chomp-buffer-name-by-directory
+  "Function that maps OSC title + `default-directory' to a buffer name.
+Called with the latest OSC title string (may be nil).  Return a name, or
+nil to leave the buffer name alone.  Set to nil to disable auto-rename.
+
+Defaults to directory naming like ghostel users typically want: local
+buffers show an abbreviated path without the hostname; remote paths keep
+the TRAMP host."
+  :type '(choice (const :tag "Disabled" nil)
+                 (function-item :tag "By directory"
+                                chomp-buffer-name-by-directory)
+                 (function-item :tag "By title"
+                                chomp-buffer-name-by-title)
+                 function)
   :group 'chomp)
 
 (defcustom chomp-scrollback-lines 10000
@@ -133,6 +149,10 @@ Options: `char', `semi-char', `emacs'."
   "Pending debounce timer for password prompt detection.")
 (defvar-local chomp--password-prompt-active nil
   "Non-nil while the password source chain is running.")
+(defvar-local chomp--title nil
+  "Last OSC title string reported by the shell.")
+(defvar-local chomp--managed-buffer-name nil
+  "Last buffer name set by chomp auto-rename, or nil if unmanaged.")
 
 (defvar chomp--focus-change-installed nil
   "Non-nil when `chomp--focus-change' is installed globally.")
@@ -536,17 +556,15 @@ Called after each render.  Debounced so short-lived matches don't flash."
   (pcase type
     ('bell (ding t))
     ('title
-     (let ((title (car args)))
-       (when chomp-show-title
-         (rename-buffer (format "*chomp: %s*"
-                                (if (> (length title) 40)
-                                    (concat (substring title 0 37) "...")
-                                  title))
-                        t))))
+     (when chomp-show-title
+       (chomp--set-title (car args))))
     ('cwd
      (let ((dir (car args)))
        (when (and dir (file-directory-p dir))
-         (setq default-directory (file-name-as-directory dir)))))
+         (setq default-directory (file-name-as-directory dir))
+         (when chomp-buffer-name-function
+           (chomp--rename-managed
+            (funcall chomp-buffer-name-function chomp--title))))))
     ('cursor-style
      ;; Could update cursor display here
      nil)
@@ -814,6 +832,14 @@ or `$SHELL'."
         ;; Start process with shell integration env vars
         (chomp-io-start chomp--io shell buf
                         (chomp-shell-env-vars))
+        ;; Initial directory-based name (before any OSC title).
+        ;; Leave custom/project buffer names alone until OSC updates.
+        (when (and chomp-buffer-name-function
+                   (or (equal (buffer-name) "*chomp*")
+                       (string-match-p "\\`\\*chomp\\*<[0-9]+>\\'"
+                                       (buffer-name))))
+          (chomp--rename-managed
+           (funcall chomp-buffer-name-function nil)))
         ;; Set default input mode
         (pcase chomp-default-input-mode
           ('char (chomp-char-mode))
@@ -907,6 +933,66 @@ or `$SHELL'."
             (setq chomp--session-id identity))))
       (pop-to-buffer-same-window buffer)
       buffer)))
+
+;;;; ---- Buffer naming --------------------------------------------------
+
+(defun chomp--local-host-p (host)
+  "Return non-nil if HOST is this machine or empty/localhost."
+  (or (null host)
+      (string-empty-p host)
+      (member (downcase host) '("localhost" "127.0.0.1" "::1"))
+      (eq t (compare-strings host nil nil (system-name) nil nil t))
+      (eq t (compare-strings host nil nil
+                             (car (split-string (system-name) "\\."))
+                             nil nil t))))
+
+(defun chomp--format-title-for-buffer (title)
+  "Return TITLE with local user@host: stripped; keep remote host."
+  (when (and title (not (string-empty-p title)))
+    (let* ((trimmed (if (> (length title) 60)
+                        (concat (substring title 0 57) "...")
+                      title))
+           (local-user (user-login-name))
+           (hosts (delq nil
+                        (list (system-name)
+                              (car (split-string (system-name) "\\."))))))
+      (or (cl-loop for host in hosts
+                   for re = (concat "\\`"
+                                    (regexp-quote local-user)
+                                    "@"
+                                    (regexp-quote host)
+                                    ":")
+                   when (string-match re trimmed)
+                   return (substring trimmed (match-end 0)))
+          trimmed))))
+
+(defun chomp-buffer-name-by-title (title)
+  "Return \"*chomp: TITLE*\", stripping local user@host from TITLE."
+  (when-let ((pretty (chomp--format-title-for-buffer title)))
+    (format "*chomp: %s*" pretty)))
+
+(defun chomp-buffer-name-by-directory (&optional _title)
+  "Return \"*chomp: DIR*\" from abbreviated `default-directory'.
+Local paths omit the hostname; remote TRAMP paths keep the host."
+  (format "*chomp: %s*"
+          (abbreviate-file-name
+           (directory-file-name default-directory))))
+
+(defun chomp--rename-managed (new-name)
+  "Rename buffer to NEW-NAME unless the user renamed it manually."
+  (when (and new-name
+             (or (null chomp--managed-buffer-name)
+                 (equal (buffer-name) chomp--managed-buffer-name))
+             (not (equal new-name (buffer-name))))
+    (rename-buffer new-name t)
+    (setq chomp--managed-buffer-name (buffer-name))))
+
+(defun chomp--set-title (title)
+  "Record OSC TITLE and rename via `chomp-buffer-name-function'."
+  (setq chomp--title title)
+  (when chomp-buffer-name-function
+    (chomp--rename-managed
+     (funcall chomp-buffer-name-function title))))
 
 ;;;; ---- Mode Line ------------------------------------------------------
 

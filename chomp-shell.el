@@ -225,14 +225,36 @@ post-render processing."
 
 (defun chomp-shell--set-cwd (args)
   "Set the working directory from base64-encoded ARGS.
-ARGS is (HOST-B64 PATH-B64)."
+ARGS is (HOST-B64 PATH-B64).  Local hosts update a plain path;
+remote hosts keep/build a TRAMP path.  Renames the buffer when
+`chomp-buffer-name-function' is set."
   (when (and chomp-enable-directory-tracking args (cdr args))
-    (let ((host (chomp-shell--base64-decode (car args)))
-          (path (chomp-shell--base64-decode (cadr args))))
-      (when (and host path
-                 (string= host (system-name))
-                 (file-directory-p path))
-        (setq default-directory (file-name-as-directory path))))))
+    (let* ((host (chomp-shell--base64-decode (car args)))
+           (path (chomp-shell--base64-decode (cadr args)))
+           (local-p (or (null host)
+                        (string-empty-p host)
+                        (member (downcase host) '("localhost" "127.0.0.1" "::1"))
+                        (eq t (compare-strings host nil nil (system-name) nil nil t))
+                        (eq t (compare-strings host nil nil
+                                               (car (split-string (system-name) "\\."))
+                                               nil nil t)))))
+      (when (and path (not (string-empty-p path)))
+        (cond
+         (local-p
+          (when (file-directory-p path)
+            (setq default-directory (file-name-as-directory path))))
+         (t
+          (let* ((prefix (file-remote-p default-directory))
+                 (remote (if prefix
+                             (concat prefix path)
+                           (format "/ssh:%s:%s" host path))))
+            (setq default-directory (file-name-as-directory remote)))))
+        (when (and (fboundp 'chomp-buffer-name-function)
+                   chomp-buffer-name-function
+                   (fboundp 'chomp--rename-managed))
+          (chomp--rename-managed
+           (funcall chomp-buffer-name-function
+                    (bound-and-true-p chomp--title))))))))
 
 (defun chomp-shell--set-command (args)
   "Handle command text (F sequence).
