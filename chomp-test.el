@@ -534,9 +534,9 @@ Binds `screen' and `parser' in BODY."
 
 (ert-deftest chomp-test-render-color-conversion ()
   "Color conversion produces correct hex strings."
-  ;; ANSI colors
-  (should (equal "#000000" (chomp-render--color-to-string 0)))
-  (should (equal "#cd0000" (chomp-render--color-to-string 1)))
+  ;; ANSI 0-15 come from theme-backed faces (ansi-color-*)
+  (should (stringp (chomp-render--color-to-string 0)))
+  (should (stringp (chomp-render--color-to-string 1)))
   ;; 256-color
   (should (equal "#ff0000" (chomp-render--color-to-string 196)))
   ;; Truecolor
@@ -644,7 +644,8 @@ Binds `screen' and `parser' in BODY."
                    (plist-get face :inherit))))
   ;; Foreground color
   (let ((face (chomp-render--attr-to-face (make-chomp-attr :fg 1))))
-    (should (equal "#cd0000" (plist-get face :foreground)))))
+    (should (equal (face-foreground 'chomp-color-1 nil t)
+                   (plist-get face :foreground)))))
 
 ;;;; ---- Phase 2 Tests --------------------------------------------------
 
@@ -755,6 +756,11 @@ Binds `screen' and `parser' in BODY."
   (should (facep 'chomp-color-0))
   (should (facep 'chomp-color-1))
   (should (facep 'chomp-color-255))
+  ;; 0-15 inherit Emacs ansi-color faces
+  (should (eq 'ansi-color-black
+              (face-attribute 'chomp-color-0 :inherit nil 'default)))
+  (should (eq 'ansi-color-bright-red
+              (face-attribute 'chomp-color-9 :inherit nil 'default)))
   ;; Color lookup returns a string
   (should (stringp (chomp-render--color-to-string 0)))
   (should (stringp (chomp-render--color-to-string 196))))
@@ -775,11 +781,12 @@ Binds `screen' and `parser' in BODY."
 
 (ert-deftest chomp-test-inverse-attr-with-fg ()
   "Inverse with explicit fg swaps correctly."
-  (let ((face (chomp-render--attr-to-face
-               (make-chomp-attr :inverse t :fg 1))))
-    ;; fg was 1 (red=#cd0000), inverse means it becomes the background
+  (let* ((red (chomp-render--color-to-string 1))
+         (face (chomp-render--attr-to-face
+                (make-chomp-attr :inverse t :fg 1))))
+    ;; fg was palette 1; inverse means it becomes the background
     (should (plist-get face :background))
-    (should (string-match-p "#cd0000" (plist-get face :background)))))
+    (should (equal red (plist-get face :background)))))
 
 (ert-deftest chomp-test-xtsmgraphics-response ()
   "XTSMGRAPHICS query gets a valid response."

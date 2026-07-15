@@ -64,11 +64,29 @@
 (defconst chomp-render--attr-face-cache-limit 4096
   "Maximum number of cached attribute face specs before clearing the cache.")
 
+;; Palette 0-15 inherit Emacs ansi-color faces (theme-aware), like eat/ghostel.
+(defconst chomp-render--ansi-face-names
+  ["black" "red" "green" "yellow" "blue" "magenta" "cyan" "white"]
+  "Base names for ANSI colors 0-7 / bright 8-15.")
+
 (dotimes (i 256)
   (let* ((sym (intern (format "chomp-color-%d" i)))
-         (hex (chomp-render--256color-hex i)))
+         (spec
+          (cond
+           ((< i 8)
+            `((t :inherit
+                 ,(intern (format "ansi-color-%s"
+                                 (aref chomp-render--ansi-face-names i))))))
+           ((< i 16)
+            `((t :inherit
+                 ,(intern (format "ansi-color-bright-%s"
+                                 (aref chomp-render--ansi-face-names
+                                       (- i 8)))))))
+           (t
+            (let ((hex (chomp-render--256color-hex i)))
+              `((t :foreground ,hex :background ,hex)))))))
     (eval `(defface ,sym
-             '((t :foreground ,hex :background ,hex))
+             ',spec
              ,(format "Chomp color %d." i)
              :group 'chomp-faces))
     (aset chomp-render--color-faces i sym)))
@@ -98,11 +116,24 @@ allowing theme/user customization."
             (chomp--clamp (cadr color) 0 255)
             (chomp--clamp (caddr color) 0 255)))
    ((and (integerp color) (<= 0 color 255))
-    ;; Use the named face's foreground for customizability
+    ;; Use the named face's foreground for customizability.
+    ;; face-foreground can be a named color ("red3"); normalize to #RRGGBB
+    ;; so inverse/render comparisons stay stable.  Fall back through the
+    ;; inherit chain (ansi-color-*) then the xterm hex table.
     (or (aref chomp-render--indexed-color-cache color)
         (let* ((face-sym (aref chomp-render--color-faces color))
-               (value (or (face-foreground face-sym nil t)
-                          (chomp-render--256color-hex color))))
+               (raw (or (face-foreground face-sym nil t)
+                        (chomp-render--256color-hex color)))
+               (value
+                (cond
+                 ;; Already hex — keep it. color-values is lossy on TTY/batch.
+                 ((and (stringp raw) (string-prefix-p "#" raw) (= (length raw) 7))
+                  raw)
+                 ((and (stringp raw) (color-values raw))
+                  (apply #'format "#%02x%02x%02x"
+                         (mapcar (lambda (c) (ash c -8))
+                                 (color-values raw))))
+                 (t raw))))
           (aset chomp-render--indexed-color-cache color value)
           value)))
    (t nil)))
