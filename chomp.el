@@ -49,8 +49,9 @@ For best shell integration, set this to your interactive shell
   :type '(choice (const nil) string)
   :group 'chomp)
 
-(defcustom chomp-kill-buffer-on-exit nil
-  "If non-nil, kill the buffer when the shell process exits."
+(defcustom chomp-kill-buffer-on-exit t
+  "If non-nil, kill the buffer when the shell process exits.
+With the default of t, Ctrl-D / shell exit closes the chomp buffer."
   :type 'boolean
   :group 'chomp)
 
