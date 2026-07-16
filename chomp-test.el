@@ -39,11 +39,15 @@ Binds `screen' and `parser' in BODY."
   "Return the text content of display line ROW as a string."
   (let* ((line (chomp-screen-get-line screen row))
          (cells (chomp-line-cells line))
-         (chars nil))
+         (parts nil))
     (dotimes (i (length cells))
-      (push (chomp-cell-char (aref cells i)) chars))
+      (let ((cell (aref cells i)))
+        (unless (zerop (chomp-cell-width cell))
+          (push (concat (string (chomp-cell-char cell))
+                        (chomp-cell-combining cell))
+                parts))))
     ;; Strip trailing spaces
-    (string-trim-right (apply #'string (nreverse chars)))))
+    (string-trim-right (apply #'concat (nreverse parts)))))
 
 (defun chomp-test-display-text (screen)
   "Return all display lines as a list of strings (trailing spaces stripped)."
@@ -101,6 +105,33 @@ Binds `screen' and `parser' in BODY."
     (chomp-screen-write-char screen ?i)
     (should (equal "Hi" (chomp-test-display-line screen 0)))
     (should (equal '(2 . 0) (chomp-test-cursor screen)))))
+
+(ert-deftest chomp-test-combining-mark-preserved ()
+  "Combining marks decorate the prior cell without moving the cursor."
+  (chomp-test-with-screen (:width 5 :height 1)
+    (chomp-test-output parser "ã")
+    (let ((cell (aref (chomp-line-cells (chomp-screen-get-line screen 0)) 0)))
+      (should (= ?a (chomp-cell-char cell)))
+      (should (equal "̃" (chomp-cell-combining cell))))
+    (should (equal "ã" (chomp-test-display-line screen 0)))
+    (should (equal '(1 . 0) (chomp-test-cursor screen)))
+    (should (equal "ã    "
+                   (chomp-render--line-to-string
+                    (chomp-screen-get-line screen 0) 5)))))
+
+(ert-deftest chomp-test-zwj-grapheme-preserved ()
+  "A ZWJ sequence occupies the first glyph's terminal cells."
+  (chomp-test-with-screen (:width 5 :height 1)
+    (chomp-test-output parser "👩‍💻")
+    (let ((cell (aref (chomp-line-cells (chomp-screen-get-line screen 0)) 0)))
+      (should (= ?👩 (chomp-cell-char cell)))
+      (should (equal "‍💻" (chomp-cell-combining cell)))
+      (should (= 2 (chomp-cell-width cell))))
+    (should (equal "👩‍💻" (chomp-test-display-line screen 0)))
+    (should (equal '(2 . 0) (chomp-test-cursor screen)))
+    (should (string-prefix-p "👩‍💻"
+                             (chomp-render--line-to-string
+                              (chomp-screen-get-line screen 0) 5)))))
 
 (ert-deftest chomp-test-auto-wrap ()
   "Auto-wrap moves to next line at end of line."

@@ -21,6 +21,7 @@
 (cl-defstruct (chomp-cell (:copier nil))
   "A single cell on the terminal screen."
   (char ?\s)
+  (combining nil)       ; zero-width suffix, including ZWJ sequences
   (width 1)
   (attr nil))
 
@@ -498,12 +499,71 @@ Bottom lines are discarded."
 
 ;;;; ---- Character Writing ----------------------------------------------
 
+(defun chomp--previous-cell (screen)
+  "Return the cell immediately before SCREEN's cursor, or nil.
+A pending wrap leaves the cursor on the final cell.  Across a line boundary,
+only join with a line that was auto-wrapped."
+  (let* ((y (chomp-screen-cursor-y screen))
+         (x (chomp-screen-cursor-x screen))
+         (width (chomp-screen-width screen))
+         (line (chomp--line-at screen y)))
+    (cond
+     ((chomp-screen-pending-wrap screen)
+      (cons line x))
+     ((> x 0)
+      (let* ((cells (chomp--line-ensure-cells line width))
+             (column (1- x)))
+        (while (and (> column 0)
+                    (zerop (chomp-cell-width (aref cells column))))
+          (cl-decf column))
+        (cons line column)))
+     ((and (> y 0) (chomp-line-wrapped (chomp--line-at screen (1- y))))
+      (let* ((previous (chomp--line-at screen (1- y)))
+             (cells (chomp--line-ensure-cells previous width))
+             (column (1- width)))
+        (while (and (> column 0)
+                    (zerop (chomp-cell-width (aref cells column))))
+          (cl-decf column))
+        (cons previous column))))))
+
+(defun chomp--append-to-previous-cell (screen char)
+  "Append zero-width CHAR to the cell before SCREEN's cursor."
+  (when-let* ((target (chomp--previous-cell screen))
+              (cell (aref (chomp-line-cells (car target)) (cdr target))))
+    (setf (chomp-cell-combining cell)
+          (concat (chomp-cell-combining cell) (string char)))
+    (setf (chomp-line-text (car target)) nil
+          (chomp-line-attr-runs (car target)) nil
+          (chomp-line-uniform-attr (car target)) nil
+          (chomp-line-rendered (car target)) nil
+          (chomp-line-dirty (car target)) t)
+    (chomp--mark-dirty screen
+                        (if (eq (car target)
+                                (chomp--line-at screen
+                                                (chomp-screen-cursor-y screen)))
+                            (chomp-screen-cursor-y screen)
+                          (1- (chomp-screen-cursor-y screen))))
+    t))
+
+(defun chomp--append-joined-char (screen char)
+  "Append CHAR when it continues a preceding zero-width joiner sequence."
+  (when-let* ((target (chomp--previous-cell screen))
+              (cell (aref (chomp-line-cells (car target)) (cdr target)))
+              (suffix (chomp-cell-combining cell)))
+    (when (eq (aref suffix (1- (length suffix))) #x200d)
+      (chomp--append-to-previous-cell screen char))))
+
 (defun chomp-screen-write-char (screen char)
   "Write CHAR at the current cursor position.
 Handles double-width (CJK) characters by occupying two cells."
   (let* ((scrn-width (chomp-screen-width screen))
          (char-w (chomp--char-display-width char)))
-    ;; Zero-width characters are ignored (like xterm/eat behavior)
+    (catch 'chomp-screen-write-char
+      (when (zerop char-w)
+        (chomp--append-to-previous-cell screen char)
+        (throw 'chomp-screen-write-char nil))
+      (when (chomp--append-joined-char screen char)
+        (throw 'chomp-screen-write-char nil))
     (unless (zerop char-w)
 
     ;; Handle pending wrap
@@ -536,6 +596,7 @@ Handles double-width (CJK) characters by occupying two cells."
           ;; cleanup.  This is the dominant path for plain command output.
           (progn
             (setf (chomp-cell-char cell) translated)
+            (setf (chomp-cell-combining cell) nil)
             (setf (chomp-cell-width cell) 1)
             (setf (chomp-cell-attr cell) attr)
             (let ((uniform (chomp-line-uniform-attr line)))
@@ -605,6 +666,7 @@ Handles double-width (CJK) characters by occupying two cells."
           ;; allocating new cell structs for every Unicode character.
           (let ((cell (aref cells cx)))
             (setf (chomp-cell-char cell) translated)
+            (setf (chomp-cell-combining cell) nil)
             (setf (chomp-cell-width cell) char-w)
             (setf (chomp-cell-attr cell) attr))
           ;; For double-width: mark continuation cell(s).
@@ -613,6 +675,7 @@ Handles double-width (CJK) characters by occupying two cells."
               (while (and (< i char-w) (< (+ cx i) scrn-width))
                 (let ((cell (aref cells (+ cx i))))
                   (setf (chomp-cell-char cell) ?\s)
+                  (setf (chomp-cell-combining cell) nil)
                   (setf (chomp-cell-width cell) 0)
                   (setf (chomp-cell-attr cell) attr))
                 (cl-incf i))))
@@ -630,7 +693,7 @@ Handles double-width (CJK) characters by occupying two cells."
                   (setf (chomp-screen-cursor-x screen) (1- scrn-width))
                   (when (chomp-screen-auto-wrap screen)
                     (setf (chomp-screen-pending-wrap screen) t)))
-              (setf (chomp-screen-cursor-x screen) new-cx)))))))))
+              (setf (chomp-screen-cursor-x screen) new-cx))))))))))
 
 (defun chomp-screen-write-string (screen string start end)
   "Write printable STRING bytes from START to END to SCREEN.
@@ -702,6 +765,7 @@ for wide/non-ASCII/insert-mode cases."
                            (cell (aref cells col))
                            (ch (aref string i)))
                       (setf (chomp-cell-char cell) ch)
+                      (setf (chomp-cell-combining cell) nil)
                       (setf (chomp-cell-width cell) 1)
                       (setf (chomp-cell-attr cell) nil))
                     (cl-incf i))
@@ -710,6 +774,7 @@ for wide/non-ASCII/insert-mode cases."
                   (let* ((cell (aref cells (+ cx (- i start-i))))
                          (ch (aref string i)))
                     (setf (chomp-cell-char cell) ch)
+                    (setf (chomp-cell-combining cell) nil)
                     (setf (chomp-cell-width cell) 1)
                     (setf (chomp-cell-attr cell) attr-template))
                   (cl-incf i))))))
@@ -1507,6 +1572,7 @@ Rows joined by a soft wrap have no intervening newline."
 (defun copy-chomp-cell (cell)
   "Return a shallow copy of CELL."
   (make-chomp-cell :char (chomp-cell-char cell)
+                   :combining (chomp-cell-combining cell)
                    :width (chomp-cell-width cell)
                    :attr (chomp-cell-attr cell)))
 

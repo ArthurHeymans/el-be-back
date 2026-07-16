@@ -384,7 +384,8 @@ compactly."
       (while (< i width)
         (let* ((cell (aref cells i))
                (cw (chomp-cell-width cell)))
-          (when (chomp-cell-attr cell)
+          (when (or (chomp-cell-attr cell)
+                    (chomp-cell-combining cell))
             (throw 'styled nil))
           (cond
            ((zerop cw)
@@ -507,7 +508,8 @@ lists; falls back only when a styled cell is present."
       (while (< i width)
         (let* ((cell (aref cells i))
                (cw (chomp-cell-width cell)))
-          (when (chomp-cell-attr cell)
+          (when (or (chomp-cell-attr cell)
+                    (chomp-cell-combining cell))
             (throw 'styled nil))
           (cond
            ((zerop cw)
@@ -534,6 +536,7 @@ lists; falls back only when a styled cell is present."
       (while (and (< i width)
                   (let ((cell (aref cells i)))
                     (and (= (chomp-cell-width cell) 1)
+                         (not (chomp-cell-combining cell))
                          (or (eq (chomp-cell-attr cell) attr)
                              (equal (chomp-cell-attr cell) attr)))))
         (cl-incf i))
@@ -563,7 +566,7 @@ lists; falls back only when a styled cell is present."
           (let* ((ch (chomp-cell-char cell))
                  (attr (chomp-cell-attr cell))
                  (face (chomp-render--attr-to-face attr))
-                 (s (string ch))
+                 (s (concat (string ch) (chomp-cell-combining cell)))
                  ;; Invisible spacers for the extra columns
                  (spacer (propertize (make-string (1- cw) ?\s)
                                      'invisible t
@@ -571,26 +574,35 @@ lists; falls back only when a styled cell is present."
             (when face
               (put-text-property 0 (length s) 'face face s)
               (put-text-property 0 (length spacer) 'face face spacer))
-            (push spacer parts)
-            (push s parts))
+            (push s parts)
+            (push spacer parts))
           ;; Skip the char cell and its continuation cells
           (cl-incf i cw))
-         ;; Normal single-width: group consecutive same-attr cells
+         ;; Normal single-width: emit grapheme cells, grouping simple runs.
          (t
-          (let ((attr (chomp-cell-attr cell))
-                (chars nil))
-            (while (and (< i width)
-                        (let ((c (aref cells i)))
-                          (and (= (chomp-cell-width c) 1)
-                               (equal (chomp-cell-attr c) attr))))
-              (push (chomp-cell-char (aref cells i)) chars)
-              (cl-incf i))
-            (when chars
-              (let ((s (apply #'string (nreverse chars)))
-                    (face (chomp-render--attr-to-face attr)))
-                (when face
-                  (put-text-property 0 (length s) 'face face s))
-                (push s parts))))))))
+          (let ((attr (chomp-cell-attr cell)))
+            (if (chomp-cell-combining cell)
+                (let ((s (concat (string (chomp-cell-char cell))
+                                 (chomp-cell-combining cell)))
+                      (face (chomp-render--attr-to-face attr)))
+                  (when face
+                    (put-text-property 0 (length s) 'face face s))
+                  (push s parts)
+                  (cl-incf i))
+              (let ((chars nil))
+                (while (and (< i width)
+                            (let ((c (aref cells i)))
+                              (and (= (chomp-cell-width c) 1)
+                                   (not (chomp-cell-combining c))
+                                   (equal (chomp-cell-attr c) attr))))
+                  (push (chomp-cell-char (aref cells i)) chars)
+                  (cl-incf i))
+                (when chars
+                  (let ((s (apply #'string (nreverse chars)))
+                        (face (chomp-render--attr-to-face attr)))
+                    (when face
+                      (put-text-property 0 (length s) 'face face s))
+                    (push s parts))))))))))
     ;; Build result and ensure it is exactly width display columns
     (let ((result (apply #'concat (nreverse parts))))
       ;; Pad with spaces if display width is short
