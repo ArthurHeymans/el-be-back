@@ -15,6 +15,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'url-util)
 (require 'chomp-term)
 
 (defcustom chomp-enable-osc52 nil
@@ -1229,11 +1230,21 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
                  (chomp-parse--emit parser 'title payload))
                 ;; Set CWD
                 (7
-                 (let ((cwd (if (string-match "file://[^/]*/\\(.*\\)" payload)
-                                (concat "/" (match-string 1 payload))
-                              payload)))
+                 (let ((host nil)
+                       (cwd payload))
+                   (when (string-match "\\`file://\\([^/]*\\)/\\(.*\\)\\'" payload)
+                     (setq host (match-string 1 payload)
+                           ;; Paths arrive percent-encoded; without this,
+                           ;; remote reports (trusted, never stat'ed)
+                           ;; corrupt `default-directory' on any space.
+                           cwd (concat "/" (decode-coding-string
+                                            (url-unhex-string
+                                             (match-string 2 payload))
+                                            'utf-8))))
                    (setf (chomp-screen-cwd screen) cwd)
-                   (chomp-parse--emit parser 'cwd cwd)))
+                   ;; HOST lets the handler build a TRAMP path when the
+                   ;; report comes from a remote shell.
+                   (chomp-parse--emit parser 'cwd cwd host)))
                 ;; Query palette entries
                 (4
                  (chomp-parse--handle-osc-4 parser payload))

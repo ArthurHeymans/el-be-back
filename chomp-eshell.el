@@ -271,8 +271,14 @@
                                    (height (window-body-height)))
                                (setf (plist-get plist :connection-type) 'pty
                                      (plist-get plist :command)
-                                     (chomp-io--wrap-command-with-stty
-                                      expected height width))
+                                     ;; Remote visual commands need the
+                                     ;; on-remote TERM probe; TRAMP strips
+                                     ;; the TERM= env alias.
+                                     (funcall (if (file-remote-p
+                                                   default-directory)
+                                                  #'chomp-io--remote-command
+                                                #'chomp-io--wrap-command-with-stty)
+                                              expected height width))
                                (apply make-process plist))
                            (apply make-process plist))))))
             (funcall original command args))

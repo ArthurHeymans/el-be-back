@@ -50,6 +50,34 @@ For best shell integration, set this to your interactive shell
   :type '(choice (const nil) string)
   :group 'chomp)
 
+(defcustom chomp-tramp-shells
+  '(("ssh" login-shell)
+    ("sshx" login-shell)
+    ("scp" login-shell)
+    ("docker" "/bin/sh"))
+  "Shell to use for remote TRAMP connections, per method.
+Each entry is (TRAMP-METHOD SHELL [FALLBACK ARG...]).  TRAMP-METHOD
+is a method string such as \"ssh\", or t as a catch-all default.
+
+SHELL is a path string, or the symbol `login-shell' to auto-detect
+the remote user's login shell via `getent passwd'.  FALLBACK, when
+present, is used when login-shell detection fails.  Any elements
+after FALLBACK are extra shell arguments; when none are given,
+recognized shells (bash, zsh, fish) start login+interactive
+\(`-l -i') so they source the user's rc/profile files."
+  :type '(alist :key-type (choice string (const t)) :value-type sexp)
+  :group 'chomp)
+
+(defcustom chomp-tramp-default-method nil
+  "TRAMP method for remote paths built from OSC 7 directory reports.
+Used when the shell reports a non-local hostname and the buffer's
+`default-directory' has no existing remote prefix.  nil means use
+`tramp-default-method'."
+  :type '(choice (const :tag "Use tramp-default-method" nil) string)
+  :group 'chomp)
+
+(defvar tramp-default-method)
+
 (defcustom chomp-kill-buffer-on-exit t
   "If non-nil, kill the buffer when the shell process exits.
 With the default of t, Ctrl-D / shell exit closes the chomp buffer."
@@ -560,9 +588,12 @@ Called after each render.  Debounced so short-lived matches don't flash."
      (when chomp-show-title
        (chomp--set-title (car args))))
     ('cwd
-     (let ((dir (car args)))
-       (when (and dir (file-directory-p dir))
-         (setq default-directory (file-name-as-directory dir))
+     (let ((path (chomp--cwd-to-path (car args) (cadr args))))
+       ;; Remote: trust the shell's report; a `file-directory-p' here
+       ;; would open a synchronous TRAMP connection on every cd.
+       (when (and path (if (file-remote-p path) t (file-directory-p path)))
+         (setq default-directory (file-name-as-directory path)
+               list-buffers-directory default-directory)
          (when chomp-buffer-name-function
            (chomp--rename-managed
             (funcall chomp-buffer-name-function chomp--title))))))
@@ -688,6 +719,11 @@ Called after each render.  Debounced so short-lived matches don't flash."
   (chomp--ensure-focus-change-hook)
   ;; Clean up shell state on kill
   (add-hook 'kill-buffer-hook #'chomp-shell-cleanup nil t)
+  ;; Kill the (possibly remote) shell process with the buffer; the
+  ;; process has no buffer of its own, so Emacs won't reap it.
+  (add-hook 'kill-buffer-hook
+            (lambda () (when chomp--io (chomp-io-stop chomp--io)))
+            nil t)
   (add-hook 'kill-buffer-hook #'chomp--maybe-remove-focus-change-hook nil t)
   ;; Query before kill
   (when chomp-query-before-kill
@@ -766,13 +802,74 @@ Called after each render.  Debounced so short-lived matches don't flash."
       (pop-to-buffer-same-window other)
     (chomp program)))
 
+(defun chomp--cwd-to-path (dir host)
+  "Return OSC 7 report DIR as a usable path, given the reporting HOST.
+Reports from a non-local HOST become TRAMP paths.  The buffer's remote
+prefix is reused when it targets the reported host (preserves method,
+user, multi-hop); a different host means the user ssh'd onward from
+this buffer's host, so a fresh path is built via
+`chomp-tramp-default-method'.  A local-looking HOST (or none) in a
+remote buffer is the remote shell reporting on itself."
+  (when (and dir (not (string-empty-p dir)))
+    (let ((prefix (file-remote-p default-directory)))
+      (cond
+       ((not (chomp--local-host-p host))
+        (if (and prefix
+                 (equal (downcase host)
+                        (downcase (or (file-remote-p default-directory 'host)
+                                      ""))))
+            (concat prefix dir)
+          (progn
+            (require 'tramp)
+            (format "/%s:%s:%s"
+                    (or chomp-tramp-default-method tramp-default-method)
+                    host dir))))
+       (prefix (concat prefix dir))
+       (t dir)))))
+
+(defun chomp--remote-login-shell ()
+  "Return the remote user's login shell via `getent passwd', or nil.
+Runs on the host of `default-directory' through TRAMP."
+  (with-temp-buffer
+    (when (eq 0 (ignore-errors
+                  (process-file-shell-command "getent passwd \"$LOGNAME\""
+                                              nil (current-buffer))))
+      ;; With $LOGNAME unset, bare `getent passwd' dumps the whole
+      ;; database with exit 0 -- only a single-line reply is a user.
+      (when (= (count-lines (point-min) (point-max)) 1)
+        (let ((shell (nth 6 (split-string (string-trim (buffer-string)) ":"))))
+          (and shell (not (string-empty-p shell)) shell))))))
+
+(defun chomp--remote-shell ()
+  "Return the shell argv list to run for a remote `default-directory'.
+Resolves per TRAMP method via `chomp-tramp-shells'; falls back to
+/bin/sh when nothing resolves."
+  (let* ((method (file-remote-p default-directory 'method))
+         (spec (cdr (or (assoc method chomp-tramp-shells)
+                        (assoc t chomp-tramp-shells))))
+         (program (or (if (eq (car spec) 'login-shell)
+                          (or (chomp--remote-login-shell) (cadr spec))
+                        (car spec))
+                      "/bin/sh"))
+         (args (or (cddr spec)
+                   (and (memq (chomp-io--detect-shell program)
+                              '(bash zsh fish))
+                        '("-l" "-i")))))
+    (cons program args)))
+
 ;;;###autoload
 (defun chomp (&optional program)
   "Start a terminal emulator.
 With a numeric prefix argument N, switch to the Nth existing chomp
 session (creating it if needed).  With \\[universal-argument] \\[universal-argument],
 prompt for the program to run.  PROGRAM defaults to `chomp-default-shell'
-or `$SHELL'."
+or `$SHELL'.
+
+When `default-directory' is remote, spawns the remote shell via TRAMP
+(see `chomp-tramp-shells').  Shell integration is not deployed to the
+remote host: cwd tracking there requires the remote rc files to emit
+OSC 7/51 themselves (e.g. by sourcing the scripts in chomp's
+`integration/' directory)."
   (interactive
    (list
     (cond
@@ -797,6 +894,8 @@ or `$SHELL'."
         (pop-to-buffer-same-window existing)
         (cl-return-from chomp existing))))
   (let* ((shell (or program
+                    (and (file-remote-p default-directory)
+                         (chomp--remote-shell))
                     chomp-default-shell
                     (getenv "SHELL")
                     shell-file-name

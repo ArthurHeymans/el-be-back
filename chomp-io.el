@@ -277,6 +277,29 @@ EXTRA-ENV is the env var list (used to find integration dir)."
       ('zsh command)
       (_ command))))
 
+(defun chomp-io--term-name ()
+  "Return the TERM value chomp advertises."
+  (if (boundp 'chomp-term-name) chomp-term-name "eat-truecolor"))
+
+(defun chomp-io--remote-command (shell-command rows columns)
+  "Wrap SHELL-COMMAND for a remote (TRAMP) spawn.
+The wrapper runs on the remote host: TERM is chosen there because
+TRAMP's `tramp-local-environment-variable-p' filter strips `TERM='
+entries pushed via the environment, leaving the remote shell with
+TERM=dumb.  It probes `infocmp' for the chomp terminfo entry and
+falls back to xterm-256color, then initializes the PTY like the
+local stty wrapper and execs SHELL-COMMAND."
+  (let ((command (if (listp shell-command) shell-command (list shell-command)))
+        (term (shell-quote-argument (chomp-io--term-name))))
+    (list "/bin/sh" "-c"
+          (concat
+           (format "TERM=xterm-256color; if infocmp %s >/dev/null 2>&1; then TERM=%s; fi; "
+                   term term)
+           "COLORTERM=truecolor; export TERM COLORTERM; "
+           (format "stty -nl echo rows %d columns %d sane 2>/dev/null; exec "
+                   rows columns)
+           (mapconcat #'shell-quote-argument command " ")))))
+
 (defun chomp-io--wrap-command-with-stty (command rows columns)
   "Wrap COMMAND to initialize PTY termios before exec.
 Eat does this with `stty ... sane' before starting the client program; in
@@ -333,8 +356,16 @@ on startup.  We create a symlink there pointing to our integration script."
 (defun chomp-io-start (io shell-command buffer &optional extra-env)
   "Start a terminal process running SHELL-COMMAND in BUFFER.
 EXTRA-ENV is an optional list of \"VAR=VALUE\" strings to add to
-the process environment."
-  (let* ((extra-env (chomp-io--prepare-environment shell-command extra-env))
+the process environment.
+
+When `default-directory' is remote, the process is spawned on the
+remote host through TRAMP (`:file-handler').  Shell integration,
+EXTRA-ENV, and the local TERMINFO are skipped there (they carry
+local paths), and TERM is chosen by an on-remote probe; see
+`chomp-io--remote-command'."
+  (let* ((remote (and (file-remote-p default-directory) t))
+         (extra-env (if remote nil
+                      (chomp-io--prepare-environment shell-command extra-env)))
          (screen (chomp-io-screen io))
          (w (chomp-screen-width screen))
          (h (chomp-screen-height screen))
@@ -342,29 +373,28 @@ the process environment."
          (process-environment
           (append
            (list
-            (concat "TERM=" (if (boundp 'chomp-term-name) chomp-term-name "eat-truecolor"))
             (format "COLUMNS=%d" w)
             (format "LINES=%d" h)
             "INSIDE_EMACS=chomp")
+           ;; Remote TERM is exported by the on-remote wrapper; TRAMP's
+           ;; env filter would strip a TERM= entry set here anyway.
+           (unless remote
+             (list (concat "TERM=" (chomp-io--term-name))))
            (or extra-env nil)
            process-environment))
          ;; Construct the command with shell integration and initialize PTY
          ;; termios like Eat does before execing the client program.
-         (cmd (chomp-io--wrap-command-with-stty
-               (chomp-io--build-command shell-command extra-env) h w))
-         ;; Large TUI redraws emit hundreds of KB in one write.  Before
-         ;; Emacs 31, `process-adaptive-read-buffering' throttles bursty
-         ;; processes to ~40 KB/s; also raise the per-read cap so one
-         ;; filter call can consume a full frame.  Both are captured at
-         ;; `make-process' time, so they must be let-bound here.
-         (process-adaptive-read-buffering nil)
-         (read-process-output-max (max read-process-output-max (* 1024 1024)))
+         (cmd (if remote
+                  (chomp-io--remote-command shell-command h w)
+                (chomp-io--wrap-command-with-stty
+                 (chomp-io--build-command shell-command extra-env) h w)))
          ;; Create process
          (proc (make-process
                 :name "chomp"
                 :buffer nil  ; no associated buffer (we manage our own)
                 :command cmd
                 :connection-type 'pty
+                :file-handler remote
                 :coding '(utf-8-unix . no-conversion)
                 :noquery t
                 :filter (lambda (proc output)

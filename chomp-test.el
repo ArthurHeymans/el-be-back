@@ -2215,5 +2215,109 @@ Binds `screen' and `parser' in BODY."
          (lambda (&rest _) (push 'eshell events)) 'process "finished\n")
         (should (equal events '(eshell cleanup)))))))
 
+;;;; ---- TRAMP integration ----------------------------------------------
+
+(ert-deftest chomp-test-cwd-to-path ()
+  "OSC 7 reports map to plain paths locally and TRAMP paths remotely."
+  (with-temp-buffer
+    (setq-local default-directory "/tmp/")
+    ;; Local host: plain path.
+    (should (equal "/home/u" (chomp--cwd-to-path "/home/u" (system-name))))
+    (should (equal "/home/u" (chomp--cwd-to-path "/home/u" "")))
+    ;; Remote host, no existing prefix: build via default method.
+    (let ((chomp-tramp-default-method "ssh"))
+      (should (equal "/ssh:box:/home/u"
+                     (chomp--cwd-to-path "/home/u" "box"))))
+    ;; Empty or nil dir: nil.
+    (should-not (chomp--cwd-to-path "" "box"))
+    (should-not (chomp--cwd-to-path nil nil)))
+  (with-temp-buffer
+    ;; Remote buffer: reuse the full prefix (method, user, multi-hop).
+    (setq-local default-directory "/ssh:user@box:/tmp/")
+    (should (equal "/ssh:user@box:/home/u"
+                   (chomp--cwd-to-path "/home/u" "box")))
+    ;; Empty host in a remote buffer is the remote shell reporting.
+    (should (equal "/ssh:user@box:/home/u"
+                   (chomp--cwd-to-path "/home/u" "")))
+    ;; Localhost aliases in a remote buffer also mean the remote shell
+    ;; (containers often report 127.0.0.1).
+    (should (equal "/ssh:user@box:/home/u"
+                   (chomp--cwd-to-path "/home/u" "127.0.0.1")))
+    ;; A different host means the user ssh'd onward: fresh TRAMP path.
+    (let ((chomp-tramp-default-method "ssh"))
+      (should (equal "/ssh:other:/home/u"
+                     (chomp--cwd-to-path "/home/u" "other"))))))
+
+(ert-deftest chomp-test-remote-login-shell ()
+  "`getent passwd' replies are accepted only when they name one user."
+  (cl-letf (((symbol-function 'process-file-shell-command)
+             (lambda (cmd _in buf &rest _)
+               (should (string-match-p "\\\"\$LOGNAME\\\"" cmd))
+               (with-current-buffer buf
+                 (insert "u:x:1000:1000:U:/home/u:/usr/bin/fish\n"))
+               0)))
+    (should (equal "/usr/bin/fish" (chomp--remote-login-shell))))
+  ;; Whole-database dump ($LOGNAME unset): refuse to pick root's shell.
+  (cl-letf (((symbol-function 'process-file-shell-command)
+             (lambda (_cmd _in buf &rest _)
+               (with-current-buffer buf
+                 (insert "root:x:0:0:R:/root:/bin/bash\n"
+                         "u:x:1000:1000:U:/home/u:/usr/bin/fish\n"))
+               0)))
+    (should-not (chomp--remote-login-shell))))
+
+(ert-deftest chomp-test-remote-shell-resolution ()
+  "`chomp--remote-shell' honors `chomp-tramp-shells' per TRAMP method."
+  (cl-letf (((symbol-function 'chomp--remote-login-shell)
+             (lambda () "/usr/bin/fish")))
+    ;; login-shell detection + login+interactive default args.
+    (let ((default-directory "/ssh:box:/tmp/"))
+      (should (equal '("/usr/bin/fish" "-l" "-i") (chomp--remote-shell))))
+    ;; Explicit shell, no default args for unrecognized shells.
+    (let ((default-directory "/docker:c:/"))
+      (should (equal '("/bin/sh") (chomp--remote-shell))))
+    ;; Unlisted method falls back to /bin/sh.
+    (let ((default-directory "/sudo:root@localhost:/"))
+      (should (equal '("/bin/sh") (chomp--remote-shell))))
+    ;; Explicit args override the default.
+    (let ((default-directory "/ssh:box:/tmp/")
+          (chomp-tramp-shells '(("ssh" "/bin/bash" nil "-i"))))
+      (should (equal '("/bin/bash" "-i") (chomp--remote-shell)))))
+  ;; Detection failure uses the FALLBACK slot.
+  (cl-letf (((symbol-function 'chomp--remote-login-shell) #'ignore))
+    (let ((default-directory "/ssh:box:/tmp/")
+          (chomp-tramp-shells '(("ssh" login-shell "/bin/zsh"))))
+      (should (equal '("/bin/zsh" "-l" "-i") (chomp--remote-shell))))))
+
+(ert-deftest chomp-test-remote-command-wrapper ()
+  "The remote wrapper probes TERM on the remote and execs the shell."
+  (let ((cmd (chomp-io--remote-command '("/bin/bash" "-l" "-i") 24 80)))
+    (should (equal '("/bin/sh" "-c") (list (nth 0 cmd) (nth 1 cmd))))
+    (let ((script (nth 2 cmd)))
+      (should (string-match-p "infocmp eat-truecolor" script))
+      (should (string-match-p "TERM=xterm-256color" script))
+      (should (string-match-p "export TERM COLORTERM" script))
+      (should (string-match-p "rows 24 columns 80" script))
+      (should (string-suffix-p "exec /bin/bash -l -i" script)))))
+
+(ert-deftest chomp-test-osc7-emits-host ()
+  "OSC 7 emits both path and reporting host."
+  (chomp-test-with-screen ()
+    (let (got)
+      (setf (chomp-parser-emit-fn parser)
+            (lambda (type &rest args)
+              (when (eq type 'cwd) (setq got args))))
+      (chomp-test-output parser "\e]7;file://box/home/u\e\\")
+      (should (equal '("/home/u" "box") got))
+      (should (equal "/home/u" (chomp-screen-cwd screen))))
+    ;; Percent-encoded paths are decoded.
+    (chomp-test-with-screen ()
+      (let (got)
+        (setf (chomp-parser-emit-fn parser)
+              (lambda (type &rest args)
+                (when (eq type 'cwd) (setq got args))))
+        (chomp-test-output parser "\e]7;file://box/home/u/my%20dir%C3%A9\e\\")
+        (should (equal '("/home/u/my diré" "box") got))))))
+
 (provide 'chomp-test)
 ;;; chomp-test.el ends here
