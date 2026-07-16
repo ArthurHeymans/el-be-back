@@ -993,6 +993,21 @@ Pm=1: read, Pm=4: read maximum."
 
 ;;;; ---- SGR Handler (Select Graphic Rendition) -------------------------
 
+(defun chomp-parse--set-colon-sgr-color (screen params)
+  "Apply colon-form color PARAMS to SCREEN."
+  (let ((property (pcase (car params)
+                    (38 :fg)
+                    (48 :bg)
+                    (58 :ul-color))))
+    (when property
+      (pcase (cdr params)
+        (`(5 ,index)
+         (chomp-screen-set-attr screen property index))
+        (`(2 ,r ,g ,b)
+         (chomp-screen-set-attr screen property (list r g b)))
+        (`(2 ,_color-space ,r ,g ,b)
+         (chomp-screen-set-attr screen property (list r g b)))))))
+
 (defun chomp-parse--csi-sgr (parser params)
   "Handle SGR (CSI m) -- the most complex single CSI handler.
 Private CSI sequences ending in `m' (e.g. CSI > 4 ; 1 m for
@@ -1007,22 +1022,24 @@ modifyOtherKeys) are not SGR and must be ignored."
         (while (< i len)
           (let ((p (aref params i)))
             (cond
-             ;; Sub-parameter list (e.g., 4:0, 4:3 for underline styles)
+             ;; Colon-form sub-parameters, including color specifications.
              ((listp p)
-              (when (and p (= (car p) 4))
-                ;; Underline with sub-parameter: 4:0=off, 4:1=line,
-                ;; 4:2=double, 4:3=curly, 4:4=dotted, 4:5=dashed
-                (let ((sub (if (cdr p) (cadr p) 1)))
-                  (chomp-screen-set-attr
-                   screen :underline
-                   (pcase sub
-                     (0 nil)
-                     (1 'line)
-                     (2 'double)
-                     (3 'curly)
-                     (4 'dotted)
-                     (5 'dashed)
-                     (_ 'line))))))
+              (pcase (car p)
+                (4
+                 ;; 4:0=off, 4:1=line, 4:2=double, 4:3=curly, etc.
+                 (let ((sub (if (cdr p) (cadr p) 1)))
+                   (chomp-screen-set-attr
+                    screen :underline
+                    (pcase sub
+                      (0 nil)
+                      (1 'line)
+                      (2 'double)
+                      (3 'curly)
+                      (4 'dotted)
+                      (5 'dashed)
+                      (_ 'line)))))
+                ((or 38 48 58)
+                 (chomp-parse--set-colon-sgr-color screen p))))
              ;; Reset
              ((= p 0)  (chomp-screen-reset-attr screen))
              ;; Bold / faint / italic

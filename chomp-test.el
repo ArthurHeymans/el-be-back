@@ -796,6 +796,17 @@ Binds `screen' and `parser' in BODY."
            (attr (chomp-cell-attr cell)))
       (should (eq 'dashed (chomp-attr-underline attr))))))
 
+(ert-deftest chomp-test-sgr-colon-colors ()
+  "Colon-form SGR colors accept mixed semicolon-separated attributes."
+  (chomp-test-with-screen (:width 20 :height 6)
+    (chomp-test-output parser "\e[4:3;38:5:2;48:2::3:4:5;58:5:6mX")
+    (let* ((cell (aref (chomp-line-cells (chomp-screen-get-line screen 0)) 0))
+           (attr (chomp-cell-attr cell)))
+      (should (eq 'curly (chomp-attr-underline attr)))
+      (should (= 2 (chomp-attr-fg attr)))
+      (should (equal '(3 4 5) (chomp-attr-bg attr)))
+      (should (= 6 (chomp-attr-ul-color attr))))))
+
 (ert-deftest chomp-test-double-width-char ()
   "Double-width (CJK) characters occupy two cells."
   (chomp-test-with-screen (:width 10 :height 3)
