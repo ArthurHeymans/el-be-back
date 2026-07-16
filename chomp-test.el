@@ -11,6 +11,7 @@
 (require 'chomp-parse)
 (require 'chomp-render)
 (require 'chomp-io)
+(require 'chomp-trace)
 (require 'chomp-input)
 (require 'chomp)
 
@@ -1449,6 +1450,21 @@ Binds `screen' and `parser' in BODY."
       (should (eq 'existing (chomp-io-attach io 'existing (current-buffer))))
       (should (eq 'existing (chomp-io-process io)))
       (should (eq (current-buffer) (chomp-io-buffer io))))))
+
+(ert-deftest chomp-test-trace-records-process-output ()
+  "Tracing uses the terminal buffer instead of the process context."
+  (let ((terminal (generate-new-buffer " *chomp-trace-terminal*"))
+        (trace (generate-new-buffer " *chomp-trace-output*")))
+    (unwind-protect
+        (with-current-buffer terminal
+          (setq-local chomp-trace--buffer trace)
+          (let ((io (make-chomp-io :buffer terminal)))
+            (chomp-trace--filter-advice #'ignore io nil "\e[31mred")
+            (with-current-buffer trace
+              (should (string-match-p "output.*31mred" (buffer-string))))))
+      (mapc (lambda (buffer)
+              (when (buffer-live-p buffer) (kill-buffer buffer)))
+            (list terminal trace)))))
 
 (ert-deftest chomp-test-io-filter-queues-chunks-without-concat ()
   "Process filter appends chunks instead of growing one pending string."

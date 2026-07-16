@@ -95,20 +95,25 @@ cycles are logged to a trace buffer."
 
 (defun chomp-trace--filter-advice (orig-fn io process output)
   "Trace output arriving from the process."
-  (when chomp-trace--buffer
-    (chomp-trace--log nil 'output output))
+  (when-let ((buffer (chomp-io-buffer io)))
+    (with-current-buffer buffer
+      (when chomp-trace--buffer
+        (chomp-trace--log nil 'output output))))
   (funcall orig-fn io process output))
 
 (defun chomp-trace--resize-advice (orig-fn io new-width new-height)
   "Trace resize events."
-  (when chomp-trace--buffer
-    (chomp-trace--log nil 'resize new-width new-height))
+  (when-let ((buffer (chomp-io-buffer io)))
+    (with-current-buffer buffer
+      (when chomp-trace--buffer
+        (chomp-trace--log nil 'resize new-width new-height))))
   (funcall orig-fn io new-width new-height))
 
 (defun chomp-trace--refresh-advice (orig-fn render)
   "Trace redisplay events."
-  (when chomp-trace--buffer
-    (chomp-trace--log nil 'redisplay))
+  (with-current-buffer (chomp-render-state-buffer render)
+    (when chomp-trace--buffer
+      (chomp-trace--log nil 'redisplay)))
   (funcall orig-fn render))
 
 (provide 'chomp-trace)
