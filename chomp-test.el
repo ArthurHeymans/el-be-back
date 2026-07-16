@@ -379,6 +379,21 @@ Binds `screen' and `parser' in BODY."
                         (aref (chomp-line-cells
                                (chomp-screen-get-line screen 0)) 0))))))
 
+(ert-deftest chomp-test-charset-96-character-set ()
+  "ESC - designates the G1 96-character set."
+  (chomp-test-with-screen (:width 10 :height 3)
+    (chomp-test-output parser "\e-0\x0eq\x0f")
+    (should (= #x2500 (chomp-cell-char
+                        (aref (chomp-line-cells
+                               (chomp-screen-get-line screen 0)) 0))))))
+
+(ert-deftest chomp-test-charset-designation-recovers ()
+  "Unsupported character sets are consumed without disrupting text."
+  (chomp-test-with-screen (:width 10 :height 3)
+    (chomp-test-output parser "\e-?ok")
+    (should (eq :ground (chomp-parser-state parser)))
+    (should (equal "ok" (chomp-test-display-line screen 0)))))
+
 (ert-deftest chomp-test-scrollback ()
   "Lines scrolled off top go to scrollback."
   (chomp-test-with-screen (:width 5 :height 2)

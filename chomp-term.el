@@ -1510,9 +1510,9 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
               (_  'us-ascii))))
     (pcase slot
       (?\( (setf (chomp-screen-charset-g0 screen) cs))
-      (?\) (setf (chomp-screen-charset-g1 screen) cs))
-      (?* (setf (chomp-screen-charset-g2 screen) cs))
-      (?+ (setf (chomp-screen-charset-g3 screen) cs)))))
+      ((or ?\) ?-) (setf (chomp-screen-charset-g1 screen) cs))
+      ((or ?* ?.) (setf (chomp-screen-charset-g2 screen) cs))
+      ((or ?+ ?/) (setf (chomp-screen-charset-g3 screen) cs)))))
 
 (defun chomp-screen-shift-out (screen)
   "Invoke G1 character set (SO)."
