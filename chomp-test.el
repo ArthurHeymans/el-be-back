@@ -1014,6 +1014,17 @@ Binds `screen' and `parser' in BODY."
   (let ((screen (chomp-screen-create 80 24)))
     (should (equal "\e[3~" (chomp-input-translate 'deletechar screen)))))
 
+(ert-deftest chomp-test-input-committed-text ()
+  "Committed input-method text is sent unchanged."
+  (let (sent)
+    (with-temp-buffer
+      (setq-local chomp--io 'fake)
+      (setq-local chomp--screen (chomp-screen-create 10 3))
+      (cl-letf (((symbol-function 'chomp-io-send)
+                 (lambda (_io string) (push string sent))))
+        (chomp-self-input 1 "日本")))
+    (should (equal '("日本") sent))))
+
 (ert-deftest chomp-test-send-password ()
   "Password command sends the password followed by return."
   (let (sent)

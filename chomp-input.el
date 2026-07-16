@@ -82,8 +82,11 @@ Returns 1 + sum of: shift=1, meta/alt=2, control=4."
 
 (defun chomp-input-translate (key &optional screen)
   "Translate Emacs key event KEY to a terminal escape sequence string.
-SCREEN is consulted for mode flags.  Returns a string or nil."
-  (let* ((mods (event-modifiers key))
+SCREEN is consulted for mode flags.  Returns a string or nil.
+A string KEY is committed input text from an input method."
+  (if (stringp key)
+      key
+    (let* ((mods (event-modifiers key))
          (basic (event-basic-type key))
          (keypad (and screen (chomp-screen-keypad-mode screen))))
     (cond
@@ -184,7 +187,7 @@ SCREEN is consulted for mode flags.  Returns a string or nil."
       (string key))
 
      ;; ---- Unknown ----
-     (t nil))))
+     (t nil)))))
 
 ;;;; ---- Modifier Insertion Helper --------------------------------------
 
