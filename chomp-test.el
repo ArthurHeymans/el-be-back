@@ -482,6 +482,16 @@ Binds `screen' and `parser' in BODY."
            (attr (chomp-cell-attr cell)))
       (should (= 196 (chomp-attr-fg attr))))))
 
+(ert-deftest chomp-test-parse-sgr-256color-followed-by-reset ()
+  "A palette color does not consume a following SGR parameter."
+  (chomp-test-with-screen (:width 20 :height 6)
+    (chomp-test-output parser "\e[38;5;2;49mG")
+    (let* ((line (chomp-screen-get-line screen 0))
+           (cell (aref (chomp-line-cells line) 0))
+           (attr (chomp-cell-attr cell)))
+      (should (= 2 (chomp-attr-fg attr)))
+      (should-not (chomp-attr-bg attr)))))
+
 (ert-deftest chomp-test-parse-sgr-truecolor ()
   "Parser handles truecolor SGR."
   (chomp-test-with-screen (:width 20 :height 6)
