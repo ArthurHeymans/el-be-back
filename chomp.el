@@ -204,7 +204,8 @@ Options: `char', `semi-char', `emacs'."
 
 (defun chomp--require-running-terminal ()
   "Return the current terminal I/O state or signal `user-error'."
-  (unless (eq major-mode 'chomp-mode)
+  (unless (or (eq major-mode 'chomp-mode)
+              (bound-and-true-p chomp-eshell--io))
     (user-error "Not in a Chomp buffer"))
   (let ((process (and chomp--io (chomp-io-process chomp--io))))
     (unless (and process (process-live-p process))
@@ -647,17 +648,15 @@ Called after each render.  Debounced so short-lived matches don't flash."
 
 ;;;; ---- Resize Hook ----------------------------------------------------
 
-(defun chomp--window-size-change (frame)
-  "Handle window size changes for chomp buffers in FRAME."
-  (dolist (win (window-list frame 'no-minibuf))
-    (let ((buf (window-buffer win)))
-      (when (buffer-local-value 'chomp--io buf)
-        (with-current-buffer buf
-          (when chomp--io
-            (let ((new-width (window-max-chars-per-line win))
-                  (new-height (window-body-height win)))
-              (when (and (> new-width 0) (> new-height 0))
-                (chomp-io-handle-resize chomp--io new-width new-height)))))))))
+(defun chomp--window-size-change (window)
+  "Handle a size change for WINDOW showing a Chomp buffer."
+  (let ((buffer (window-buffer window)))
+    (when (buffer-local-value 'chomp--io buffer)
+      (with-current-buffer buffer
+        (let ((new-width (window-max-chars-per-line window))
+              (new-height (window-body-height window)))
+          (when (and (> new-width 0) (> new-height 0))
+            (chomp-io-handle-resize chomp--io new-width new-height)))))))
 
 ;;;; ---- Major Mode -----------------------------------------------------
 
@@ -683,7 +682,7 @@ Called after each render.  Debounced so short-lived matches don't flash."
               '(" " (:eval (chomp--mode-line-input-mode))))
   ;; Set up shell integration margins
   (chomp-shell-setup-margins)
-  ;; Add resize hook
+  ;; Buffer-local window-size-change hooks receive a window, not a frame.
   (add-hook 'window-size-change-functions #'chomp--window-size-change nil t)
   ;; Add focus tracking
   (chomp--ensure-focus-change-hook)
@@ -1012,6 +1011,8 @@ Local paths omit the hostname; remote TRAMP paths keep the host."
 
 ;; Add to mode-line
 (put 'chomp--input-mode 'risky-local-variable t)
+
+(require 'chomp-eshell)
 
 (provide 'chomp)
 ;;; chomp.el ends here

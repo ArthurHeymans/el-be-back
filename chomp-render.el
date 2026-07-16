@@ -163,35 +163,47 @@ background, font, or size than the rest of Emacs."
   "State for the buffer renderer."
   (screen nil)           ; chomp-screen
   (buffer nil)           ; Emacs buffer
+  (region-begin nil)     ; marker at start of terminal region
+  (region-end nil)       ; marker at end of terminal region
   (display-begin nil)    ; marker at start of display area
   (cursor-overlay nil)   ; overlay for cursor
   (scrollback-count 0))  ; scrollback lines rendered in buffer
 
 ;;;; ---- Constructor ----------------------------------------------------
 
-(defun chomp-render-create (screen buffer)
-  "Create a render state for SCREEN displayed in BUFFER."
+(defun chomp-render-create (screen buffer &optional begin end)
+  "Create a render state for SCREEN displayed in BUFFER.
+
+When BEGIN and END are non-nil, render only that buffer region.  This lets
+Eshell retain everything outside an inline terminal."
   (let ((render (make-chomp-render-state :screen screen :buffer buffer))
         (w (chomp-screen-width screen))
         (h (chomp-screen-height screen)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t)
             (buffer-undo-list t))
-        (erase-buffer)
-        ;; Insert display lines (H lines of W spaces, newline-separated)
-        (dotimes (i h)
-          (insert (make-string w ?\s))
-          (when (< i (1- h))
-            (insert "\n")))
-        ;; Place display-begin marker at buffer start
-        (let ((m (copy-marker (point-min))))
-          (set-marker-insertion-type m t)  ; advances when text inserted at it
-          (setf (chomp-render-state-display-begin render) m))
-        ;; Create cursor overlay (1 char wide at origin)
-        (let ((ov (make-overlay (point-min) (1+ (point-min)) buffer)))
-          (overlay-put ov 'face 'chomp-cursor)
-          (overlay-put ov 'priority 100)
-          (setf (chomp-render-state-cursor-overlay render) ov))))
+        (unless begin (erase-buffer))
+        (let ((region-begin (copy-marker (or begin (point-min))))
+              (region-end (copy-marker (or end (point-max)))))
+          (set-marker-insertion-type region-begin nil)
+          (set-marker-insertion-type region-end t)
+          (delete-region region-begin region-end)
+          (goto-char region-begin)
+          ;; Insert display lines (H lines of W spaces, newline-separated).
+          (dotimes (i h)
+            (insert (make-string w ?\s))
+            (when (< i (1- h)) (insert "\n")))
+          (setf (chomp-render-state-region-begin render) region-begin
+                (chomp-render-state-region-end render) region-end)
+          ;; New scrollback is inserted before this marker.
+          (let ((m (copy-marker region-begin)))
+            (set-marker-insertion-type m t)
+            (setf (chomp-render-state-display-begin render) m))
+          ;; Create cursor overlay (1 char wide at origin).
+          (let ((ov (make-overlay region-begin (1+ region-begin) buffer)))
+            (overlay-put ov 'face 'chomp-cursor)
+            (overlay-put ov 'priority 100)
+            (setf (chomp-render-state-cursor-overlay render) ov)))))
     render))
 
 ;;;; ---- Main Refresh ---------------------------------------------------
@@ -292,7 +304,7 @@ state are reconciled independently so metadata-only updates are visible."
          (count (min append-count model-count)))
     (save-excursion
       (when (> trim-count 0)
-        (goto-char (point-min))
+        (goto-char (chomp-render-state-region-begin render))
         (let ((beg (point))
               (n (min trim-count (chomp-render-state-scrollback-count render))))
           (forward-line n)
@@ -314,8 +326,8 @@ state are reconciled independently so metadata-only updates are visible."
          (display-begin (chomp-render-state-display-begin render))
          (lines (chomp-screen-scrollback-lines-raw screen)))
     (save-excursion
-      (delete-region (point-min) display-begin)
-      (goto-char (point-min))
+      (delete-region (chomp-render-state-region-begin render) display-begin)
+      (goto-char (chomp-render-state-region-begin render))
       (insert (chomp-render--lines-to-string lines width)))
     (setf (chomp-render-state-scrollback-count render) (length lines))))
 
@@ -457,7 +469,9 @@ compactly."
         (goto-char display-begin)
         (forward-line row)
         (let* ((bol (point))
-               (eol (line-end-position))
+               (eol (min (line-end-position)
+                         (marker-position
+                          (chomp-render-state-region-end render))))
                (new (chomp-render--apply-line-metadata
                      line (chomp-render--line-to-string line width) width)))
           ;; TUI programs often repaint rows with identical content.  Avoid a
@@ -703,9 +717,14 @@ hint at the live terminal position."
             (goto-char display-begin)
             (forward-line cy)
             (let* ((bol (point))
-                   (eol (line-end-position)))
+                   (eol (min (line-end-position)
+                             (marker-position
+                              (chomp-render-state-region-end render)))))
               (setq pos (min (+ bol cx) eol))
-              (move-overlay ov pos (min (1+ pos) (point-max)))))
+              (move-overlay ov pos
+                            (min (1+ pos)
+                                 (marker-position
+                                  (chomp-render-state-region-end render))))))
           (overlay-put ov 'face 'chomp-cursor)
           (if emacs-mode
               (setq-local cursor-type
@@ -735,8 +754,7 @@ hint at the live terminal position."
   (clrhash chomp-render--attr-face-cache)
   (when (boundp 'chomp--render)
     (dolist (buffer (buffer-list))
-      (when (and (buffer-live-p buffer)
-                 (eq (buffer-local-value 'major-mode buffer) 'chomp-mode))
+      (when (buffer-live-p buffer)
         (when-let ((render (buffer-local-value 'chomp--render buffer)))
           (chomp-render--invalidate-screen-lines
            (chomp-render-state-screen render))
@@ -789,7 +807,9 @@ Used after resize when the display area size has changed."
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
-            (erase-buffer)
+            (goto-char (chomp-render-state-region-begin render))
+            (delete-region (point)
+                           (chomp-render-state-region-end render))
           ;; Re-render scrollback
           (let ((sb-lines (chomp-screen-scrollback-lines screen)))
             (insert (chomp-render--lines-to-string sb-lines w))
@@ -814,9 +834,10 @@ Used after resize when the display area size has changed."
           (set-marker-insertion-type
            (chomp-render-state-display-begin render) t)
           ;; Reset cursor overlay
-          (let ((ov (chomp-render-state-cursor-overlay render)))
+          (let ((ov (chomp-render-state-cursor-overlay render))
+                (begin (chomp-render-state-region-begin render)))
             (when ov
-              (move-overlay ov (point-min) (1+ (point-min)))))
+              (move-overlay ov begin (1+ begin))))
           ;; Update cursor
           (chomp-render--update-cursor render)
             ;; Clear dirty since we just rendered everything
@@ -842,8 +863,10 @@ Used after resize when the display area size has changed."
   "Clean up render state."
   (when-let ((ov (chomp-render-state-cursor-overlay render)))
     (delete-overlay ov))
-  (when-let ((m (chomp-render-state-display-begin render)))
-    (set-marker m nil)))
+  (dolist (m (list (chomp-render-state-display-begin render)
+                   (chomp-render-state-region-begin render)
+                   (chomp-render-state-region-end render)))
+    (when m (set-marker m nil))))
 
 (chomp-render--install-theme-invalidation)
 

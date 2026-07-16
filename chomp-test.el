@@ -57,6 +57,29 @@ Binds `screen' and `parser' in BODY."
   (cons (chomp-screen-cursor-x screen)
         (chomp-screen-cursor-y screen)))
 
+(ert-deftest chomp-test-window-size-change-callbacks-receive-window ()
+  "Buffer-local resize callbacks accept the changed window."
+  (let* ((window (selected-window))
+         (original-buffer (window-buffer window))
+         (buffer (generate-new-buffer " *chomp-resize-test*"))
+         (screen (chomp-screen-create 1 1))
+         (io (make-chomp-io :screen screen)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq-local chomp--io io)
+            (setq-local chomp-eshell--io io))
+          (set-window-buffer window buffer)
+          (dolist (resize '(chomp--window-size-change chomp-eshell--resize))
+            (chomp-screen-resize screen 1 1)
+            (funcall resize window)
+            (should (= (window-max-chars-per-line window)
+                       (chomp-screen-width screen)))
+            (should (= (window-body-height window)
+                       (chomp-screen-height screen)))))
+      (set-window-buffer window original-buffer)
+      (kill-buffer buffer))))
+
 ;;;; ---- Screen Model Tests ---------------------------------------------
 
 (ert-deftest chomp-test-screen-create ()
@@ -1337,6 +1360,39 @@ Binds `screen' and `parser' in BODY."
         (should (= 0 (chomp-render-state-scrollback-count render)))
         (should-not (string-prefix-p "A  \n" (buffer-string)))))))
 
+(ert-deftest chomp-test-render-region-preserves-surrounding-buffer ()
+  "A bounded render region never rewrites surrounding Eshell text."
+  (let ((screen (chomp-screen-create 5 2)))
+    (with-temp-buffer
+      (insert "before\nold\nafter")
+      (let ((begin (copy-marker (point-min)))
+            end)
+        (goto-char (point-min))
+        (forward-line 1)
+        (set-marker begin (point))
+        (forward-line 1)
+        (setq end (copy-marker (point)))
+        (let ((render (chomp-render-create screen (current-buffer) begin end)))
+          (chomp-screen-write-string screen "hello" 0 5)
+          (chomp-render-refresh render)
+          (should (string-prefix-p "before\nhello" (buffer-string)))
+          (should (string-suffix-p "after" (buffer-string)))
+          (chomp-screen-resize screen 4 3)
+          (chomp-render-full-reset render)
+          (should (string-prefix-p "before\nhell" (buffer-string)))
+          (should (string-suffix-p "after" (buffer-string)))
+          (chomp-render-destroy render))))))
+
+(ert-deftest chomp-test-io-attach-keeps-existing-process ()
+  "Attaching uses an existing process instead of spawning one."
+  (let* ((screen (chomp-screen-create 5 2))
+         (parser (chomp-parse-create screen))
+         (io (make-chomp-io :screen screen :parser parser)))
+    (with-temp-buffer
+      (should (eq 'existing (chomp-io-attach io 'existing (current-buffer))))
+      (should (eq 'existing (chomp-io-process io)))
+      (should (eq (current-buffer) (chomp-io-buffer io))))))
+
 (ert-deftest chomp-test-io-filter-queues-chunks-without-concat ()
   "Process filter appends chunks instead of growing one pending string."
   (let ((io (make-chomp-io)))
@@ -1974,6 +2030,53 @@ Binds `screen' and `parser' in BODY."
       (chomp-shell-handle-osc51 "e;C" screen)
       (should (= 2 (length chomp-shell--pending-events)))
       (should (eq 'prompt-end (caar chomp-shell--pending-events))))))
+
+(ert-deftest chomp-test-eshell-inline-paste-routes-to-process ()
+  "Inline Eshell input uses the attached terminal process."
+  (let ((io (make-chomp-io :process 'process))
+        sent)
+    (with-temp-buffer
+      (setq-local chomp-eshell--io io)
+      (setq-local chomp--io io)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'chomp-io-send)
+                 (lambda (_io string) (setq sent string))))
+        (chomp-paste-string "paste")
+        (should (equal sent "paste"))))))
+
+(ert-deftest chomp-test-eshell-cleanup-restores-cursor ()
+  "Finishing an inline terminal restores Eshell's native cursor."
+  (with-temp-buffer
+    (let* ((screen (chomp-screen-create 5 2))
+           (render (chomp-render-create screen (current-buffer)))
+           (io (make-chomp-io :process 'process :render render))
+           (process-mark (copy-marker (point-min))))
+      (setq-local chomp-eshell--io io)
+      (setq-local chomp--io io)
+      (setq-local eshell-last-output-start (copy-marker (point-min)))
+      (setq-local eshell-last-output-end (copy-marker (point-min)))
+      (setq-local cursor-type nil)
+      (cl-letf (((symbol-function 'process-mark) (lambda (_) process-mark))
+                ((symbol-function 'chomp-io-stop) #'ignore)
+                ((symbol-function 'chomp-shell-cleanup) #'ignore)
+                ((symbol-function 'chomp-eshell--semi-char-mode) #'ignore)
+                ((symbol-function 'chomp-eshell--char-mode) #'ignore)
+                ((symbol-function 'chomp-eshell--running-mode) #'ignore)
+                ((symbol-function 'chomp--mouse-mode) #'ignore))
+        (chomp-eshell--cleanup 'process))
+      (should (eq cursor-type t)))))
+
+(ert-deftest chomp-test-eshell-sentinel-cleans-before-eshell ()
+  "Chomp releases its region before Eshell writes its exit status."
+  (let (events)
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'process-status) (lambda (_) 'exit))
+                ((symbol-function 'process-buffer) (lambda (_) (current-buffer)))
+                ((symbol-function 'chomp-eshell--cleanup)
+                 (lambda (_) (push 'cleanup events))))
+        (chomp-eshell--sentinel
+         (lambda (&rest _) (push 'eshell events)) 'process "finished\n")
+        (should (equal events '(eshell cleanup)))))))
 
 (provide 'chomp-test)
 ;;; chomp-test.el ends here

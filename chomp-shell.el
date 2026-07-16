@@ -31,6 +31,7 @@
 (require 'chomp-render)
 
 (declare-function chomp-emacs-mode "chomp")
+(defvar chomp-buffer-name-function)
 
 ;;;; ---- Customization --------------------------------------------------
 
@@ -319,7 +320,7 @@ after `chomp-render-refresh'."
         (cond
          ;; In scrollback region (before display-begin)
          ((< abs-line sb-count)
-          (goto-char (point-min))
+          (goto-char (chomp-render-state-region-begin render))
           (forward-line abs-line)
           (point))
          ;; In display region

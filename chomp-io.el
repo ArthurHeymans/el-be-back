@@ -374,6 +374,16 @@ the process environment."
     (setf (chomp-io-buffer io) buffer)
     proc))
 
+(defun chomp-io-attach (io process buffer)
+  "Attach IO to existing PROCESS in BUFFER without replacing its handlers.
+Eshell owns PROCESS's filter, sentinel, and bookkeeping; its output hook feeds
+Chomp through `chomp-io--filter'."
+  (setf (chomp-io-process io) process
+        (chomp-io-buffer io) buffer
+        (chomp-parser-write-fn (chomp-io-parser io))
+        (lambda (string) (chomp-io-send io string)))
+  process)
+
 (defun chomp-io--sentinel (io _proc event)
   "Handle process state changes."
   (when (string-match-p "\\(finished\\|exited\\|killed\\|deleted\\)" event)
