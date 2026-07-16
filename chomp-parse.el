@@ -948,12 +948,18 @@ Pm=1: read, Pm=4: read maximum."
     (chomp-screen-set-scroll-region screen top bot)))
 
 ;; SCP - Save Cursor Position
-(defun chomp-parse--csi-scp (parser _params)
-  (chomp-screen-save-cursor (chomp-parser-screen parser)))
+(defun chomp-parse--csi-scp (parser params)
+  (when (and (null (chomp-parser-private parser))
+             (string-empty-p (chomp-parser-intermediates parser))
+             (zerop (length params)))
+    (chomp-screen-save-cursor (chomp-parser-screen parser))))
 
 ;; RCP - Restore Cursor Position
-(defun chomp-parse--csi-rcp (parser _params)
-  (chomp-screen-restore-cursor (chomp-parser-screen parser)))
+(defun chomp-parse--csi-rcp (parser params)
+  (when (and (null (chomp-parser-private parser))
+             (string-empty-p (chomp-parser-intermediates parser))
+             (zerop (length params)))
+    (chomp-screen-restore-cursor (chomp-parser-screen parser))))
 
 ;; DECSCUSR - Set Cursor Style (with SP intermediate)
 (defun chomp-parse--csi-decscusr (parser params)

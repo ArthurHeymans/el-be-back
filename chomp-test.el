@@ -473,6 +473,14 @@ Binds `screen' and `parser' in BODY."
       (should (= 6 (chomp-attr-fg attr)))
       (should-not (chomp-attr-underline attr)))))
 
+(ert-deftest chomp-test-private-csi-u-does-not-restore-cursor ()
+  "Kitty keyboard negotiation is not mistaken for cursor restoration."
+  (chomp-test-with-screen (:width 20 :height 6)
+    (chomp-test-output parser "\e[3;5H\e[s\e[1;1H\e[u")
+    (should (equal '(4 . 2) (chomp-test-cursor screen)))
+    (chomp-test-output parser "\e[2;2H\e[>13u")
+    (should (equal '(1 . 1) (chomp-test-cursor screen)))))
+
 (ert-deftest chomp-test-parse-sgr-256color ()
   "Parser handles 256-color SGR."
   (chomp-test-with-screen (:width 20 :height 6)
