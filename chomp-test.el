@@ -1651,6 +1651,13 @@ Binds `screen' and `parser' in BODY."
         (should (equal "old\nabcdE\nlast" (chomp-copy-all)))))
     (should (equal "old\nabcdE\nlast" copied))))
 
+(ert-deftest chomp-test-copy-all-plain-text-preserves-graphemes ()
+  "Copy-all preserves combining marks and ZWJ sequences."
+  (let* ((screen (chomp-screen-create 10 2))
+         (parser (chomp-parse-create screen)))
+    (chomp-test-output parser "ã 👩‍💻")
+    (should (equal "ã 👩‍💻" (chomp-screen-plain-text screen)))))
+
 ;;;; ---- Session Tests --------------------------------------------------
 
 (defun chomp-test--session-buffer (name &optional identity)

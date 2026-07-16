@@ -1527,12 +1527,14 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
 (defun chomp--line-plain-text (line width)
   "Return LINE as plain text with terminal padding removed."
   (let ((cells (chomp--line-ensure-cells line width))
-        chars)
+        parts)
     (dotimes (i width)
       (let ((cell (aref cells i)))
         (unless (zerop (chomp-cell-width cell))
-          (push (chomp-cell-char cell) chars))))
-    (string-trim-right (apply #'string (nreverse chars)))))
+          (push (concat (string (chomp-cell-char cell))
+                        (chomp-cell-combining cell))
+                parts))))
+    (string-trim-right (apply #'concat (nreverse parts)))))
 
 (defun chomp-screen-plain-text (screen)
   "Return scrollback and viewport text from SCREEN.
