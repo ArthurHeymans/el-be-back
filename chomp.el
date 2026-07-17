@@ -692,8 +692,15 @@ Called after each render.  Debounced so short-lived matches don't flash."
   (let ((buffer (window-buffer window)))
     (when (buffer-local-value 'chomp--io buffer)
       (with-current-buffer buffer
-        (let ((new-width (window-max-chars-per-line window))
-              (new-height (window-body-height window)))
+        (let* ((process (chomp-io-process chomp--io))
+               (windows (get-buffer-window-list buffer nil t))
+               (size (and process windows
+                          (funcall window-adjust-process-window-size-function
+                                   process windows)))
+               (new-width (or (car-safe size)
+                              (window-max-chars-per-line window)))
+               (new-height (or (cdr-safe size)
+                               (window-body-height window))))
           (when (and (> new-width 0) (> new-height 0))
             (chomp-io-handle-resize chomp--io new-width new-height)))))))
 

@@ -85,6 +85,26 @@ Binds `screen' and `parser' in BODY."
       (set-window-buffer window original-buffer)
       (kill-buffer buffer))))
 
+(ert-deftest chomp-test-window-size-change-uses-smallest-visible-window ()
+  "Multiple views of one terminal use Emacs's standard process sizing rule."
+  (save-window-excursion
+    (let* ((buffer (generate-new-buffer " *chomp-resize-windows-test*"))
+           (screen (chomp-screen-create 1 1))
+           (io (make-chomp-io :screen screen :process 'fake)))
+      (unwind-protect
+          (progn
+            (set-window-buffer (selected-window) buffer)
+            (set-window-buffer (split-window-below) buffer)
+            (with-current-buffer buffer
+              (setq-local chomp--io io))
+            (cl-letf (((symbol-function 'process-live-p) (lambda (_) nil)))
+              (chomp--window-size-change (selected-window)))
+            (let ((size (window-adjust-process-window-size-smallest
+                         'fake (get-buffer-window-list buffer nil t))))
+              (should (= (car size) (chomp-screen-width screen)))
+              (should (= (cdr size) (chomp-screen-height screen)))))
+        (kill-buffer buffer)))))
+
 ;;;; ---- Screen Model Tests ---------------------------------------------
 
 (ert-deftest chomp-test-screen-create ()
@@ -391,6 +411,14 @@ Binds `screen' and `parser' in BODY."
     (dotimes (row 3)
       (should (= 6 (length (chomp-line-cells
                             (chomp-screen-get-line screen row))))))))
+
+(ert-deftest chomp-test-resize-does-not-reflow-alternate-screen ()
+  "Resizing a full-screen application preserves its row layout."
+  (chomp-test-with-screen (:width 4 :height 2)
+    (chomp-screen-enter-alt screen)
+    (chomp-test-output parser "abcd\r\nxy")
+    (chomp-screen-resize screen 2 3)
+    (should (equal '("ab" "xy" "") (chomp-test-display-text screen)))))
 
 (ert-deftest chomp-test-reset ()
   "Full reset clears everything."
@@ -1200,6 +1228,20 @@ Binds `screen' and `parser' in BODY."
       (let ((chomp-enable-shell-integration nil))
         (chomp-io-start io "/bin/sh" (current-buffer))))
     (should (equal '(utf-8-unix . no-conversion) coding))))
+
+(ert-deftest chomp-test-io-resize-drains-old-size-output-first ()
+  "Resize parses queued output before changing terminal dimensions."
+  (let* ((screen (chomp-screen-create 10 3))
+         (io (make-chomp-io :screen screen :pending-chunks '("output")))
+         events)
+    (cl-letf (((symbol-function 'chomp-io--process-pending)
+               (lambda (_io _all) (push (chomp-screen-width screen) events)
+                 (setf (chomp-io-pending-chunks io) nil)))
+              ((symbol-function 'chomp-screen-resize)
+               (lambda (_screen width _height) (push width events)
+                 (setf (chomp-screen-width screen) width))))
+      (chomp-io-handle-resize io 20 3))
+    (should (equal '(20 10) events))))
 
 (ert-deftest chomp-test-io-list-command-keeps-shell-integration ()
   "Shell argv from the program prompt retains startup integration."

@@ -1382,10 +1382,24 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
                          (= 0 (length (chomp--trim-trailing-blank-cells
                                        (chomp--line-ensure-cells line old-width)))))))
         (cl-decf end))
-      ;; Phase 1: Unwrap lines into logical lines
-      (let ((logical (chomp--unwrap-lines (cl-subseq old-lines 0 end) old-width)))
-        ;; Phase 2: Re-wrap to new width
-        (let ((new-lines (chomp--rewrap-lines logical new-width new-height)))
+      ;; Full-screen applications own their row layout and redraw after
+      ;; SIGWINCH.  Reflowing the alternate screen corrupts that layout.
+      (let ((new-lines
+             (if (chomp-screen-alt-screen screen)
+                 (let ((lines (make-vector new-height nil)))
+                   (dotimes (row new-height)
+                     (aset lines row
+                           (if (< row (length old-lines))
+                               (let ((line (aref old-lines row)))
+                                 (chomp--line-ensure-cells line new-width)
+                                 (setf (chomp-line-dirty line) t)
+                                 line)
+                             (chomp--make-empty-line new-width))))
+                   lines)
+               ;; Phase 1: Unwrap lines into logical lines, then re-wrap.
+               (chomp--rewrap-lines
+                (chomp--unwrap-lines (cl-subseq old-lines 0 end) old-width)
+                new-width new-height))))
           ;; Phase 3: Apply
           (setf (chomp-screen-lines screen) new-lines)
           (setf (chomp-screen-line-start screen) 0)
@@ -1406,7 +1420,7 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
           (setf (chomp-screen-dirty-count screen) new-height)
           ;; Reset tab stops for new width
           (setf (chomp-screen-tab-stops screen)
-                (chomp--default-tab-stops new-width)))))))
+                (chomp--default-tab-stops new-width))))))
 
 (defun chomp--unwrap-lines (lines old-width)
   "Merge wrapped physical lines into logical lines.
