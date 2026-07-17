@@ -372,10 +372,11 @@ local paths), and TERM is chosen by an on-remote probe; see
          ;; Environment
          (process-environment
           (append
-           (list
-            (format "COLUMNS=%d" w)
-            (format "LINES=%d" h)
-            "INSIDE_EMACS=chomp")
+           ;; Never export COLUMNS/LINES: ncurses lets them override
+           ;; TIOCGWINSZ, freezing full-screen apps (htop) at the startup
+           ;; size and ignoring later SIGWINCH resizes.  The stty wrapper
+           ;; sets the initial PTY size instead.
+           (list "INSIDE_EMACS=chomp")
            ;; Remote TERM is exported by the on-remote wrapper; TRAMP's
            ;; env filter would strip a TERM= entry set here anyway.
            (unless remote
@@ -456,6 +457,9 @@ Multibyte text is encoded as UTF-8; unibyte strings are sent unchanged."
   (let ((screen (chomp-io-screen io)))
     (unless (and (= new-width (chomp-screen-width screen))
                  (= new-height (chomp-screen-height screen)))
+      ;; Output already received was generated for the old dimensions.
+      (when (chomp-io--pending-p io)
+        (chomp-io--process-pending io t))
       ;; Step 1: Resize screen model
       (chomp-screen-resize screen new-width new-height)
       ;; Step 2: Notify PTY
