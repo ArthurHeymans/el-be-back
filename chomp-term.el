@@ -56,6 +56,7 @@
 (cl-defstruct (chomp-alt-save (:copier nil))
   "Saved main-screen state when in alternate screen."
   (lines nil)
+  (width 80) (height 24)
   (line-start 0)
   (cursor-x 0) (cursor-y 0)
   (cursor-saved-x 0) (cursor-saved-y 0) (cursor-saved-attr nil)
@@ -182,30 +183,40 @@ from allocating a full vector of cell structs for every blank bottom row."
   (aref (chomp-screen-lines screen) (chomp--line-index screen row)))
 
 (defun chomp--line-ensure-cells (line width)
-  "Ensure LINE's cell vector reflects its plain text cache."
-  (unless (chomp-line-cells-valid line)
-    (let ((text (or (chomp-line-text line) (make-string width ?\s)))
-          (cells (chomp-line-cells line)))
-      (unless (and cells (= (length cells) width))
-        (setq cells (chomp--make-empty-cells width))
-        (setf (chomp-line-cells line) cells))
-      (let ((i 0))
-        (while (< i width)
-          (let ((cell (aref cells i)))
-            (setf (chomp-cell-char cell)
-                  (if (< i (length text)) (aref text i) ?\s))
-            (setf (chomp-cell-width cell) 1)
-            (setf (chomp-cell-attr cell) (chomp-line-uniform-attr line)))
-          (cl-incf i)))
-      (dolist (run (chomp-line-attr-runs line))
-        (let ((i (nth 0 run))
-              (end (min width (nth 1 run)))
-              (attr (nth 2 run)))
-          (while (< i end)
-            (setf (chomp-cell-attr (aref cells i)) attr)
-            (cl-incf i))))
-      (setf (chomp-line-cells-valid line) t)))
-  (chomp-line-cells line))
+  "Ensure LINE has WIDTH cells, materializing its text cache when needed."
+  (let ((cells (chomp-line-cells line)))
+    (unless (and (chomp-line-cells-valid line)
+                 cells
+                 (= (length cells) width))
+      (if (chomp-line-cells-valid line)
+          ;; A resize can leave a saved/scrollback row at its old width.
+          ;; Keep its already-materialized contents rather than blanking it.
+          (let ((resized (chomp--make-empty-cells width)))
+            (when cells
+              (cl-replace resized cells :end2 (min width (length cells))))
+            (setq cells resized)
+            (setf (chomp-line-cells line) cells))
+        (let ((text (or (chomp-line-text line) (make-string width ?\s))))
+          (unless (and cells (= (length cells) width))
+            (setq cells (chomp--make-empty-cells width))
+            (setf (chomp-line-cells line) cells))
+          (let ((i 0))
+            (while (< i width)
+              (let ((cell (aref cells i)))
+                (setf (chomp-cell-char cell)
+                      (if (< i (length text)) (aref text i) ?\s))
+                (setf (chomp-cell-width cell) 1)
+                (setf (chomp-cell-attr cell) (chomp-line-uniform-attr line)))
+              (cl-incf i)))
+          (dolist (run (chomp-line-attr-runs line))
+            (let ((i (nth 0 run))
+                  (end (min width (nth 1 run)))
+                  (attr (nth 2 run)))
+              (while (< i end)
+                (setf (chomp-cell-attr (aref cells i)) attr)
+                (cl-incf i))))))
+      (setf (chomp-line-cells-valid line) t))
+    cells))
 
 (defun chomp--line-set-attr-run (line start end attr)
   "Set LINE's attribute over [START, END) to ATTR in its text run cache."
@@ -1170,6 +1181,28 @@ Handles LF, VT, FF."
 
 ;;;; ---- Alternate Screen -----------------------------------------------
 
+(defun chomp--resize-alt-save (saved new-width new-height)
+  "Resize SAVED's main-screen model while the alternate screen is active."
+  (let ((main (chomp-screen--make
+               :lines (chomp-alt-save-lines saved)
+               :width (chomp-alt-save-width saved)
+               :height (chomp-alt-save-height saved)
+               :line-start (chomp-alt-save-line-start saved)
+               :cursor-x (chomp-alt-save-cursor-x saved)
+               :cursor-y (chomp-alt-save-cursor-y saved)
+               :scroll-top (chomp-alt-save-scroll-top saved)
+               :scroll-bottom (chomp-alt-save-scroll-bottom saved)
+               :scrollback (chomp-alt-save-scrollback saved))))
+    (chomp-screen-resize main new-width new-height)
+    (setf (chomp-alt-save-lines saved) (chomp-screen-lines main)
+          (chomp-alt-save-width saved) (chomp-screen-width main)
+          (chomp-alt-save-height saved) (chomp-screen-height main)
+          (chomp-alt-save-line-start saved) (chomp-screen-line-start main)
+          (chomp-alt-save-cursor-x saved) (chomp-screen-cursor-x main)
+          (chomp-alt-save-cursor-y saved) (chomp-screen-cursor-y main)
+          (chomp-alt-save-scroll-top saved) (chomp-screen-scroll-top main)
+          (chomp-alt-save-scroll-bottom saved) (chomp-screen-scroll-bottom main))))
+
 (defun chomp-screen-enter-alt (screen)
   "Enter alternate screen buffer."
   (unless (chomp-screen-alt-screen screen)
@@ -1177,6 +1210,8 @@ Handles LF, VT, FF."
     (setf (chomp-screen-alt-screen screen)
           (make-chomp-alt-save
            :lines (chomp-screen-lines screen)
+           :width (chomp-screen-width screen)
+           :height (chomp-screen-height screen)
            :line-start (chomp-screen-line-start screen)
            :cursor-x (chomp-screen-cursor-x screen)
            :cursor-y (chomp-screen-cursor-y screen)
@@ -1315,6 +1350,13 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
   (when (and (> new-width 0) (> new-height 0)
              (or (/= new-width (chomp-screen-width screen))
                  (/= new-height (chomp-screen-height screen))))
+    (when-let ((saved (chomp-screen-alt-screen screen)))
+      (chomp--resize-alt-save saved new-width new-height))
+    ;; Scrollback is rendered at the current screen width too.
+    (when (chomp-screen-scrollback screen)
+      (dolist (line (chomp-screen-scrollback screen))
+        (chomp--line-ensure-cells line new-width))
+      (setf (chomp-screen-scrollback-dirty screen) t))
     (let ((old-lines (chomp--ordered-lines-vector screen))
           (old-width (chomp-screen-width screen)))
       ;; Phase 1: Unwrap lines into logical lines

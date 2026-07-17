@@ -357,6 +357,34 @@ Binds `screen' and `parser' in BODY."
     (chomp-screen-resize screen 100 30)
     (should (= 30 (length (chomp-screen-get-dirty screen))))))
 
+(ert-deftest chomp-test-resize-normalizes-scrollback ()
+  "Resizing keeps old scrollback rows renderable at the new width."
+  (chomp-test-with-screen (:width 4 :height 2)
+    (chomp-test-output parser "row")
+    (let ((display-line (chomp-screen-get-line screen 0)))
+      (chomp--line-ensure-cells display-line 4)
+      (let ((line (make-chomp-line
+                   :cells (vconcat (chomp-line-cells display-line))
+                   :cells-valid t)))
+        (setf (chomp-screen-scrollback screen) (list line)
+              (chomp-screen-scrollback-length screen) 1)
+        (chomp-screen-resize screen 6 2)
+        (should (= 6 (length (chomp-line-cells line))))
+        (should (string-prefix-p "row"
+                                 (chomp-render--line-to-string-scrollback line 6)))))))
+
+(ert-deftest chomp-test-resize-alternate-screen ()
+  "Resizing in the alternate screen keeps the saved main screen in sync."
+  (chomp-test-with-screen (:width 4 :height 2)
+    (chomp-test-output parser "main")
+    (chomp-screen-enter-alt screen)
+    (chomp-screen-resize screen 6 3)
+    (chomp-screen-leave-alt screen)
+    (should (equal '("main" "" "") (chomp-test-display-text screen)))
+    (dotimes (row 3)
+      (should (= 6 (length (chomp-line-cells
+                            (chomp-screen-get-line screen row))))))))
+
 (ert-deftest chomp-test-reset ()
   "Full reset clears everything."
   (chomp-test-with-screen (:width 20 :height 6)
