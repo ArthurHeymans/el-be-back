@@ -204,12 +204,18 @@ Options: `char', `semi-char', `emacs'."
 
 ;;;; ---- Input Mode Switching -------------------------------------------
 
+(defun chomp--refresh-input-cursor ()
+  "Update native and terminal cursor visibility after an input-mode change."
+  (when chomp--render
+    (chomp-render--update-cursor chomp--render)))
+
 (defun chomp-semi-char-mode ()
   "Switch to semi-char input mode."
   (interactive)
   (chomp--char-mode -1)
   (chomp--semi-char-mode 1)
   (setq chomp--input-mode 'semi-char)
+  (chomp--refresh-input-cursor)
   (force-mode-line-update))
 
 (defun chomp-char-mode ()
@@ -218,6 +224,7 @@ Options: `char', `semi-char', `emacs'."
   (chomp--semi-char-mode -1)
   (chomp--char-mode 1)
   (setq chomp--input-mode 'char)
+  (chomp--refresh-input-cursor)
   (force-mode-line-update))
 
 (defun chomp-emacs-mode ()
@@ -226,6 +233,7 @@ Options: `char', `semi-char', `emacs'."
   (chomp--semi-char-mode -1)
   (chomp--char-mode -1)
   (setq chomp--input-mode 'emacs)
+  (chomp--refresh-input-cursor)
   (force-mode-line-update))
 
 ;;;; ---- Self-Input Command ---------------------------------------------

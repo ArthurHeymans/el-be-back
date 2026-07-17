@@ -495,7 +495,7 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
 (defun chomp--prepare-semi-char-mode-map ()
   "Build the semi-char mode keymap."
   (let ((map (chomp-input-make-keymap
-              #'chomp-self-input '(:ascii :arrow :navigation)
+              #'chomp-self-input '(:ascii :arrow :navigation :function)
               `([?\C-c] [?\C-q] [?\C-y] [?\e ?y]
                 ,@chomp-semi-char-non-bound-keys))))
     ;; Overrides
@@ -512,7 +512,10 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
 
 (defun chomp-update-semi-char-mode-map ()
   "Rebuild the semi-char keymap after customization changes."
-  (setq chomp-semi-char-mode-map (chomp--prepare-semi-char-mode-map)))
+  (setq chomp-semi-char-mode-map (chomp--prepare-semi-char-mode-map))
+  ;; `define-minor-mode' records the original map object in this alist.
+  (when-let ((entry (assq 'chomp--semi-char-mode minor-mode-map-alist)))
+    (setcdr entry chomp-semi-char-mode-map)))
 
 ;;;; ---- Char Keymap ----------------------------------------------------
 

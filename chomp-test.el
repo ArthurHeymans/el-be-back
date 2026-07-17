@@ -357,6 +357,13 @@ Binds `screen' and `parser' in BODY."
     (chomp-screen-resize screen 100 30)
     (should (= 30 (length (chomp-screen-get-dirty screen))))))
 
+(ert-deftest chomp-test-resize-keeps-output-above-blank-rows ()
+  "Shrinking the window does not let padding rows discard visible output."
+  (chomp-test-with-screen (:width 10 :height 6)
+    (chomp-test-output parser "flashprog")
+    (chomp-screen-resize screen 10 3)
+    (should (equal '("flashprog" "" "") (chomp-test-display-text screen)))))
+
 (ert-deftest chomp-test-resize-normalizes-scrollback ()
   "Resizing keeps old scrollback rows renderable at the new width."
   (chomp-test-with-screen (:width 4 :height 2)
@@ -1058,14 +1065,23 @@ Binds `screen' and `parser' in BODY."
     (should (equal "\x7f" (chomp-input-translate ?\C-? screen)))))
 
 (ert-deftest chomp-test-input-function-keys-extended ()
-  "F21+ function keys produce escape sequences."
+  "Function keys translate and are forwarded in default semi-char mode."
   (let ((screen (chomp-screen-create 80 24)))
-    ;; F21
+    (should (equal "\eOP" (chomp-input-translate 'f1 screen)))
     (should (chomp-input-translate 'f21 screen))
-    ;; F36
     (should (chomp-input-translate 'f36 screen))
-    ;; F63
-    (should (chomp-input-translate 'f63 screen))))
+    (should (chomp-input-translate 'f63 screen)))
+  (should (eq #'chomp-self-input
+              (lookup-key chomp-semi-char-mode-map [f1])))
+  (should (eq #'chomp-self-input
+              (lookup-key chomp-semi-char-mode-map [f10])))
+  (let ((minor-mode-map-alist
+         `((chomp--semi-char-mode . ,(make-sparse-keymap)))))
+    (chomp-update-semi-char-mode-map)
+    (should (eq #'chomp-self-input
+                (lookup-key (cdr (assq 'chomp--semi-char-mode
+                                       minor-mode-map-alist))
+                            [f5])))))
 
 (ert-deftest chomp-test-input-deletechar ()
   "deletechar key translates to ESC[3~."
@@ -1459,6 +1475,36 @@ Binds `screen' and `parser' in BODY."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest chomp-test-render-ed2-shows-viewport-top ()
+  "ED 2 makes Ctrl-L and clear show the top of the live viewport."
+  (save-window-excursion
+    (let* ((screen (chomp-screen-create 5 2))
+           (parser (chomp-parse-create screen))
+           (buffer (generate-new-buffer " *chomp-ed2-test*")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (switch-to-buffer buffer)
+            (setq-local chomp--input-mode 'semi-char)
+            (let ((render (chomp-render-create screen buffer)))
+              (setf (chomp-screen-scrollback screen)
+                    (list (make-chomp-line :text "old  " :cells-valid nil))
+                    (chomp-screen-scrollback-length screen) 1
+                    (chomp-screen-scrollback-dirty screen) t)
+              (chomp-render-refresh render)
+              (set-window-start (selected-window) (point-min) t)
+              (chomp-test-output parser "\e[H\e[2Jprompt")
+              (chomp-render-refresh render)
+              (should (= (window-start)
+                         (marker-position
+                          (chomp-render-state-display-begin render))))
+              (chomp-screen-resize screen 6 3)
+              (chomp-render-full-reset render)
+              (should (= (window-start)
+                         (marker-position
+                          (chomp-render-state-display-begin render))))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest chomp-test-render-scrollback-clear-reconciles-buffer ()
   "ED 3 clears both model scrollback and rendered scrollback."
   (let* ((screen (chomp-screen-create 3 2))
@@ -1653,21 +1699,26 @@ Binds `screen' and `parser' in BODY."
 ;;;; ---- Mode Line Tests ------------------------------------------------
 
 (ert-deftest chomp-test-mode-line-input-mode-installed ()
-  "Chomp mode keeps its major-mode name and updates the input-mode label."
+  "Chomp mode keeps its name and refreshes the cursor when input mode changes."
   (with-temp-buffer
     (chomp-mode)
-    (should (equal "Chomp" mode-name))
-    (should (equal '(" " (:eval (chomp--mode-line-input-mode)))
-                   mode-line-process))
-    (chomp-semi-char-mode)
-    (should (equal "[Semi]" (chomp--mode-line-input-mode)))
-    (should (equal "Chomp" mode-name))
-    (chomp-char-mode)
-    (should (equal "[Char]" (chomp--mode-line-input-mode)))
-    (should (equal "Chomp" mode-name))
-    (chomp-emacs-mode)
-    (should (equal "[Emacs]" (chomp--mode-line-input-mode)))
-    (should (equal "Chomp" mode-name))))
+    (setq-local chomp--render 'render)
+    (let (refreshed)
+      (cl-letf (((symbol-function 'chomp-render--update-cursor)
+                 (lambda (_) (push chomp--input-mode refreshed))))
+        (should (equal "Chomp" mode-name))
+        (should (equal '(" " (:eval (chomp--mode-line-input-mode)))
+                       mode-line-process))
+        (chomp-semi-char-mode)
+        (should (equal "[Semi]" (chomp--mode-line-input-mode)))
+        (should (equal "Chomp" mode-name))
+        (chomp-char-mode)
+        (should (equal "[Char]" (chomp--mode-line-input-mode)))
+        (should (equal "Chomp" mode-name))
+        (chomp-emacs-mode)
+        (should (equal "[Emacs]" (chomp--mode-line-input-mode)))
+        (should (equal "Chomp" mode-name))
+        (should (equal '(emacs char semi-char) refreshed))))))
 
 ;;;; ---- Clear and Copy Tests -------------------------------------------
 

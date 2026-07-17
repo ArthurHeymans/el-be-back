@@ -718,7 +718,8 @@ hint at the live terminal position."
          (cy (chomp-screen-cursor-y screen))
          (visible (chomp-screen-cursor-visible screen))
          (style (chomp-screen-cursor-style screen))
-         (emacs-mode (eq (bound-and-true-p chomp--input-mode) 'emacs)))
+         (emacs-mode (eq (bound-and-true-p chomp--input-mode) 'emacs))
+         (viewport-reset (chomp-screen-take-viewport-reset screen)))
     (when ov
       (if (not visible)
           (progn
@@ -746,7 +747,9 @@ hint at the live terminal position."
             (setq-local cursor-type nil)
             (goto-char pos)
             (dolist (win (get-buffer-window-list nil nil t))
-              (set-window-point win pos)))
+              (set-window-point win pos)
+              (when viewport-reset
+                (set-window-start win display-begin t))))
           (if (chomp-render--cursor-blink-p style)
               (blink-cursor-mode 1)
             (blink-cursor-mode -1)))))))
@@ -867,7 +870,11 @@ Used after resize when the display area size has changed."
             (when (window-live-p saved-window)
               (save-excursion
                 (chomp-render--restore-position saved-window-start)
-                (set-window-start saved-window (point) t)))))))))
+                (set-window-start saved-window (point) t))))
+          (unless preserve-view
+            (dolist (window (get-buffer-window-list buffer nil t))
+              (set-window-start
+               window (chomp-render-state-display-begin render) t))))))))
 
 ;;;; ---- Cleanup --------------------------------------------------------
 

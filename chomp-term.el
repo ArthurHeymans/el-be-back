@@ -113,6 +113,19 @@
   ;; Pending wrap
   (pending-wrap nil))
 
+(defvar chomp--viewport-reset-screens
+  (make-hash-table :test #'eq :weakness 'key)
+  "Screens whose next render should show the live viewport from its top.")
+
+(defun chomp-screen-mark-viewport-reset (screen)
+  "Request that SCREEN's next render reset its visible viewport."
+  (puthash screen t chomp--viewport-reset-screens))
+
+(defun chomp-screen-take-viewport-reset (screen)
+  "Return and clear SCREEN's pending visible viewport reset."
+  (prog1 (gethash screen chomp--viewport-reset-screens)
+    (remhash screen chomp--viewport-reset-screens)))
+
 ;;;; ---- DEC Special Graphics Character Set ------------------------------
 
 (defconst chomp--dec-graphics-map
@@ -932,6 +945,7 @@ Handles LF, VT, FF."
        (cl-loop for r from 0 below cy
                 do (chomp--erase-whole-line screen r)))
       (2 ;; Erase whole display
+       (chomp-screen-mark-viewport-reset screen)
        (let ((bg (and (chomp-screen-current-attr screen)
                       (chomp-attr-bg (chomp-screen-current-attr screen)))))
          (if (null bg)
@@ -1357,10 +1371,19 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
       (dolist (line (chomp-screen-scrollback screen))
         (chomp--line-ensure-cells line new-width))
       (setf (chomp-screen-scrollback-dirty screen) t))
-    (let ((old-lines (chomp--ordered-lines-vector screen))
-          (old-width (chomp-screen-width screen)))
+    (let* ((old-lines (chomp--ordered-lines-vector screen))
+           (old-width (chomp-screen-width screen))
+           ;; Rows below the cursor that contain only terminal padding must not
+           ;; push visible output off the top when the window gets shorter.
+           (end (length old-lines)))
+      (while (and (> end (1+ (chomp-screen-cursor-y screen)))
+                  (let ((line (aref old-lines (1- end))))
+                    (and (not (chomp-line-wrapped line))
+                         (= 0 (length (chomp--trim-trailing-blank-cells
+                                       (chomp--line-ensure-cells line old-width)))))))
+        (cl-decf end))
       ;; Phase 1: Unwrap lines into logical lines
-      (let ((logical (chomp--unwrap-lines old-lines old-width)))
+      (let ((logical (chomp--unwrap-lines (cl-subseq old-lines 0 end) old-width)))
         ;; Phase 2: Re-wrap to new width
         (let ((new-lines (chomp--rewrap-lines logical new-width new-height)))
           ;; Phase 3: Apply
