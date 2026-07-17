@@ -352,6 +352,13 @@ the process environment."
          ;; termios like Eat does before execing the client program.
          (cmd (chomp-io--wrap-command-with-stty
                (chomp-io--build-command shell-command extra-env) h w))
+         ;; Large TUI redraws emit hundreds of KB in one write.  Before
+         ;; Emacs 31, `process-adaptive-read-buffering' throttles bursty
+         ;; processes to ~40 KB/s; also raise the per-read cap so one
+         ;; filter call can consume a full frame.  Both are captured at
+         ;; `make-process' time, so they must be let-bound here.
+         (process-adaptive-read-buffering nil)
+         (read-process-output-max (max read-process-output-max (* 1024 1024)))
          ;; Create process
          (proc (make-process
                 :name "chomp"
