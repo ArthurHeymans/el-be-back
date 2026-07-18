@@ -1,0 +1,139 @@
+#+TITLE: Chomp
+
+Chomp is a terminal emulator for Emacs written in pure Elisp.  It is an
+alternative to [[https://codeberg.org/akib/emacs-eat][Eat]], keeping Eat's user-facing model while restructuring the
+internals.  It also borrows ideas from [[../ghostel/][ghostel]].  See [[#credits][Credits]].
+
+Open a terminal with:
+
+#+begin_src text
+M-x chomp
+#+end_src
+
+* Architecture
+
+| Module         | Role                                                          |
+|----------------+---------------------------------------------------------------|
+| =chomp-term=   | Screen model: cells, lines, scrollback, alt screen, resize    |
+| =chomp-parse=  | VT escape-sequence state machine mutating the screen model    |
+| =chomp-render= | Incremental (dirty-line) rendering of the model into a buffer |
+| =chomp-input=  | Key translation, input modes (semi-char, char, emacs)         |
+| =chomp-io=     | PTY process management, chunked/batched async I/O, resize     |
+| =chomp-shell=  | Shell integration: prompts, directory tracking, OSC handling  |
+| =chomp-eshell= | Visual-command terminal inside Eshell                         |
+| =chomp-trace=  | Optional event tracing for debugging                          |
+
+* Chomp vs. Eat
+:PROPERTIES:
+:CUSTOM_ID: chomp-vs-eat
+:END:
+
+Chomp deliberately keeps what makes Eat pleasant to use: the input modes
+(semi-char, char, emacs), the =eat.ti= terminfo entry, the stty bootstrap
+before exec, and shell/Eshell integration in the same spirit.  The
+differences are internal.
+
+** Screen state lives in a data structure, not the buffer
+
+Eat's terminal state /is/ the Emacs buffer: text and text properties on
+buffer text are the screen model, and escape sequences are applied as buffer
+edits.  This is memory-efficient and gives free integration with Emacs text
+machinery, but it couples terminal semantics to buffer semantics: terminal
+updates interact with undo, markers, point, other modes touching the buffer,
+and Emacs redisplay.
+
+Chomp splits this in two.  The screen is a pure Elisp structure — a vector
+of line records holding cell arrays (char, width, attributes) plus cursor,
+scroll region, tab stops, alt screen, and scrollback.  The buffer is a view:
+=chomp-render= refreshes only lines the model marked dirty, in a controlled
+render pass, and the buffer is read-only from every other perspective.  The
+parser and model can therefore be exercised in batch mode without any buffer
+or process, which is how most of the test suite works.
+
+** The process filter never parses
+
+Eat parses escape sequences synchronously inside the process filter: a large
+or hostile output burst (=cat /dev/urandom=, a huge binary) is parsed to
+completion before Emacs gets control back.
+
+In chomp the filter only appends raw bytes to a queue.  A scheduler drains
+the queue in bounded chunks (=chomp-chunk-size=), and rendering is batched
+between a minimum and maximum latency (=chomp-minimum-latency=,
+=chomp-maximum-latency=): fast output coalesces into fewer render passes,
+slow output renders promptly.  Control returns to the event loop between
+chunks, so =C-g= and user input stay responsive under output floods.
+
+** Rendering is a diff against the model
+
+Because Eat edits the buffer as sequences arrive, display work is
+interleaved with parsing.  Chomp accumulates all mutations in the model and
+then repaints only dirty lines once per batch.  Redisplay fights (flicker,
+point jumping, interaction with =hl-line-mode=-style modes) are confined to
+one small render layer.
+
+** Resize semantics
+
+On resize, chomp reflows wrapped lines in the main screen and scrollback,
+but deliberately does /not/ reflow the alternate screen: full-screen
+applications own their row layout and repaint after =SIGWINCH=, so the model
+keeps rows as-is and lets the application redraw.  The PTY is resized after
+queued output generated at the old size has been drained, so escape
+sequences are always interpreted at the dimensions they were produced for.
+
+** Defensive parsing
+
+Unknown or malformed sequences never signal: every parser state has a
+fallthrough, cursor coordinates are clamped, and split UTF-8 sequences are
+buffered across filter calls.
+
+** What Eat has that chomp does not
+
+Eat is the mature project: Sixel inline graphics, a documented embeddable
+terminal library API (=eat-term-make= and friends, used by other packages to
+put a terminal in their own buffers), Info documentation, years of
+compatibility fixes, and broader Emacs-version support.  Chomp reimplements the core but has not matched Eat's full feature
+surface.
+
+* Chomp vs. ghostel
+
+[[../ghostel/][Ghostel]] takes the opposite implementation strategy: a native module in Zig
+embedding libghostty-vt (Ghostty's VT engine) owns parsing, screen state,
+and local PTY I/O; Elisp handles keymaps, buffers, and commands.  That buys
+C-speed parsing and a modern escape-sequence surface (Kitty keyboard and
+graphics protocols, DEC 2026 synchronized output) at the cost of a compiled
+module per platform and terminal state living behind a module boundary.
+Chomp stays pure Elisp: slower, smaller escape coverage, but runs on any
+Emacs 28.1+, is inspectable and advisable at runtime, and its state is
+directly testable.  Several user-facing touches (shell-integration
+ergonomics, project-scoped terminal commands, Eshell visual-command mode)
+follow ghostel's refinements of the Eat model.
+
+* Credits
+:PROPERTIES:
+:CUSTOM_ID: credits
+:END:
+
+- [[https://codeberg.org/akib/emacs-eat][Eat]] by Akib Azmain Turja — the foundation for this project.  The input
+  modes, terminfo entry, stty bootstrap, and shell integration approach all
+  originate there, and chomp's design is best understood as a response to
+  Eat's architecture.
+- [[../ghostel/][ghostel]] by Daniel Kraus — the polished user-facing feature set chomp
+  measures itself against, and a well-documented native-module counterpoint
+  to doing everything in Elisp.
+
+Both were read closely and heavily relied on; bugs in the reinterpretation
+are chomp's own.
+
+* Requirements
+
+- Emacs 28.1 or newer
+
+* Tests
+
+#+begin_src sh
+emacs -Q --batch -L . -l chomp-test.el -f ert-run-tests-batch-and-exit
+#+end_src
+
+* License
+
+GPL-3.0-or-later.

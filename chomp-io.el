@@ -457,6 +457,7 @@ Multibyte text is encoded as UTF-8; unibyte strings are sent unchanged."
   (let ((screen (chomp-io-screen io)))
     (unless (and (= new-width (chomp-screen-width screen))
                  (= new-height (chomp-screen-height screen)))
+      (let ((width-changed (/= new-width (chomp-screen-width screen))))
       ;; Output already received was generated for the old dimensions.
       (when (chomp-io--pending-p io)
         (chomp-io--process-pending io t))
@@ -466,9 +467,12 @@ Multibyte text is encoded as UTF-8; unibyte strings are sent unchanged."
       (when-let ((proc (chomp-io-process io)))
         (when (process-live-p proc)
           (set-process-window-size proc new-height new-width)))
-      ;; Step 3: Full re-render
+      ;; Step 3: A minibuffer only changes height.  Rebuild its viewport,
+      ;; not thousands of unchanged scrollback rows.
       (when (chomp-io-render io)
-        (chomp-render-full-reset (chomp-io-render io))))))
+        (if width-changed
+            (chomp-render-full-reset (chomp-io-render io))
+          (chomp-render-resize-height (chomp-io-render io))))))))
 
 ;;;; ---- Cleanup --------------------------------------------------------
 

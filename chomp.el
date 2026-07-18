@@ -716,7 +716,12 @@ Called after each render.  Debounced so short-lived matches don't flash."
   (setq-local scroll-step 1)
   (setq-local auto-hscroll-mode nil)
   (setq-local hscroll-margin 0)
-  ;; Disable features that conflict with terminal display
+  ;; Disable features that conflict with terminal display.
+  ;; Chomp supplies its own text properties; deferred fontification makes
+  ;; redisplay scan the entire scrollback when revisiting a terminal.
+  (font-lock-mode -1)
+  (when (fboundp 'emojify-mode)
+    (emojify-mode -1))
   (setq-local bidi-paragraph-direction 'left-to-right)
   (setq-local show-trailing-whitespace nil)
   (setq-local display-line-numbers nil)

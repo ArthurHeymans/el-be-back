@@ -876,6 +876,34 @@ Used after resize when the display area size has changed."
               (set-window-start
                window (chomp-render-state-display-begin render) t))))))))
 
+(defun chomp-render-resize-height (render)
+  "Rebuild only RENDER's viewport after a height-only terminal resize."
+  (let* ((screen (chomp-render-state-screen render))
+         (buffer (chomp-render-state-buffer render))
+         (width (chomp-screen-width screen))
+         (height (chomp-screen-height screen)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t)
+              (inhibit-modification-hooks t)
+              (buffer-undo-list t)
+              (display-begin (chomp-render-state-display-begin render)))
+          (save-excursion
+            (goto-char display-begin)
+            (delete-region (point) (chomp-render-state-region-end render))
+            (set-marker-insertion-type display-begin nil)
+            (dotimes (row height)
+              (let ((line (chomp-screen-get-line screen row)))
+                (insert (if line
+                            (chomp-render--apply-line-metadata
+                             line (chomp-render--line-to-string line width) width)
+                          (make-string width ?\s)))
+                (when (< row (1- height)) (insert "\n"))))
+            (set-marker-insertion-type display-begin t))
+          (chomp-render--update-cursor render)
+          (chomp-screen-clear-dirty screen)
+          (chomp-screen-clear-scrollback-dirty screen))))))
+
 ;;;; ---- Cleanup --------------------------------------------------------
 
 (defun chomp-render-destroy (render)

@@ -1740,6 +1740,16 @@ Binds `screen' and `parser' in BODY."
 
 ;;;; ---- Mode Line Tests ------------------------------------------------
 
+(ert-deftest chomp-test-mode-disables-fontification ()
+  "Chomp prevents deferred fontification from scanning terminal scrollback."
+  (let (emojify-argument)
+    (cl-letf (((symbol-function 'emojify-mode)
+               (lambda (argument) (setq emojify-argument argument))))
+      (with-temp-buffer
+        (chomp-mode)
+        (should-not font-lock-mode)
+        (should (equal -1 emojify-argument))))))
+
 (ert-deftest chomp-test-mode-line-input-mode-installed ()
   "Chomp mode keeps its name and refreshes the cursor when input mode changes."
   (with-temp-buffer
