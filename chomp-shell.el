@@ -33,6 +33,8 @@
 (declare-function chomp-emacs-mode "chomp")
 (declare-function chomp--cwd-to-path "chomp")
 (defvar chomp-buffer-name-function)
+(defvar chomp--render)
+(defvar chomp--screen)
 
 ;;;; ---- Customization --------------------------------------------------
 
@@ -141,10 +143,9 @@ Returns a list of strings."
     (split-string (substring payload start) ";" nil)))
 
 (defun chomp-shell--absolute-line (screen)
-  "Return the current absolute line number in SCREEN.
-This is scrollback-count + cursor-y, giving a stable line index
-that persists across renders."
-  (+ (length (chomp-screen-scrollback screen))
+  "Return the current physical row number in SCREEN.
+This is the current-width history row count plus cursor-y."
+  (+ (chomp-screen-history-row-count screen)
      (chomp-screen-cursor-y screen)))
 
 ;;;; ---- Prompt Indicator Helpers ---------------------------------------
@@ -303,7 +304,7 @@ after `chomp-render-refresh'."
   "Convert ABS-LINE and COLUMN to a buffer position in RENDER."
   (let* ((display-begin (chomp-render-state-display-begin render))
          (screen (chomp-render-state-screen render))
-         (sb-count (length (chomp-screen-scrollback screen))))
+         (sb-count (chomp-screen-history-row-count screen)))
     (with-current-buffer (chomp-render-state-buffer render)
       (save-excursion
         (cond
@@ -421,37 +422,59 @@ Remove overlays that point to deleted text."
   "Move to the Nth previous shell prompt.
 N defaults to 1."
   (interactive "p")
-  (let ((n (or n 1)))
-    (dotimes (_ n)
-      (let ((prev (previous-single-property-change
-                   (point) 'chomp-shell-prompt-end)))
-        (if prev
-            (progn
-              (goto-char prev)
-              ;; If we're on a prompt-end, jump past it to the previous one
-              (when (get-text-property (point) 'chomp-shell-prompt-end)
-                (let ((prev2 (previous-single-property-change
-                              (point) 'chomp-shell-prompt-end)))
-                  (when prev2 (goto-char prev2)))))
-          (user-error "No previous prompt"))))))
+  (chomp-shell--goto-prompt (- (or n 1))))
 
 (defun chomp-shell-next-prompt (&optional n)
   "Move to the Nth next shell prompt.
 N defaults to 1."
   (interactive "p")
-  (let ((n (or n 1)))
-    (dotimes (_ n)
-      (let ((next (next-single-property-change
-                   (point) 'chomp-shell-prompt-end)))
-        (if next
-            (progn
-              (goto-char next)
-              ;; Skip past the prompt-end region
-              (when (get-text-property (point) 'chomp-shell-prompt-end)
-                (let ((next2 (next-single-property-change
-                              (point) 'chomp-shell-prompt-end)))
-                  (when next2 (goto-char next2)))))
-          (user-error "No next prompt"))))))
+  (chomp-shell--goto-prompt (or n 1)))
+
+(defun chomp-shell--goto-prompt (step)
+  "Move STEP prompt boundaries through model-backed history."
+  (if (not (and (bound-and-true-p chomp--render)
+                (bound-and-true-p chomp--screen)))
+      (dotimes (_ (abs step))
+        (let ((position
+               (if (> step 0)
+                   (next-single-property-change
+                    (point) 'chomp-shell-prompt-end)
+                 (previous-single-property-change
+                  (point) 'chomp-shell-prompt-end))))
+          (unless position
+            (user-error "No %s prompt" (if (> step 0) "next" "previous")))
+          (goto-char position)
+          (when (get-text-property (point) 'chomp-shell-prompt-end)
+            (when-let ((next
+                        (if (> step 0)
+                            (next-single-property-change
+                             (point) 'chomp-shell-prompt-end)
+                          (previous-single-property-change
+                           (point) 'chomp-shell-prompt-end))))
+              (goto-char next)))))
+    (let ((current (chomp-render-buffer-location chomp--render))
+          (locations (chomp-screen-prompt-end-locations chomp--screen))
+          target)
+      (dotimes (_ (abs step))
+        (setq target
+              (if (> step 0)
+                  (cl-find-if
+                   (lambda (location)
+                     (or (> (car location) (car current))
+                         (and (= (car location) (car current))
+                              (> (cdr location) (cdr current)))))
+                   locations)
+                (cl-find-if
+                 (lambda (location)
+                   (or (< (car location) (car current))
+                       (and (= (car location) (car current))
+                            (< (cdr location) (cdr current)))))
+                 (reverse locations))))
+        (unless target
+          (user-error "No %s prompt" (if (> step 0) "next" "previous")))
+        (setq current target))
+      (chomp-render-goto-location
+       chomp--render (car current) (cdr current)))))
 
 ;;;; ---- Margin Setup ---------------------------------------------------
 

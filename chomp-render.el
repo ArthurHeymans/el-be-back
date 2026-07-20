@@ -10,7 +10,8 @@
 ;; terminal's perspective -- undo is always disabled.
 ;;
 ;; Buffer layout:
-;;   [scrollback lines...] display-begin [display lines...] display-end
+;;   [bounded history slab...] display-begin [display lines...] display-end
+;; Logical history remains in the screen model; only nearby rows are inserted.
 
 ;;; Code:
 
@@ -167,7 +168,12 @@ background, font, or size than the rest of Emacs."
   (region-end nil)       ; marker at end of terminal region
   (display-begin nil)    ; marker at start of display area
   (cursor-overlay nil)   ; overlay for cursor
-  (scrollback-count 0))  ; scrollback lines rendered in buffer
+  (scrollback-count 0)   ; history rows currently materialized
+  (history-start-row 0)  ; absolute physical row of first materialized row
+  (history-total-rows 0)
+  (history-generation -1)
+  (virtual-mark nil)
+  (history-cache nil))
 
 ;;;; ---- Constructor ----------------------------------------------------
 
@@ -176,7 +182,9 @@ background, font, or size than the rest of Emacs."
 
 When BEGIN and END are non-nil, render only that buffer region.  This lets
 Eshell retain everything outside an inline terminal."
-  (let ((render (make-chomp-render-state :screen screen :buffer buffer))
+  (let ((render (make-chomp-render-state
+                 :screen screen :buffer buffer
+                 :history-cache (make-hash-table :test #'equal)))
         (w (chomp-screen-width screen))
         (h (chomp-screen-height screen)))
     (with-current-buffer buffer
@@ -208,19 +216,6 @@ Eshell retain everything outside an inline terminal."
 
 ;;;; ---- Main Refresh ---------------------------------------------------
 
-(defun chomp-render--save-position (pos)
-  "Return POS as a buffer line and terminal column."
-  (when pos
-    (save-excursion
-      (goto-char pos)
-      (cons (1- (line-number-at-pos)) (current-column)))))
-
-(defun chomp-render--restore-position (saved)
-  "Restore point to SAVED buffer line and terminal column."
-  (goto-char (point-min))
-  (forward-line (car saved))
-  (move-to-column (cdr saved)))
-
 (defun chomp-render-refresh (render)
   "Refresh the buffer from the screen model.
 Only dirty display lines are re-rendered, but scrollback and cursor
@@ -233,9 +228,9 @@ state are reconciled independently so metadata-only updates are visible."
         (let* ((preserve-view
                 (eq (bound-and-true-p chomp--input-mode) 'emacs))
                (saved-point (and preserve-view
-                                 (chomp-render--save-position (point))))
+                                 (chomp-render-buffer-anchor render (point))))
                (saved-mark (and preserve-view (mark t)
-                                (chomp-render--save-position (mark t))))
+                                (chomp-render-buffer-anchor render (mark t))))
                (saved-mark-active (and preserve-view mark-active))
                (saved-window
                 (and preserve-view
@@ -243,8 +238,8 @@ state are reconciled independently so metadata-only updates are visible."
                      (selected-window)))
                (saved-window-start
                 (and saved-window
-                     (chomp-render--save-position
-                      (window-start saved-window)))))
+                     (chomp-render-buffer-anchor
+                      render (window-start saved-window)))))
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
@@ -256,101 +251,211 @@ state are reconciled independently so metadata-only updates are visible."
             ;; Cursor movement/visibility/style can change without dirtying a row.
             (chomp-render--update-cursor render))
           (when preserve-view
-            (chomp-render--restore-position saved-point)
+            (chomp-render-goto-anchor render saved-point t)
             (if saved-mark
                 (progn
                   (save-excursion
-                    (chomp-render--restore-position saved-mark)
+                    (chomp-render-goto-anchor render saved-mark t)
                     (set-marker (mark-marker) (point)))
                   (setq mark-active saved-mark-active))
               (set-marker (mark-marker) nil))
             (when (window-live-p saved-window)
               (save-excursion
-                (chomp-render--restore-position saved-window-start)
+                (chomp-render-goto-anchor render saved-window-start t)
                 (set-window-start saved-window (point) t))))))
       (chomp-screen-clear-dirty screen))))
 
 ;;;; ---- Scrollback Rendering -------------------------------------------
 
 (defun chomp-render--update-scrollback (render)
-  "Reconcile rendered scrollback with the screen model."
+  "Materialize only the bounded history range needed by RENDER."
   (let* ((screen (chomp-render-state-screen render))
-         (model-count (chomp-screen-scrollback-length screen))
-         (rendered-count (chomp-render-state-scrollback-count render))
-         (new-count (- model-count rendered-count))
-         (appended (chomp-screen-scrollback-appended-count screen))
-         (trimmed (chomp-screen-scrollback-trimmed-count screen)))
-    (cond
-     ;; Clears, alternate-screen switches, and other non-append mutations
-     ;; require a full scrollback-region rewrite.
-     ((or (chomp-screen-scrollback-dirty screen)
-          (< new-count 0))
-      (chomp-render--rebuild-scrollback render))
-     ;; When scrollback is already full, new model lines are balanced by trims:
-     ;; mirror that in the buffer by deleting oldest rendered rows and appending
-     ;; the new rows, instead of rebuilding the entire history region.
-     ((or (> new-count 0) (> appended 0) (> trimmed 0))
-      (chomp-render--append-scrollback render
-                                       (max appended new-count)
-                                       trimmed
-                                       model-count)))
+         (total (chomp-screen-history-row-count screen))
+         (generation (chomp-screen-history-generation screen))
+         (capacity (chomp-render--history-capacity render))
+         (display-begin (chomp-render-state-display-begin render))
+         (reading-history (< (point) (marker-position display-begin)))
+         (start (if reading-history
+                    (min (chomp-render-state-history-start-row render)
+                         (max 0 (1- total)))
+                  (max 0 (- total capacity))))
+         (count (min capacity (- total start))))
+    (when (or (/= generation
+                  (chomp-render-state-history-generation render))
+              (/= start (chomp-render-state-history-start-row render))
+              (/= count (chomp-render-state-scrollback-count render))
+              (/= total (chomp-render-state-history-total-rows render)))
+      (chomp-render--rebuild-scrollback render start count total generation))
     (chomp-screen-clear-scrollback-dirty screen)))
 
-(defun chomp-render--append-scrollback (render append-count trim-count model-count)
-  "Append APPEND-COUNT newest scrollback lines and delete TRIM-COUNT old rows."
-  (let* ((screen (chomp-render-state-screen render))
-         (width (chomp-screen-width screen))
-         (display-begin (chomp-render-state-display-begin render))
-         (count (min append-count model-count)))
-    (save-excursion
-      (when (> trim-count 0)
-        (goto-char (chomp-render-state-region-begin render))
-        (let ((beg (point))
-              (n (min trim-count (chomp-render-state-scrollback-count render))))
-          (forward-line n)
-          (delete-region beg (point))))
-      (when (> count 0)
-        ;; New scrollback lines are at the front of the list (newest first).
-        ;; Insert them in chronological order (oldest of the new batch first).
-        (goto-char display-begin)
-        (insert (chomp-render--lines-to-string
-                 (chomp-render--newest-lines-oldest-first
-                  (chomp-screen-scrollback screen) count)
-                 width))))
-    (setf (chomp-render-state-scrollback-count render) model-count)))
+(defun chomp-render--history-capacity (render)
+  "Return the bounded number of history rows to materialize for RENDER."
+  (let* ((buffer (chomp-render-state-buffer render))
+         (windows (get-buffer-window-list buffer nil t))
+         (height (max 24 (cl-loop for window in windows
+                                  maximize (window-body-height window)
+                                  into maximum
+                                  finally return (or maximum 0)))))
+    (* 3 height)))
 
-(defun chomp-render--rebuild-scrollback (render)
-  "Replace the rendered scrollback region from the screen model."
+(defun chomp-render--history-row-string (render row)
+  "Return cached rendered history ROW for RENDER."
   (let* ((screen (chomp-render-state-screen render))
          (width (chomp-screen-width screen))
+         (location (chomp-screen-history-row-location screen row))
+         (logical (car location))
+         (key (list (chomp-history-line-id logical)
+                    (chomp-history-line-generation logical)
+                    (cdr location) width))
+         (cache (chomp-render-state-history-cache render)))
+    (or (gethash key cache)
+        (let* ((line (chomp-screen-history-render-row screen row))
+               (string (concat
+                        (chomp-render--apply-line-metadata
+                         line
+                         (chomp-render--line-to-string-scrollback line width)
+                         width)
+                        "\n")))
+          (put-text-property 0 (length string) 'chomp-history-id
+                             (chomp-history-line-id logical) string)
+          (put-text-property 0 (length string) 'chomp-history-offset
+                             (cdr location) string)
+          (when (> (hash-table-count cache)
+                   (* 2 (chomp-render--history-capacity render)))
+            (clrhash cache))
+          (puthash key string cache)
+          string))))
+
+(defun chomp-render--rebuild-scrollback
+    (render &optional start count total generation)
+  "Replace RENDER's bounded history slab from START for COUNT rows."
+  (let* ((screen (chomp-render-state-screen render))
          (display-begin (chomp-render-state-display-begin render))
-         (lines (chomp-screen-scrollback-lines-raw screen)))
+         (total (or total (chomp-screen-history-row-count screen)))
+         (start (or start (max 0 (- total (chomp-render--history-capacity render)))))
+         (count (or count (min (chomp-render--history-capacity render)
+                               (- total start))))
+         (generation (or generation (chomp-screen-history-generation screen))))
     (save-excursion
       (delete-region (chomp-render-state-region-begin render) display-begin)
       (goto-char (chomp-render-state-region-begin render))
-      (insert (chomp-render--lines-to-string lines width)))
-    (setf (chomp-render-state-scrollback-count render) (length lines))))
+      (dotimes (offset count)
+        (insert (chomp-render--history-row-string render (+ start offset)))))
+    (setf (chomp-render-state-history-start-row render) start
+          (chomp-render-state-scrollback-count render) count
+          (chomp-render-state-history-total-rows render) total
+          (chomp-render-state-history-generation render) generation)))
 
-(defun chomp-render--newest-lines-oldest-first (lines count)
-  "Return the first COUNT newest-first LINES in oldest-first order."
-  (let ((taken nil)
-        (n 0))
-    (while (and lines (< n count))
-      (push (pop lines) taken)
-      (cl-incf n))
-    taken))
+(defun chomp-render-scroll-history (render rows)
+  "Scroll RENDER's selected window by virtual history ROWS."
+  (let* ((window (selected-window))
+         (screen (chomp-render-state-screen render))
+         (total (chomp-screen-history-row-count screen))
+         (display-begin (chomp-render-state-display-begin render))
+         (slab-start (chomp-render-state-history-start-row render))
+         (current
+          (if (>= (window-start window) (marker-position display-begin))
+              total
+            (+ slab-start
+               (- (line-number-at-pos (window-start window))
+                  (line-number-at-pos
+                   (chomp-render-state-region-begin render))))))
+         (target (chomp--clamp (+ current rows) 0 total))
+         (capacity (chomp-render--history-capacity render))
+         (start (min (max 0 (- target (/ capacity 3)))
+                     (max 0 (- total capacity))))
+         (count (min capacity (- total start)))
+         (inhibit-read-only t)
+         (inhibit-modification-hooks t)
+         (buffer-undo-list t))
+    (when (and mark-active (mark t))
+      (setf (chomp-render-state-virtual-mark render)
+            (chomp-render-buffer-location render (mark t))))
+    (chomp-render--rebuild-scrollback
+     render start count total (chomp-screen-history-generation screen))
+    (if (= target total)
+        (set-window-start window display-begin t)
+      (save-excursion
+        (goto-char (chomp-render-state-region-begin render))
+        (forward-line (- target start))
+        (set-window-start window (point) t)))
+    (unless (pos-visible-in-window-p (point) window)
+      (goto-char (window-start window)))
+    target))
 
-(defun chomp-render--lines-to-string (lines width)
-  "Return scrollback LINES as one string with trailing newlines.
-Unlike display rows, scrollback rows do not need invisible spacer characters for
-cursor column addressing, so default wide-character rows can be emitted more
-compactly."
-  (mapconcat (lambda (line)
-               (concat
-                (chomp-render--apply-line-metadata
-                 line (chomp-render--line-to-string-scrollback line width) width)
-                "\n"))
-             lines ""))
+(defun chomp-render-buffer-location (render &optional position)
+  "Return virtual (ROW . COLUMN) for POSITION in RENDER's buffer."
+  (let* ((position (or position (point)))
+         (display-begin (marker-position
+                         (chomp-render-state-display-begin render)))
+         (region-begin (marker-position
+                        (chomp-render-state-region-begin render)))
+         (row (if (< position display-begin)
+                  (+ (chomp-render-state-history-start-row render)
+                     (- (line-number-at-pos position)
+                        (line-number-at-pos region-begin)))
+                (+ (chomp-render-state-history-total-rows render)
+                   (- (line-number-at-pos position)
+                      (line-number-at-pos display-begin)))))
+         (column (save-excursion (goto-char position) (current-column))))
+    (cons row column)))
+
+(defun chomp-render-buffer-anchor (render &optional position)
+  "Return stable model anchor for POSITION in RENDER's buffer."
+  (let* ((position (or position (point)))
+         (display-begin (marker-position
+                         (chomp-render-state-display-begin render))))
+    (if (< position display-begin)
+        (save-excursion
+          (goto-char position)
+          (let* ((bol (line-beginning-position))
+                 (id (get-text-property bol 'chomp-history-id))
+                 (offset (get-text-property bol 'chomp-history-offset)))
+            (and id (list 'history id (+ offset (current-column))))))
+      (let ((location (chomp-render-buffer-location render position)))
+        (list 'viewport
+              (- (car location)
+                 (chomp-render-state-history-total-rows render))
+              (cdr location))))))
+
+(defun chomp-render-goto-anchor (render anchor &optional no-recenter)
+  "Move point to stable model ANCHOR in RENDER."
+  (pcase anchor
+    (`(history ,id ,offset)
+     (when-let ((location
+                 (chomp-screen-history-anchor-location
+                  (chomp-render-state-screen render) id offset)))
+       (chomp-render-goto-location
+        render (car location) (cdr location) no-recenter)))
+    (`(viewport ,row ,column)
+     (chomp-render-goto-location
+      render (+ (chomp-screen-history-row-count
+                 (chomp-render-state-screen render)) row)
+      column no-recenter))))
+
+(defun chomp-render-goto-location (render row column &optional no-recenter)
+  "Move point to virtual ROW and COLUMN in RENDER.
+When NO-RECENTER is non-nil, leave window positioning unchanged."
+  (let* ((screen (chomp-render-state-screen render))
+         (history-rows (chomp-screen-history-row-count screen))
+         (capacity (chomp-render--history-capacity render)))
+    (if (< row history-rows)
+        (let* ((start (min (max 0 (- row (/ capacity 3)))
+                           (max 0 (- history-rows capacity))))
+               (count (min capacity (- history-rows start)))
+               (inhibit-read-only t)
+               (inhibit-modification-hooks t)
+               (buffer-undo-list t))
+          (chomp-render--rebuild-scrollback
+           render start count history-rows
+           (chomp-screen-history-generation screen))
+          (goto-char (chomp-render-state-region-begin render))
+          (forward-line (- row start)))
+      (goto-char (chomp-render-state-display-begin render))
+      (forward-line (- row history-rows)))
+    (move-to-column column)
+    (unless no-recenter (recenter))
+    (point)))
 
 (defun chomp-render--line-to-string-scrollback (line width)
   "Convert LINE for scrollback rendering."
@@ -758,8 +863,7 @@ hint at the live terminal position."
 
 (defun chomp-render--invalidate-screen-lines (screen)
   "Discard rendered face caches stored on every line in SCREEN."
-  (dolist (line (append (chomp-screen-scrollback-lines-raw screen)
-                        (append (chomp--ordered-lines-vector screen) nil)))
+  (dolist (line (append (chomp--ordered-lines-vector screen) nil))
     (setf (chomp-line-rendered line) nil)
     (setf (chomp-line-dirty line) t)))
 
@@ -773,6 +877,7 @@ hint at the live terminal position."
         (when-let ((render (buffer-local-value 'chomp--render buffer)))
           (chomp-render--invalidate-screen-lines
            (chomp-render-state-screen render))
+          (clrhash (chomp-render-state-history-cache render))
           (chomp-render-full-reset render))))))
 
 (defun chomp-render--after-load-theme (&rest _)
@@ -807,9 +912,9 @@ Used after resize when the display area size has changed."
         (let* ((preserve-view
                 (eq (bound-and-true-p chomp--input-mode) 'emacs))
                (saved-point (and preserve-view
-                                 (chomp-render--save-position (point))))
+                                 (chomp-render-buffer-anchor render (point))))
                (saved-mark (and preserve-view (mark t)
-                                (chomp-render--save-position (mark t))))
+                                (chomp-render-buffer-anchor render (mark t))))
                (saved-mark-active (and preserve-view mark-active))
                (saved-window
                 (and preserve-view
@@ -817,18 +922,27 @@ Used after resize when the display area size has changed."
                      (selected-window)))
                (saved-window-start
                 (and saved-window
-                     (chomp-render--save-position
-                      (window-start saved-window)))))
+                     (chomp-render-buffer-anchor
+                      render (window-start saved-window)))))
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
             (goto-char (chomp-render-state-region-begin render))
             (delete-region (point)
                            (chomp-render-state-region-end render))
-          ;; Re-render scrollback
-          (let ((sb-lines (chomp-screen-scrollback-lines screen)))
-            (insert (chomp-render--lines-to-string sb-lines w))
-            (setf (chomp-render-state-scrollback-count render) (length sb-lines)))
+          ;; Materialize only the tail history slab.
+          (let* ((total (chomp-screen-history-row-count screen))
+                 (capacity (chomp-render--history-capacity render))
+                 (start (max 0 (- total capacity)))
+                 (count (- total start)))
+            (dotimes (offset count)
+              (insert (chomp-render--history-row-string
+                       render (+ start offset))))
+            (setf (chomp-render-state-history-start-row render) start
+                  (chomp-render-state-scrollback-count render) count
+                  (chomp-render-state-history-total-rows render) total
+                  (chomp-render-state-history-generation render)
+                  (chomp-screen-history-generation screen)))
           ;; Place display-begin marker
           (let ((m (chomp-render-state-display-begin render)))
             (set-marker m (point))
@@ -859,17 +973,17 @@ Used after resize when the display area size has changed."
             (chomp-screen-clear-dirty screen)
             (chomp-screen-clear-scrollback-dirty screen))
           (when preserve-view
-            (chomp-render--restore-position saved-point)
+            (chomp-render-goto-anchor render saved-point t)
             (if saved-mark
                 (progn
                   (save-excursion
-                    (chomp-render--restore-position saved-mark)
+                    (chomp-render-goto-anchor render saved-mark t)
                     (set-marker (mark-marker) (point)))
                   (setq mark-active saved-mark-active))
               (set-marker (mark-marker) nil))
             (when (window-live-p saved-window)
               (save-excursion
-                (chomp-render--restore-position saved-window-start)
+                (chomp-render-goto-anchor render saved-window-start t)
                 (set-window-start saved-window (point) t))))
           (unless preserve-view
             (dolist (window (get-buffer-window-list buffer nil t))
@@ -888,6 +1002,7 @@ Used after resize when the display area size has changed."
               (inhibit-modification-hooks t)
               (buffer-undo-list t)
               (display-begin (chomp-render-state-display-begin render)))
+          (chomp-render--update-scrollback render)
           (save-excursion
             (goto-char display-begin)
             (delete-region (point) (chomp-render-state-region-end render))

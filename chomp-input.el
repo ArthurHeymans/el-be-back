@@ -25,6 +25,9 @@
 (declare-function chomp-kill-process "chomp")
 (declare-function chomp-previous-prompt "chomp")
 (declare-function chomp-next-prompt "chomp")
+(declare-function chomp-scroll-up "chomp")
+(declare-function chomp-scroll-down "chomp")
+(declare-function chomp-copy-region "chomp")
 
 ;;;; ---- Function Key Tables --------------------------------------------
 
@@ -545,6 +548,12 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
     ;; Prompt navigation
     (define-key map (kbd "C-c C-p") #'chomp-previous-prompt)
     (define-key map (kbd "C-c C-n") #'chomp-next-prompt)
+    ;; The history buffer is a bounded materialized slab.
+    (define-key map [remap scroll-up-command] #'chomp-scroll-up)
+    (define-key map [remap scroll-down-command] #'chomp-scroll-down)
+    (define-key map [wheel-up] #'chomp-scroll-down)
+    (define-key map [wheel-down] #'chomp-scroll-up)
+    (define-key map [remap kill-ring-save] #'chomp-copy-region)
     map)
   "Base keymap for `chomp-mode'.")
 

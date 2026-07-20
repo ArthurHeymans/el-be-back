@@ -384,21 +384,107 @@ Binds `screen' and `parser' in BODY."
     (chomp-screen-resize screen 10 3)
     (should (equal '("flashprog" "" "") (chomp-test-display-text screen)))))
 
-(ert-deftest chomp-test-resize-normalizes-scrollback ()
-  "Resizing keeps old scrollback rows renderable at the new width."
+(ert-deftest chomp-test-resize-keeps-logical-scrollback-width-independent ()
+  "Resize reprojects logical history without mutating its stored cells."
   (chomp-test-with-screen (:width 4 :height 2)
     (chomp-test-output parser "row")
     (let ((display-line (chomp-screen-get-line screen 0)))
       (chomp--line-ensure-cells display-line 4)
-      (let ((line (make-chomp-line
+      (setf (chomp-screen-scrollback screen)
+            (list (make-chomp-line
                    :cells (vconcat (chomp-line-cells display-line))
-                   :cells-valid t)))
-        (setf (chomp-screen-scrollback screen) (list line)
-              (chomp-screen-scrollback-length screen) 1)
-        (chomp-screen-resize screen 6 2)
-        (should (= 6 (length (chomp-line-cells line))))
-        (should (string-prefix-p "row"
-                                 (chomp-render--line-to-string-scrollback line 6)))))))
+                   :cells-valid t))
+            (chomp-screen-scrollback-length screen) 1)
+      (chomp-screen-resize screen 6 2)
+      (should (= 1 (chomp-screen-history-row-count screen)))
+      (let ((logical (car (chomp-screen-scrollback screen)))
+            (rendered (chomp-screen-history-render-row screen 0)))
+        (should (chomp-history-line-p logical))
+        (should (= 3 (length (chomp-history-line-cells logical))))
+        (should (= 6 (length (chomp-line-cells rendered))))
+        (should (string-prefix-p
+                 "row" (chomp-render--line-to-string-scrollback rendered 6)))))))
+
+(ert-deftest chomp-test-logical-history-reflows-from-row-map ()
+  "History changes physical row count without rewriting logical cells."
+  (let ((screen (chomp-screen-create 4 2)))
+    (setf (chomp-screen-scrollback screen)
+          (list (make-chomp-line :text "ef  " :cells-valid nil)
+                (make-chomp-line :text "abcd" :cells-valid nil :wrapped t))
+          (chomp-screen-scrollback-length screen) 2)
+    (should (= 2 (chomp-screen-history-row-count screen)))
+    (should (= 1 (chomp-screen-scrollback-length screen)))
+    (should (= 6 (length (chomp-history-line-cells
+                          (car (chomp-screen-scrollback screen))))))
+    (chomp-screen-resize screen 2 2)
+    (should (= 3 (chomp-screen-history-row-count screen)))
+    (should (= 6 (length (chomp-history-line-cells
+                          (car (chomp-screen-scrollback screen))))))))
+
+(ert-deftest chomp-test-logical-history-appends-row-map-in-place ()
+  "Steady output extends the width map without rescanning old history."
+  (let ((screen (chomp-screen-create 4 2)))
+    (setf (chomp-screen-scrollback screen)
+          (cl-loop for id downfrom 19 to 0
+                   collect (make-chomp-history-line
+                            :id id
+                            :cells (vector (make-chomp-cell :char ?x))))
+          (chomp-screen-scrollback-length screen) 20
+          (chomp-screen-history-next-id screen) 20
+          (chomp-screen-history-generation screen) 1
+          (chomp-screen-history-logical-p screen) t)
+    (let ((map (chomp-screen-history-row-map screen)))
+      (chomp--history-push-row
+       screen (make-chomp-line :text "y   " :cells-valid nil) 4)
+      (should (eq map (chomp-screen-history-row-map screen)))
+      (should (= 21 (chomp-screen-history-row-count screen))))))
+
+(ert-deftest chomp-test-render-materializes-bounded-history ()
+  "Rendering cost is bounded independently of total logical history."
+  (let ((screen (chomp-screen-create 8 3)))
+    (setf (chomp-screen-scrollback screen)
+          (cl-loop for id below 500
+                   collect (make-chomp-history-line
+                            :id id
+                            :cells (vector (make-chomp-cell :char ?x))))
+          (chomp-screen-scrollback-length screen) 500
+          (chomp-screen-history-next-id screen) 500
+          (chomp-screen-history-generation screen) 1)
+    (with-temp-buffer
+      (let ((render (chomp-render-create screen (current-buffer))))
+        (chomp-render-refresh render)
+        (should (= 500 (chomp-render-state-history-total-rows render)))
+        (should (<= (chomp-render-state-scrollback-count render) 72))
+        (should (< (count-lines (point-min) (point-max)) 100))))))
+
+(ert-deftest chomp-test-render-resize-preserves-logical-history-anchor ()
+  "Width changes preserve the logical cell under point."
+  (let ((screen (chomp-screen-create 4 2)))
+    (setf (chomp-screen-scrollback screen)
+          (list (make-chomp-history-line
+                 :id 0
+                 :cells (vconcat
+                         (mapcar (lambda (char) (make-chomp-cell :char char))
+                                 (string-to-list "abcdefgh")))))
+          (chomp-screen-scrollback-length screen) 1
+          (chomp-screen-history-next-id screen) 1
+          (chomp-screen-history-generation screen) 1
+          (chomp-screen-history-logical-p screen) t)
+    (with-temp-buffer
+      (setq-local chomp--input-mode 'emacs)
+      (let ((render (chomp-render-create screen (current-buffer))))
+        (chomp-render-refresh render)
+        (goto-char (chomp-render-state-region-begin render))
+        (forward-line 1)
+        (forward-char 1)
+        (should (equal '(history 0 5)
+                       (chomp-render-buffer-anchor render)))
+        (chomp-screen-resize screen 3 2)
+        (chomp-render-full-reset render)
+        (should (equal '(history 0 5)
+                       (chomp-render-buffer-anchor render)))
+        (should (equal '(1 . 2)
+                       (chomp-render-buffer-location render)))))))
 
 (ert-deftest chomp-test-resize-alternate-screen ()
   "Resizing in the alternate screen keeps the saved main screen in sync."
@@ -1833,6 +1919,25 @@ Binds `screen' and `parser' in BODY."
          (parser (chomp-parse-create screen)))
     (chomp-test-output parser "ã 👩‍💻")
     (should (equal "ã 👩‍💻" (chomp-screen-plain-text screen)))))
+
+(ert-deftest chomp-test-copy-range-reads-unmaterialized-history ()
+  "Region copying reads logical history rather than rendered buffer rows."
+  (let ((screen (chomp-screen-create 4 2)))
+    (setf (chomp-screen-scrollback screen)
+          (list (make-chomp-history-line
+                 :id 2 :cells (vector (make-chomp-cell :char ?c)
+                                      (make-chomp-cell :char ?c)))
+                (make-chomp-history-line
+                 :id 1 :cells (vector (make-chomp-cell :char ?b)
+                                      (make-chomp-cell :char ?b)))
+                (make-chomp-history-line
+                 :id 0 :cells (vector (make-chomp-cell :char ?a)
+                                      (make-chomp-cell :char ?a))))
+          (chomp-screen-scrollback-length screen) 3
+          (chomp-screen-history-next-id screen) 3
+          (chomp-screen-history-generation screen) 1)
+    (should (equal "a\nbb\nc"
+                   (chomp-screen-text-range screen '(0 . 1) '(2 . 1))))))
 
 ;;;; ---- Session Tests --------------------------------------------------
 

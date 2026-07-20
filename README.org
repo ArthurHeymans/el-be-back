@@ -67,9 +67,12 @@ chunks, so =C-g= and user input stay responsive under output floods.
 
 Because Eat edits the buffer as sequences arrive, display work is
 interleaved with parsing.  Chomp accumulates all mutations in the model and
-then repaints only dirty lines once per batch.  Redisplay fights (flicker,
-point jumping, interaction with =hl-line-mode=-style modes) are confined to
-one small render layer.
+then repaints only dirty lines once per batch.  Scrollback is retained as
+unwrapped logical lines and projected through a width-dependent row map; the
+buffer contains only a bounded history slab around the visible window, not
+the complete rendered history.  Redisplay fights (flicker, point jumping,
+interaction with =hl-line-mode=-style modes) are confined to one small render
+layer.
 
 ** Resize semantics
 

@@ -53,6 +53,15 @@
   (wrapped nil)     ; auto-wrapped from previous line?
   (dirty t))
 
+(cl-defstruct (chomp-history-line (:copier nil))
+  "One unwrapped main-screen history line."
+  (id 0)
+  (cells [])
+  (prompt-begins nil)
+  (prompt-ends nil)
+  (open nil)
+  (generation 0))
+
 (cl-defstruct (chomp-alt-save (:copier nil))
   "Saved main-screen state when in alternate screen."
   (lines nil)
@@ -64,6 +73,8 @@
   (scroll-top 0) (scroll-bottom 23)
   (scrollback nil)
   (scrollback-length 0)
+  (history-next-id 0)
+  (history-generation 0)
   (auto-wrap t)
   (origin-mode nil)
   (insert-mode nil))
@@ -93,13 +104,19 @@
   ;; Alternate screen
   (alt-screen nil)      ; chomp-alt-save when in alt mode, nil when main
   ;; Scrollback (main only)
-  (scrollback nil)      ; list of chomp-line, newest first
-  (scrollback-length 0) ; cached length of scrollback
+  (scrollback nil)      ; list of chomp-history-line, newest first
+  (scrollback-length 0) ; cached logical-line count
   (scrollback-max 10000) ; max lines
   (scrollback-trim-batch 256) ; amortize list trimming after this overflow
-  (scrollback-dirty nil) ; non-nil when renderer must fully reconcile it
-  (scrollback-appended-count 0) ; lines appended since last render refresh
-  (scrollback-trimmed-count 0)  ; oldest lines trimmed since last render refresh
+  (scrollback-dirty nil) ; non-nil when renderer must reconcile history
+  (history-next-id 0)
+  (history-generation 0)
+  (history-logical-p nil)
+  (history-row-ends nil)
+  (history-lines-vector nil)
+  (history-map-count 0)
+  (history-row-map-width nil)
+  (history-row-map-generation nil)
   ;; Title / CWD
   (title "") (cwd nil)
   ;; Tab stops
@@ -417,9 +434,288 @@ and where COL is a continuation cell (width = 0)."
 
 (defun chomp-screen-clear-scrollback-dirty (screen)
   "Clear SCREEN's scrollback reconciliation flags."
-  (setf (chomp-screen-scrollback-dirty screen) nil)
-  (setf (chomp-screen-scrollback-appended-count screen) 0)
-  (setf (chomp-screen-scrollback-trimmed-count screen) 0))
+  (setf (chomp-screen-scrollback-dirty screen) nil))
+
+(defun chomp--history-map-current-p (screen)
+  "Return non-nil when SCREEN's history map matches its current model."
+  (and (chomp-screen-history-row-ends screen)
+       (= (chomp-screen-width screen)
+          (chomp-screen-history-row-map-width screen))
+       (= (chomp-screen-history-generation screen)
+          (chomp-screen-history-row-map-generation screen))))
+
+(defun chomp--history-grow-map (screen)
+  "Ensure SCREEN's history vectors have room for one more line."
+  (let* ((count (chomp-screen-history-map-count screen))
+         (old-lines (chomp-screen-history-lines-vector screen))
+         (capacity (length old-lines)))
+    (when (= count capacity)
+      (let ((new-capacity (max 16 (* 2 (max 1 capacity)))))
+        (setf (chomp-screen-history-lines-vector screen)
+              (vconcat old-lines (make-vector (- new-capacity capacity) nil))
+              (chomp-screen-history-row-ends screen)
+              (vconcat (chomp-screen-history-row-ends screen)
+                       (make-vector (- new-capacity capacity) 0)))))))
+
+(defun chomp--history-changed (screen &optional kind line)
+  "Update width-dependent history state for SCREEN.
+KIND may be `append' for LINE or `last' for an extended newest line."
+  (let ((incremental (chomp--history-map-current-p screen)))
+    (cl-incf (chomp-screen-history-generation screen))
+    (cond
+     ((and incremental (eq kind 'append))
+      (chomp--history-grow-map screen)
+      (let* ((count (chomp-screen-history-map-count screen))
+             (previous (if (zerop count) 0
+                         (aref (chomp-screen-history-row-ends screen)
+                               (1- count)))))
+        (aset (chomp-screen-history-lines-vector screen) count line)
+        (aset (chomp-screen-history-row-ends screen) count
+              (+ previous
+                 (chomp-history-line-row-count
+                  line (chomp-screen-width screen))))
+        (setf (chomp-screen-history-map-count screen) (1+ count)
+              (chomp-screen-history-row-map-generation screen)
+              (chomp-screen-history-generation screen))))
+     ((and incremental (eq kind 'last))
+      (let* ((count (chomp-screen-history-map-count screen))
+             (previous (if (<= count 1) 0
+                         (aref (chomp-screen-history-row-ends screen)
+                               (- count 2)))))
+        (aset (chomp-screen-history-row-ends screen) (1- count)
+              (+ previous
+                 (chomp-history-line-row-count
+                  (aref (chomp-screen-history-lines-vector screen)
+                        (1- count))
+                  (chomp-screen-width screen))))
+        (setf (chomp-screen-history-row-map-generation screen)
+              (chomp-screen-history-generation screen))))
+     (t
+      (setf (chomp-screen-history-row-ends screen) nil
+            (chomp-screen-history-lines-vector screen) nil
+            (chomp-screen-history-map-count screen) 0
+            (chomp-screen-history-row-map-width screen) nil
+            (chomp-screen-history-row-map-generation screen) nil)))))
+
+(defun chomp--history-clear (screen)
+  "Clear SCREEN's logical history."
+  (setf (chomp-screen-scrollback screen) nil
+        (chomp-screen-scrollback-length screen) 0
+        (chomp-screen-scrollback-dirty screen) t)
+  (chomp--history-changed screen))
+
+(defun chomp--history-normalize (screen)
+  "Convert legacy physical rows in SCREEN history to logical lines."
+  (unless (chomp-screen-history-logical-p screen)
+    (let ((physical (cl-some #'chomp-line-p
+                             (chomp-screen-scrollback screen))))
+      (setf (chomp-screen-history-logical-p screen) t)
+      (when physical
+        (let ((rows (reverse (chomp-screen-scrollback screen))))
+          (setf (chomp-screen-scrollback screen) nil
+                (chomp-screen-scrollback-length screen) 0)
+          (dolist (row rows)
+            (chomp--history-push-row screen row (chomp-screen-width screen)))
+          (setf (chomp-screen-scrollback-dirty screen) t))))))
+
+(defun chomp--history-push-row (screen line width)
+  "Append physical LINE of WIDTH columns to SCREEN's logical history."
+  (setf (chomp-screen-history-logical-p screen) t)
+  (let* ((wrapped (chomp-line-wrapped line))
+         (row-cells (chomp--line-ensure-cells line width))
+         (cells (if wrapped
+                    (vconcat row-cells)
+                  (chomp--trim-trailing-blank-cells row-cells)))
+         (history (chomp-screen-scrollback screen))
+         (current (car history)))
+    (if (and current (chomp-history-line-p current)
+             (chomp-history-line-open current))
+        (let ((offset (length (chomp-history-line-cells current))))
+          (setf (chomp-history-line-cells current)
+                (vconcat (chomp-history-line-cells current) cells)
+                (chomp-history-line-prompt-begins current)
+                (append (chomp-history-line-prompt-begins current)
+                        (mapcar (lambda (column) (+ offset column))
+                                (chomp-line-prompt-begins line)))
+                (chomp-history-line-prompt-ends current)
+                (append (chomp-history-line-prompt-ends current)
+                        (mapcar (lambda (column) (+ offset column))
+                                (chomp-line-prompt-ends line)))
+                (chomp-history-line-open current) wrapped)
+          (cl-incf (chomp-history-line-generation current))
+          ;; The newest logical line changed without increasing its count.
+          (setf (chomp-screen-scrollback-dirty screen) t)
+          (chomp--history-changed screen 'last))
+      (let ((logical
+             (make-chomp-history-line
+              :id (prog1 (chomp-screen-history-next-id screen)
+                    (cl-incf (chomp-screen-history-next-id screen)))
+              :cells (vconcat cells)
+              :prompt-begins (copy-sequence (chomp-line-prompt-begins line))
+              :prompt-ends (copy-sequence (chomp-line-prompt-ends line))
+              :open wrapped)))
+        (push logical (chomp-screen-scrollback screen))
+        (cl-incf (chomp-screen-scrollback-length screen))
+        (chomp--history-changed screen 'append logical)))))
+
+(defun chomp-history-line-row-count (line width)
+  "Return the number of WIDTH-column rows needed for logical history LINE."
+  (let ((length (length (chomp-history-line-cells line))))
+    (if (zerop length) 1
+      (let ((offset 0)
+            (rows 0))
+        (while (< offset length)
+          (setq offset (chomp--wrap-end
+                        (chomp-history-line-cells line) offset width))
+          (cl-incf rows))
+        rows))))
+
+(defun chomp-screen-history-row-map (screen)
+  "Return SCREEN history's cumulative row map at its current width.
+Each vector entry is the physical row immediately after one logical line,
+ordered oldest first."
+  (chomp--history-normalize screen)
+  (let ((width (chomp-screen-width screen))
+        (generation (chomp-screen-history-generation screen)))
+    (unless (and (chomp-screen-history-row-ends screen)
+                 (equal width (chomp-screen-history-row-map-width screen))
+                 (equal generation
+                        (chomp-screen-history-row-map-generation screen)))
+      (let* ((ordered (vconcat (reverse (chomp-screen-scrollback screen))))
+             (count (length ordered))
+             (capacity (max 16 (* 2 count)))
+             (lines (vconcat ordered (make-vector (- capacity count) nil)))
+             (map (make-vector capacity 0))
+             (rows 0)
+             (i 0))
+        (cl-loop for line across ordered do
+          (cl-incf rows (chomp-history-line-row-count line width))
+          (aset map i rows)
+          (cl-incf i))
+        (setf (chomp-screen-history-row-ends screen) map
+              (chomp-screen-history-lines-vector screen) lines
+              (chomp-screen-history-map-count screen) count
+              (chomp-screen-history-row-map-width screen) width
+              (chomp-screen-history-row-map-generation screen) generation)))
+    (chomp-screen-history-row-ends screen)))
+
+(defun chomp-screen-history-row-count (screen)
+  "Return SCREEN's physical history row count at the current width."
+  (let ((map (chomp-screen-history-row-map screen))
+        (count (chomp-screen-history-map-count screen)))
+    (if (zerop count) 0 (aref map (1- count)))))
+
+(defun chomp-screen-history-row-location (screen row)
+  "Return (LINE . OFFSET) for zero-based physical history ROW in SCREEN."
+  (let* ((map (chomp-screen-history-row-map screen))
+         (count (chomp-screen-history-map-count screen)))
+    (when (and (>= row 0)
+               (< row (if (zerop count) 0 (aref map (1- count)))))
+      (let ((lo 0)
+            (hi count))
+        (while (< lo hi)
+          (let ((mid (/ (+ lo hi) 2)))
+            (if (> (aref map mid) row)
+                (setq hi mid)
+              (setq lo (1+ mid)))))
+        (let* ((line-index lo)
+               (line-start (if (zerop line-index)
+                               0
+                             (aref map (1- line-index))))
+               (line (aref (chomp-screen-history-lines-vector screen)
+                           line-index))
+               (offset 0)
+               (remaining (- row line-start)))
+          (while (> remaining 0)
+            (setq offset (chomp--wrap-end
+                          (chomp-history-line-cells line)
+                          offset (chomp-screen-width screen)))
+            (cl-decf remaining))
+          (cons line offset))))))
+
+(defun chomp-screen-history-anchor-location (screen id offset)
+  "Return current (ROW . COLUMN) for logical history ID and cell OFFSET."
+  (chomp-screen-history-row-map screen)
+  (let ((lo 0)
+        (hi (chomp-screen-history-map-count screen))
+        found)
+    (while (< lo hi)
+      (let* ((mid (/ (+ lo hi) 2))
+             (line (aref (chomp-screen-history-lines-vector screen) mid))
+             (line-id (chomp-history-line-id line)))
+        (cond ((< line-id id) (setq lo (1+ mid)))
+              ((> line-id id) (setq hi mid))
+              (t (setq found mid lo hi)))))
+    (when found
+      (let* ((line (aref (chomp-screen-history-lines-vector screen) found))
+             (base (if (zerop found) 0
+                     (aref (chomp-screen-history-row-ends screen)
+                           (1- found))))
+             (position (chomp-history-line-offset-position
+                        line (chomp-screen-width screen) offset)))
+        (cons (+ base (car position)) (cdr position))))))
+
+(defun chomp-screen-history-render-row (screen row)
+  "Return physical history ROW from SCREEN as a `chomp-line'."
+  (when-let* ((location (chomp-screen-history-row-location screen row))
+              (logical (car location)))
+    (let* ((width (chomp-screen-width screen))
+           (cells (chomp-history-line-cells logical))
+           (offset (cdr location))
+           (end (if (< offset (length cells))
+                    (chomp--wrap-end cells offset width)
+                  offset))
+           (last (>= end (length cells)))
+           (row-cells (if (= offset end) [] (cl-subseq cells offset end))))
+      (make-chomp-line
+       :cells (chomp--pad-cells row-cells width)
+       :prompt-begins
+       (cl-loop for column in (chomp-history-line-prompt-begins logical)
+                when (and (>= column offset) (< column end))
+                collect (- column offset))
+       :prompt-ends
+       (cl-loop for column in (chomp-history-line-prompt-ends logical)
+                when (and (> column offset) (<= column end))
+                collect (- column offset))
+       :wrapped (not last)
+       :dirty t))))
+
+(defun chomp-history-line-offset-position (line width offset)
+  "Return LINE's physical (ROW . COLUMN) for cell OFFSET at WIDTH."
+  (let ((cells (chomp-history-line-cells line))
+        (start 0)
+        (row 0)
+        end)
+    (if (zerop (length cells))
+        '(0 . 0)
+      (catch 'position
+        (while (< start (length cells))
+          (setq end (chomp--wrap-end cells start width))
+          (when (<= offset end)
+            (throw 'position (cons row (- offset start))))
+          (setq start end)
+          (cl-incf row))
+        (cons row (- (length cells) start))))))
+
+(defun chomp-screen-prompt-end-locations (screen)
+  "Return ordered (ROW . COLUMN) prompt-end locations for SCREEN."
+  (chomp--history-normalize screen)
+  (let ((width (chomp-screen-width screen))
+        (row-base 0)
+        locations)
+    (dolist (line (reverse (chomp-screen-scrollback screen)))
+      (dolist (offset (sort (copy-sequence
+                             (chomp-history-line-prompt-ends line)) #'<))
+        (let ((position
+               (chomp-history-line-offset-position line width offset)))
+          (push (cons (+ row-base (car position)) (cdr position)) locations)))
+      (cl-incf row-base (chomp-history-line-row-count line width)))
+    (dotimes (row (chomp-screen-height screen))
+      (dolist (column (sort (copy-sequence
+                             (chomp-line-prompt-ends
+                              (chomp--line-at screen row))) #'<))
+        (push (cons (+ row-base row) column) locations)))
+    (nreverse locations)))
 
 ;;;; ---- Internal Scrolling ---------------------------------------------
 
@@ -438,10 +734,8 @@ Top lines go to scrollback (if on main screen)."
     (when (and (not (chomp-screen-alt-screen screen))
                (zerop top))
       (dotimes (i n)
-        (push (chomp--line-at screen (+ top i))
-              (chomp-screen-scrollback screen))
-        (cl-incf (chomp-screen-scrollback-length screen))
-        (cl-incf (chomp-screen-scrollback-appended-count screen))))
+        (chomp--history-push-row
+         screen (chomp--line-at screen (+ top i)) width)))
     (if (and (zerop top) (= bot (1- height)))
         ;; Full-screen scrolling is the dominant bulk-output path.  Advance a
         ;; logical top index instead of moving every row object in the vector.
@@ -512,14 +806,12 @@ Bottom lines are discarded."
       ;; Keep the newest MAX entries (the list is newest first) without
       ;; rebuilding the whole list on every scroll after the limit.  Trimming is
       ;; intentionally batched because otherwise every new line after a full
-      ;; scrollback performs an O(max) `nthcdr'.  The renderer mirrors the whole
-      ;; batch as one delete-oldest + append-newest update.
-      (let ((tail (nthcdr (1- max) (chomp-screen-scrollback screen)))
-            (trimmed (- len max)))
+      ;; scrollback performs an O(max) `nthcdr'.
+      (let ((tail (nthcdr (1- max) (chomp-screen-scrollback screen))))
         (when tail
           (setcdr tail nil))
         (setf (chomp-screen-scrollback-length screen) max)
-        (cl-incf (chomp-screen-scrollback-trimmed-count screen) trimmed)))))
+        (chomp--history-changed screen)))))
 
 ;;;; ---- Character Writing ----------------------------------------------
 
@@ -961,9 +1253,7 @@ Handles LF, VT, FF."
            (cl-loop for r from 0 below height
                     do (chomp--erase-whole-line screen r)))))
       (3 ;; Erase scrollback
-       (setf (chomp-screen-scrollback screen) nil)
-       (setf (chomp-screen-scrollback-length screen) 0)
-       (setf (chomp-screen-scrollback-dirty screen) t)))))
+       (chomp--history-clear screen)))))
 
 (defun chomp-screen-erase-in-line (screen mode)
   "Erase in line.  MODE: 0=to-end, 1=to-start, 2=whole."
@@ -1206,7 +1496,10 @@ Handles LF, VT, FF."
                :cursor-y (chomp-alt-save-cursor-y saved)
                :scroll-top (chomp-alt-save-scroll-top saved)
                :scroll-bottom (chomp-alt-save-scroll-bottom saved)
-               :scrollback (chomp-alt-save-scrollback saved))))
+               :scrollback (chomp-alt-save-scrollback saved)
+               :scrollback-length (chomp-alt-save-scrollback-length saved)
+               :history-next-id (chomp-alt-save-history-next-id saved)
+               :history-generation (chomp-alt-save-history-generation saved))))
     (chomp-screen-resize main new-width new-height)
     (setf (chomp-alt-save-lines saved) (chomp-screen-lines main)
           (chomp-alt-save-width saved) (chomp-screen-width main)
@@ -1215,7 +1508,10 @@ Handles LF, VT, FF."
           (chomp-alt-save-cursor-x saved) (chomp-screen-cursor-x main)
           (chomp-alt-save-cursor-y saved) (chomp-screen-cursor-y main)
           (chomp-alt-save-scroll-top saved) (chomp-screen-scroll-top main)
-          (chomp-alt-save-scroll-bottom saved) (chomp-screen-scroll-bottom main))))
+          (chomp-alt-save-scroll-bottom saved) (chomp-screen-scroll-bottom main)
+          (chomp-alt-save-history-next-id saved) (chomp-screen-history-next-id main)
+          (chomp-alt-save-history-generation saved)
+          (chomp-screen-history-generation main))))
 
 (defun chomp-screen-enter-alt (screen)
   "Enter alternate screen buffer."
@@ -1237,6 +1533,8 @@ Handles LF, VT, FF."
            :scroll-bottom (chomp-screen-scroll-bottom screen)
            :scrollback (chomp-screen-scrollback screen)
            :scrollback-length (chomp-screen-scrollback-length screen)
+           :history-next-id (chomp-screen-history-next-id screen)
+           :history-generation (chomp-screen-history-generation screen)
            :auto-wrap (chomp-screen-auto-wrap screen)
            :origin-mode (chomp-screen-origin-mode screen)
            :insert-mode (chomp-screen-insert-mode screen)))
@@ -1252,9 +1550,7 @@ Handles LF, VT, FF."
       (setf (chomp-screen-cursor-y screen) 0)
       (setf (chomp-screen-scroll-top screen) 0)
       (setf (chomp-screen-scroll-bottom screen) (1- h))
-      (setf (chomp-screen-scrollback screen) nil)
-      (setf (chomp-screen-scrollback-length screen) 0)
-      (setf (chomp-screen-scrollback-dirty screen) t)
+      (chomp--history-clear screen)
       (setf (chomp-screen-dirty-lines screen)
             (number-sequence 0 (1- h)))
       (setf (chomp-screen-dirty-map screen) (make-vector h t))
@@ -1276,6 +1572,11 @@ Handles LF, VT, FF."
     (setf (chomp-screen-scrollback screen) (chomp-alt-save-scrollback saved))
     (setf (chomp-screen-scrollback-length screen)
           (chomp-alt-save-scrollback-length saved))
+    (setf (chomp-screen-history-next-id screen)
+          (chomp-alt-save-history-next-id saved))
+    (setf (chomp-screen-history-generation screen)
+          (chomp-alt-save-history-generation saved))
+    (setf (chomp-screen-history-row-ends screen) nil)
     (setf (chomp-screen-scrollback-dirty screen) t)
     (setf (chomp-screen-auto-wrap screen) (chomp-alt-save-auto-wrap saved))
     (setf (chomp-screen-origin-mode screen) (chomp-alt-save-origin-mode saved))
@@ -1366,11 +1667,10 @@ Reflows wrapped lines, clamps cursor, resets scroll region."
                  (/= new-height (chomp-screen-height screen))))
     (when-let ((saved (chomp-screen-alt-screen screen)))
       (chomp--resize-alt-save saved new-width new-height))
-    ;; Scrollback is rendered at the current screen width too.
+    ;; Logical history is width-independent; only its row map is invalidated.
     (when (chomp-screen-scrollback screen)
-      (dolist (line (chomp-screen-scrollback screen))
-        (chomp--line-ensure-cells line new-width))
-      (setf (chomp-screen-scrollback-dirty screen) t))
+      (setf (chomp-screen-scrollback-dirty screen) t)
+      (chomp--history-changed screen))
     (let* ((old-lines (chomp--ordered-lines-vector screen))
            (old-width (chomp-screen-width screen))
            ;; Rows below the cursor that contain only terminal padding must not
@@ -1564,9 +1864,7 @@ Returns list of (CELLS . TRAILING-WRAP-P)."
     (setf (chomp-screen-charset-g3 screen) 'us-ascii)
     (setf (chomp-screen-charset-active screen) 'g0)
     ;; Reset scrollback
-    (setf (chomp-screen-scrollback screen) nil)
-    (setf (chomp-screen-scrollback-length screen) 0)
-    (setf (chomp-screen-scrollback-dirty screen) t)
+    (chomp--history-clear screen)
     ;; Reset tab stops
     (setf (chomp-screen-tab-stops screen)
           (chomp--default-tab-stops w))
@@ -1628,6 +1926,48 @@ Rows joined by a soft wrap have no intervening newline."
         (push "\n" parts)))
     (string-trim-right (apply #'concat (nreverse parts)))))
 
+(defun chomp-screen-virtual-line (screen row)
+  "Return physical ROW across SCREEN history and live viewport."
+  (let ((history-rows (chomp-screen-history-row-count screen)))
+    (if (< row history-rows)
+        (chomp-screen-history-render-row screen row)
+      (chomp-screen-get-line screen (- row history-rows)))))
+
+(defun chomp--cells-text-range (cells start end)
+  "Return visible text from CELLS columns START through END."
+  (let (parts)
+    (cl-loop for column from start below (min end (length cells))
+             for cell = (aref cells column)
+             unless (zerop (chomp-cell-width cell))
+             do (push (concat (string (chomp-cell-char cell))
+                              (chomp-cell-combining cell))
+                      parts))
+    (apply #'concat (nreverse parts))))
+
+(defun chomp-screen-text-range (screen start end)
+  "Return plain text between virtual locations START and END.
+Locations are (ROW . COLUMN) pairs."
+  (when (or (> (car start) (car end))
+            (and (= (car start) (car end)) (> (cdr start) (cdr end))))
+    (cl-rotatef start end))
+  (let ((width (chomp-screen-width screen))
+        parts)
+    (cl-loop for row from (car start) to (car end)
+             for line = (chomp-screen-virtual-line screen row)
+             when line do
+             (let* ((from (if (= row (car start)) (cdr start) 0))
+                    (to (if (= row (car end)) (cdr end) width))
+                    (text (chomp--cells-text-range
+                           (chomp--line-ensure-cells line width) from to)))
+               (push (if (and (= to width) (not (chomp-line-wrapped line)))
+                         (string-trim-right text)
+                       text)
+                     parts)
+               (when (and (< row (car end))
+                          (not (chomp-line-wrapped line)))
+                 (push "\n" parts))))
+    (apply #'concat (nreverse parts))))
+
 ;;;; ---- Query ----------------------------------------------------------
 
 (defun chomp-screen-get-line (screen row)
@@ -1638,15 +1978,16 @@ Rows joined by a soft wrap have no intervening newline."
       line)))
 
 (defun chomp-screen-scrollback-lines-raw (screen)
-  "Return scrollback lines, oldest first, without materializing lazy cells."
-  (reverse (chomp-screen-scrollback screen)))
+  "Return current-width physical history rows, oldest first."
+  (let ((count (chomp-screen-history-row-count screen))
+        rows)
+    (dotimes (row count)
+      (push (chomp-screen-history-render-row screen row) rows))
+    (nreverse rows)))
 
 (defun chomp-screen-scrollback-lines (screen)
-  "Return scrollback lines, oldest first."
-  (let ((lines (chomp-screen-scrollback-lines-raw screen)))
-    (dolist (line lines)
-      (chomp--line-ensure-cells line (chomp-screen-width screen)))
-    lines))
+  "Return current-width physical history rows, oldest first."
+  (chomp-screen-scrollback-lines-raw screen))
 
 ;;;; ---- Cell copying helper (used by erase) ----------------------------
 

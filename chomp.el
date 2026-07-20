@@ -137,7 +137,7 @@ the TRAMP host."
   :group 'chomp)
 
 (defcustom chomp-scrollback-lines 10000
-  "Maximum number of scrollback lines."
+  "Maximum number of unwrapped logical scrollback lines."
   :type 'integer
   :group 'chomp)
 
@@ -487,6 +487,26 @@ Called after each render.  Debounced so short-lived matches don't flash."
 
 ;;;; ---- Display Commands -----------------------------------------------
 
+(defun chomp--scroll-rows (arg)
+  "Return the row count represented by scroll command ARG."
+  (if arg
+      (prefix-numeric-value arg)
+    (max 1 (- (window-body-height) next-screen-context-lines))))
+
+(defun chomp-scroll-up (&optional arg)
+  "Scroll forward through virtual terminal history by ARG rows."
+  (interactive "P")
+  (if chomp--render
+      (chomp-render-scroll-history chomp--render (chomp--scroll-rows arg))
+    (scroll-up-command arg)))
+
+(defun chomp-scroll-down (&optional arg)
+  "Scroll backward through virtual terminal history by ARG rows."
+  (interactive "P")
+  (if chomp--render
+      (chomp-render-scroll-history chomp--render (- (chomp--scroll-rows arg)))
+    (scroll-down-command arg)))
+
 (defun chomp--clear-screen (scrollback)
   "Clear the viewport, and history too when SCROLLBACK is non-nil."
   (chomp--require-running-terminal)
@@ -520,6 +540,26 @@ Called after each render.  Debounced so short-lived matches don't flash."
     (user-error "Not in a Chomp buffer"))
   (let ((text (chomp-screen-plain-text chomp--screen)))
     (kill-new text)
+    text))
+
+(defun chomp-copy-region (_begin _end)
+  "Copy the active virtual terminal region to the kill ring."
+  (interactive "r")
+  (unless (and chomp--screen chomp--render mark-active (mark t))
+    (user-error "No active terminal region"))
+  (let* ((point-location (chomp-render-buffer-location chomp--render (point)))
+         (saved-mark (chomp-render-state-virtual-mark chomp--render))
+         (mark-location
+          (if (and saved-mark
+                   (= (mark t)
+                      (marker-position
+                       (chomp-render-state-region-begin chomp--render))))
+              saved-mark
+            (chomp-render-buffer-location chomp--render (mark t))))
+         (text (chomp-screen-text-range
+                chomp--screen point-location mark-location)))
+    (kill-new text)
+    (setq deactivate-mark t)
     text))
 
 ;;;; ---- Process Management Commands ------------------------------------
