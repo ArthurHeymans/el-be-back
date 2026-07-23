@@ -691,7 +691,10 @@ ordered oldest first."
       (catch 'position
         (while (< start (length cells))
           (setq end (chomp--wrap-end cells start width))
-          (when (<= offset end)
+          ;; A boundary offset belongs to the following row, except at the
+          ;; logical end where the previous row's end is the only position.
+          (when (or (< offset end)
+                    (and (= end (length cells)) (= offset end)))
             (throw 'position (cons row (- offset start))))
           (setq start end)
           (cl-incf row))

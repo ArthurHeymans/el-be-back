@@ -388,33 +388,51 @@ Remove overlays that point to deleted text."
 ;;;; ---- Prompt Imenu ---------------------------------------------------
 
 (defun chomp-shell-imenu-create-index ()
-  "Return ordered command entries for complete prompts in this buffer."
-  (let ((position (point-min))
-        entries)
-    (while-let ((prompt-end
-                 (text-property-any position (point-max)
-                                    'chomp-shell-prompt-end t)))
-      (let* ((command-start (1+ prompt-end))
-             (line-start (save-excursion
-                           (goto-char prompt-end) (line-beginning-position)))
-             (complete (text-property-any line-start command-start
-                                          'chomp-shell-prompt-begin t))
-             (command (and complete
-                           (string-trim
-                            (buffer-substring-no-properties
-                             command-start
-                             (save-excursion
-                               (goto-char command-start)
-                               (line-end-position)))))))
-        (when (and command (not (string-empty-p command)))
-          (push (cons command (copy-marker command-start)) entries))
-        (setq position command-start)))
-    (nreverse entries)))
+  "Return ordered command entries for complete prompts in terminal history."
+  (if (bound-and-true-p chomp--screen)
+      (let ((width (chomp-screen-width chomp--screen))
+            entries)
+        (dolist (location (chomp-screen-prompt-end-locations chomp--screen))
+          (let* ((row (car location))
+                 (command (string-trim
+                           (chomp-screen-text-range
+                            chomp--screen location (cons row width)))))
+            (unless (string-empty-p command)
+              ;; A virtual location remains valid even when its row is not in
+              ;; the renderer's currently materialized history slab.
+              (push (cons command location) entries))))
+        (nreverse entries))
+    ;; Keep the renderer-only fallback useful to embedders and tests that do
+    ;; not install the buffer-local terminal model.
+    (let ((position (point-min))
+          entries)
+      (while-let ((prompt-end
+                   (text-property-any position (point-max)
+                                      'chomp-shell-prompt-end t)))
+        (let* ((command-start (1+ prompt-end))
+               (line-start (save-excursion
+                             (goto-char prompt-end) (line-beginning-position)))
+               (complete (text-property-any line-start command-start
+                                            'chomp-shell-prompt-begin t))
+               (command (and complete
+                             (string-trim
+                              (buffer-substring-no-properties
+                               command-start
+                               (save-excursion
+                                 (goto-char command-start)
+                                 (line-end-position)))))))
+          (when (and command (not (string-empty-p command)))
+            (push (cons command (copy-marker command-start)) entries))
+          (setq position command-start)))
+      (nreverse entries))))
 
 (defun chomp-shell-imenu-goto (_name position &rest _rest)
-  "Enter Emacs mode and move to prompt POSITION."
+  "Enter Emacs mode and move to virtual prompt POSITION."
   (chomp-emacs-mode)
-  (goto-char position))
+  (if (and (consp position) (integerp (car position)))
+      (chomp-render-goto-location
+       chomp--render (car position) (cdr position))
+    (goto-char position)))
 
 ;;;; ---- Prompt Navigation ----------------------------------------------
 

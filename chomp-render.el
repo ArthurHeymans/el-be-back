@@ -268,28 +268,63 @@ state are reconciled independently so metadata-only updates are visible."
 ;;;; ---- Scrollback Rendering -------------------------------------------
 
 (defun chomp-render--update-scrollback (render)
-  "Materialize only the bounded history range needed by RENDER."
+  "Materialize the history range needed by every window showing RENDER."
   (let* ((screen (chomp-render-state-screen render))
+         ;; Capture model anchors before replacing any materialized text.  In
+         ;; particular, numeric row indices are not stable when old history is
+         ;; trimmed.
+         (windows
+          (cl-loop for window in (get-buffer-window-list
+                                  (chomp-render-state-buffer render) nil t)
+                   collect (cons window
+                                 (chomp-render-buffer-anchor
+                                  render (window-start window)))))
+         (point-anchor (chomp-render-buffer-anchor render (point)))
          (total (chomp-screen-history-row-count screen))
          (generation (chomp-screen-history-generation screen))
          (capacity (chomp-render--history-capacity render))
-         (display-begin (chomp-render-state-display-begin render))
-         (reading-history (< (point) (marker-position display-begin)))
-         (start (if reading-history
-                    (min (chomp-render-state-history-start-row render)
-                         (max 0 (1- total)))
+         (history-locations
+          (delq nil
+                (mapcar (lambda (entry)
+                          (chomp-render--anchor-location
+                           render (cdr entry) total))
+                        windows)))
+         (point-location (chomp-render--anchor-location
+                          render point-anchor total))
+         (history-rows
+          (delq nil
+                (mapcar (lambda (location)
+                          (and (< (car location) total) (car location)))
+                        (append history-locations (list point-location)))))
+         ;; A buffer shared by several windows needs one contiguous slab that
+         ;; covers all their starts.  Usually this remains CAPACITY rows; widely
+         ;; separated windows intentionally expand it rather than corrupting one
+         ;; another's view.
+         (margin (max 1 (/ capacity 3)))
+         (start (if history-rows
+                    (max 0 (- (apply #'min history-rows) margin))
                   (max 0 (- total capacity))))
-         (count (min capacity (- total start))))
+         (needed-end (if history-rows
+                         (min total (+ (apply #'max history-rows)
+                                       capacity))
+                       total))
+         (count (min (- total start)
+                     (max capacity (- needed-end start)))))
     (when (or (/= generation
                   (chomp-render-state-history-generation render))
               (/= start (chomp-render-state-history-start-row render))
               (/= count (chomp-render-state-scrollback-count render))
               (/= total (chomp-render-state-history-total-rows render)))
-      (chomp-render--rebuild-scrollback render start count total generation))
+      (chomp-render--rebuild-scrollback render start count total generation)
+      (dolist (entry windows)
+        (when-let ((position
+                    (chomp-render--anchor-buffer-position
+                     render (cdr entry))))
+          (set-window-start (car entry) position t))))
     (chomp-screen-clear-scrollback-dirty screen)))
 
 (defun chomp-render--history-capacity (render)
-  "Return the bounded number of history rows to materialize for RENDER."
+  "Return the usual bounded number of history rows for RENDER."
   (let* ((buffer (chomp-render-state-buffer render))
          (windows (get-buffer-window-list buffer nil t))
          (height (max 24 (cl-loop for window in windows
@@ -297,6 +332,37 @@ state are reconciled independently so metadata-only updates are visible."
                                   into maximum
                                   finally return (or maximum 0)))))
     (* 3 height)))
+
+(defun chomp-render--anchor-location (render anchor total)
+  "Return ANCHOR's current virtual location using history size TOTAL."
+  (pcase anchor
+    (`(history ,id ,offset)
+     (chomp-screen-history-anchor-location
+      (chomp-render-state-screen render) id offset))
+    (`(viewport ,row ,column)
+     (cons (+ total row) column))))
+
+(defun chomp-render--anchor-buffer-position (render anchor)
+  "Return ANCHOR's position when it is present in RENDER's current slab."
+  (when-let ((location
+              (chomp-render--anchor-location
+               render anchor (chomp-render-state-history-total-rows render))))
+    (let* ((row (car location))
+           (column (cdr location))
+           (total (chomp-render-state-history-total-rows render))
+           (start (chomp-render-state-history-start-row render))
+           (count (chomp-render-state-scrollback-count render)))
+      (when (or (>= row total)
+                (and (>= row start) (< row (+ start count))))
+        (save-excursion
+          (if (< row total)
+              (progn
+                (goto-char (chomp-render-state-region-begin render))
+                (forward-line (- row start)))
+            (goto-char (chomp-render-state-display-begin render))
+            (forward-line (- row total)))
+          (move-to-column column)
+          (point))))))
 
 (defun chomp-render--history-row-string (render row)
   "Return cached rendered history ROW for RENDER."
@@ -362,9 +428,33 @@ state are reconciled independently so metadata-only updates are visible."
                    (chomp-render-state-region-begin render))))))
          (target (chomp--clamp (+ current rows) 0 total))
          (capacity (chomp-render--history-capacity render))
-         (start (min (max 0 (- target (/ capacity 3)))
-                     (max 0 (- total capacity))))
-         (count (min capacity (- total start)))
+         (other-windows
+          (cl-loop for other in (get-buffer-window-list
+                                 (chomp-render-state-buffer render) nil t)
+                   unless (eq other window)
+                   collect (cons other
+                                 (chomp-render-buffer-anchor
+                                  render (window-start other)))))
+         (other-rows
+          (delq nil
+                (mapcar
+                 (lambda (entry)
+                   (when-let ((location
+                               (chomp-render--anchor-location
+                                render (cdr entry) total)))
+                     (and (< (car location) total) (car location))))
+                 other-windows)))
+         (wanted-rows (if (< target total)
+                          (cons target other-rows)
+                        other-rows))
+         (start (if wanted-rows
+                    (max 0 (- (apply #'min wanted-rows) (/ capacity 3)))
+                  (max 0 (- total capacity))))
+         (needed-end (if wanted-rows
+                         (min total (+ (apply #'max wanted-rows) capacity))
+                       total))
+         (count (min (- total start)
+                     (max capacity (- needed-end start))))
          (inhibit-read-only t)
          (inhibit-modification-hooks t)
          (buffer-undo-list t))
@@ -373,6 +463,10 @@ state are reconciled independently so metadata-only updates are visible."
             (chomp-render-buffer-location render (mark t))))
     (chomp-render--rebuild-scrollback
      render start count total (chomp-screen-history-generation screen))
+    (dolist (entry other-windows)
+      (when-let ((position
+                  (chomp-render--anchor-buffer-position render (cdr entry))))
+        (set-window-start (car entry) position t)))
     (if (= target total)
         (set-window-start window display-begin t)
       (save-excursion
@@ -916,25 +1010,37 @@ Used after resize when the display area size has changed."
                (saved-mark (and preserve-view (mark t)
                                 (chomp-render-buffer-anchor render (mark t))))
                (saved-mark-active (and preserve-view mark-active))
-               (saved-window
-                (and preserve-view
-                     (eq (window-buffer (selected-window)) buffer)
-                     (selected-window)))
-               (saved-window-start
-                (and saved-window
-                     (chomp-render-buffer-anchor
-                      render (window-start saved-window)))))
+               (saved-windows
+                (cl-loop for window in (get-buffer-window-list buffer nil t)
+                         collect (cons window
+                                       (chomp-render-buffer-anchor
+                                        render (window-start window))))))
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
             (goto-char (chomp-render-state-region-begin render))
             (delete-region (point)
                            (chomp-render-state-region-end render))
-          ;; Materialize only the tail history slab.
+          ;; Materialize a slab covering every window's stable model anchor.
           (let* ((total (chomp-screen-history-row-count screen))
                  (capacity (chomp-render--history-capacity render))
-                 (start (max 0 (- total capacity)))
-                 (count (- total start)))
+                 (rows
+                  (delq nil
+                        (mapcar
+                         (lambda (entry)
+                           (when-let ((location
+                                       (chomp-render--anchor-location
+                                        render (cdr entry) total)))
+                             (and (< (car location) total) (car location))))
+                         saved-windows)))
+                 (start (if rows
+                            (max 0 (- (apply #'min rows) (/ capacity 3)))
+                          (max 0 (- total capacity))))
+                 (needed-end (if rows
+                                 (min total (+ (apply #'max rows) capacity))
+                               total))
+                 (count (min (- total start)
+                             (max capacity (- needed-end start)))))
             (dotimes (offset count)
               (insert (chomp-render--history-row-string
                        render (+ start offset))))
@@ -981,14 +1087,15 @@ Used after resize when the display area size has changed."
                     (set-marker (mark-marker) (point)))
                   (setq mark-active saved-mark-active))
               (set-marker (mark-marker) nil))
-            (when (window-live-p saved-window)
-              (save-excursion
-                (chomp-render-goto-anchor render saved-window-start t)
-                (set-window-start saved-window (point) t))))
-          (unless preserve-view
-            (dolist (window (get-buffer-window-list buffer nil t))
-              (set-window-start
-               window (chomp-render-state-display-begin render) t))))))))
+            )
+          (dolist (entry saved-windows)
+            (when (window-live-p (car entry))
+              (if-let ((position
+                        (chomp-render--anchor-buffer-position
+                         render (cdr entry))))
+                  (set-window-start (car entry) position t)
+                (set-window-start
+                 (car entry) (chomp-render-state-display-begin render) t)))))))))
 
 (defun chomp-render-resize-height (render)
   "Rebuild only RENDER's viewport after a height-only terminal resize."
