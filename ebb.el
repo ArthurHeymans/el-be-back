@@ -54,6 +54,7 @@ For best shell integration, set this to your interactive shell
   '(("ssh" login-shell)
     ("sshx" login-shell)
     ("scp" login-shell)
+    ("rpc" login-shell)
     ("docker" "/bin/sh"))
   "Shell to use for remote TRAMP connections, per method.
 Each entry is (TRAMP-METHOD SHELL [FALLBACK ARG...]).  TRAMP-METHOD
