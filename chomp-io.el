@@ -25,6 +25,7 @@
   (screen nil)            ; chomp-screen
   (render nil)            ; chomp-render-state
   (buffer nil)            ; Emacs buffer
+  (input-coding-system 'utf-8) ; encoding for multibyte input, or nil
   ;; Output queue
   (pending-chunks nil)    ; unprocessed output chunks, oldest first
   (pending-tail nil)      ; tail cons of pending-chunks for O(1) append
@@ -63,8 +64,9 @@ Ensures responsiveness."
 
 ;;;; ---- Process Filter (never blocks) ----------------------------------
 
-(defun chomp-io--filter (io _process output)
-  "Process filter.  Only appends to queue.  Never parses."
+(defun chomp-io-receive (io output)
+  "Queue terminal OUTPUT for asynchronous parsing and rendering.
+This is the supported entry point for non-PTY transports."
   (chomp-io--enqueue-output io output)
   ;; Record time of first unprocessed chunk
   (unless (chomp-io-first-chunk-time io)
@@ -72,6 +74,10 @@ Ensures responsiveness."
   ;; Schedule processing
   (unless (chomp-io-processing io)
     (chomp-io--schedule-processing io)))
+
+(defun chomp-io--filter (io _process output)
+  "Process filter for Chomp-owned processes."
+  (chomp-io-receive io output))
 
 (defun chomp-io--enqueue-output (io output)
   "Append OUTPUT to IO's pending chunk queue without copying old data."
@@ -402,8 +408,9 @@ local paths), and TERM is chosen by an on-remote probe; see
                           (chomp-io--filter io proc output))
                 :sentinel (lambda (proc event)
                             (chomp-io--sentinel io proc event)))))
-    ;; Set initial PTY size
-    (set-process-window-size proc h w)
+    ;; Set initial PTY size.
+    (when (and (processp proc) (eq (process-type proc) 'pty))
+      (set-process-window-size proc h w))
     ;; Wire up response writing
     (setf (chomp-parser-write-fn (chomp-io-parser io))
           (lambda (s) (chomp-io-send io s)))
@@ -441,14 +448,16 @@ Chomp through `chomp-io--filter'."
 
 (defun chomp-io-send (io string)
   "Send STRING to the terminal process.
-Multibyte text is encoded as UTF-8; unibyte strings are sent unchanged."
+Multibyte text is encoded with `chomp-io-input-coding-system'.
+Unibyte strings are always sent unchanged."
   (when-let ((proc (chomp-io-process io)))
     (when (process-live-p proc)
-      (process-send-string
-       proc
-       (if (multibyte-string-p string)
-           (encode-coding-string string 'utf-8 t)
-         string)))))
+      (let ((coding (chomp-io-input-coding-system io)))
+        (process-send-string
+         proc
+         (if (and coding (multibyte-string-p string))
+             (encode-coding-string string coding t)
+           string))))))
 
 ;;;; ---- Resize ---------------------------------------------------------
 
@@ -465,7 +474,9 @@ Multibyte text is encoded as UTF-8; unibyte strings are sent unchanged."
       (chomp-screen-resize screen new-width new-height)
       ;; Step 2: Notify PTY
       (when-let ((proc (chomp-io-process io)))
-        (when (process-live-p proc)
+        (when (and (process-live-p proc)
+                   (processp proc)
+                   (eq (process-type proc) 'pty))
           (set-process-window-size proc new-height new-width)))
       ;; Step 3: A minibuffer only changes height.  Rebuild its viewport,
       ;; not thousands of unchanged scrollback rows.

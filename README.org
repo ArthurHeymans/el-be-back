@@ -127,14 +127,30 @@ follow ghostel's refinements of the Eat model.
 Both were read closely and heavily relied on; bugs in the reinterpretation
 are chomp's own.
 
+* Serial terminals
+
+On Emacs 30.1 or newer, Chomp can connect directly to a local serial port or
+to a remote port through Tramp and =socat=:
+
+#+begin_src text
+M-x chomp-serial
+#+end_src
+
+The serial buffer supports reconnecting, changing baud rate/framing/flow
+control, sending raw bytes, and configurable handling of malformed UTF-8.
+Serial commands use the =C-c C-s= prefix.  Load the optional backend with
+=(require 'chomp-serial)= when it is not installed through package autoloads.
+
 * Requirements
 
 - Emacs 28.1 or newer
+- Emacs 30.1 or newer for =chomp-serial=
 
 * Tests
 
 #+begin_src sh
 emacs -Q --batch -L . -l chomp-test.el -f ert-run-tests-batch-and-exit
+emacs -Q --batch -L . -l chomp-serial-test.el -f ert-run-tests-batch-and-exit
 #+end_src
 
 * License
