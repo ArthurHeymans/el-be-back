@@ -4,9 +4,9 @@
 [[file:el-be-back.jpg]]
 
 
-El-Be-Back (Ebb) is a terminal emulator for Emacs written in pure Elisp.  It is an
-alternative to [[https://codeberg.org/akib/emacs-eat][Eat]], keeping Eat's user-facing model while restructuring the
-internals.  It also borrows ideas from [[../ghostel/][ghostel]].  See [[#credits][Credits]].
+El-Be-Back (Ebb) is a +terminator+ terminal emulator for Emacs written in pure Elisp.
+It is an alternative to [[https://codeberg.org/akib/emacs-eat][Eat]], keeping Eat's user-facing model while restructuring the
+internals. It also borrows ideas from [[../ghostel/][ghostel]].  See [[#credits][Credits]].
 
 Open a terminal with:
 
