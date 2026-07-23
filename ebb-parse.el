@@ -1,4 +1,4 @@
-;;; chomp-parse.el --- VT escape sequence parser -*- lexical-binding: t; -*-
+;;; ebb-parse.el --- VT escape sequence parser -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -6,7 +6,7 @@
 ;;; Commentary:
 
 ;; State machine parser for VT100/VT220/xterm escape sequences.
-;; Consumes characters and drives chomp-screen operations.
+;; Consumes characters and drives ebb-screen operations.
 ;;
 ;; Design: O(1) CSI dispatch via vector table.  Every handler is
 ;; wrapped in error recovery -- unknown sequences are logged, never crash.
@@ -16,19 +16,19 @@
 
 (require 'cl-lib)
 (require 'url-util)
-(require 'chomp-term)
+(require 'ebb-term)
 
-(defcustom chomp-enable-osc52 nil
+(defcustom ebb-enable-osc52 nil
   "If non-nil, allow terminal output to access the clipboard via OSC 52."
   :type 'boolean
-  :group 'chomp)
+  :group 'ebb)
 
 ;;;; ---- Data Structures ------------------------------------------------
 
-(cl-defstruct (chomp-parser (:copier nil))
+(cl-defstruct (ebb-parser (:copier nil))
   "VT escape sequence parser."
   (state :ground)        ; current state keyword
-  (screen nil)           ; chomp-screen to operate on
+  (screen nil)           ; ebb-screen to operate on
   (write-fn nil)         ; (lambda (string)) send bytes to PTY
   (emit-fn nil)          ; (lambda (type &rest args)) event callback
   ;; CSI collection
@@ -47,20 +47,20 @@
 
 ;;;; ---- Logging / Emit / Respond ---------------------------------------
 
-(defvar chomp-parse-debug nil
+(defvar ebb-parse-debug nil
   "When non-nil, log unknown escape sequences to *Messages*.")
 
-(defun chomp-parse--log (fmt &rest args)
+(defun ebb-parse--log (fmt &rest args)
   "Log a parser message when debug is enabled."
-  (when chomp-parse-debug
-    (apply #'message (concat "[chomp-parse] " fmt) args)))
+  (when ebb-parse-debug
+    (apply #'message (concat "[ebb-parse] " fmt) args)))
 
-(defun chomp-parse--respond (parser response)
+(defun ebb-parse--respond (parser response)
   "Send RESPONSE string back to the PTY."
-  (when-let ((fn (chomp-parser-write-fn parser)))
+  (when-let ((fn (ebb-parser-write-fn parser)))
     (funcall fn response)))
 
-(defun chomp-parse--color-to-xterm (color-str)
+(defun ebb-parse--color-to-xterm (color-str)
   "Convert an Emacs color string to xterm rgb:RRRR/GGGG/BBBB format."
   (cond
    ((not color-str)
@@ -78,7 +78,7 @@
                   (nth 0 rgb) (nth 1 rgb) (nth 2 rgb))
         "rgb:ffff/ffff/ffff")))))
 
-(defun chomp-parse--256color-hex (n)
+(defun ebb-parse--256color-hex (n)
   "Return the default xterm 256-color palette entry N as #RRGGBB."
   (cond
    ((< n 16)
@@ -96,21 +96,21 @@
       (format "#%02x%02x%02x"
               (aref vals r-idx) (aref vals g-idx) (aref vals b-idx))))
    (t
-    (let ((v (chomp--clamp (+ 8 (* 10 (- n 232))) 0 255)))
+    (let ((v (ebb--clamp (+ 8 (* 10 (- n 232))) 0 255)))
       (format "#%02x%02x%02x" v v v)))))
 
-(defun chomp-parse--palette-color-to-xterm (n)
+(defun ebb-parse--palette-color-to-xterm (n)
   "Return palette index N as an xterm rgb:RRRR/GGGG/BBBB string."
-  (chomp-parse--color-to-xterm (chomp-parse--256color-hex n)))
+  (ebb-parse--color-to-xterm (ebb-parse--256color-hex n)))
 
-(defun chomp-parse--emit (parser type &rest args)
+(defun ebb-parse--emit (parser type &rest args)
   "Emit an event TYPE with ARGS via the parser callback."
-  (when-let ((fn (chomp-parser-emit-fn parser)))
+  (when-let ((fn (ebb-parser-emit-fn parser)))
     (apply fn type args)))
 
 ;;;; ---- Parameter Parsing ----------------------------------------------
 
-(defun chomp-parse--parse-params (param-str)
+(defun ebb-parse--parse-params (param-str)
   "Parse CSI parameter string into a vector of integers or sub-param lists.
 Splits on semicolons.  Within each parameter, colons delimit sub-parameters.
 A parameter with colons becomes a list of integers; without, a plain integer.
@@ -130,7 +130,7 @@ Empty segments become 0.  Values clamped to 16384."
                    (min (string-to-number s) 16384))))
              (split-string param-str ";")))))
 
-(defsubst chomp-parse--param (params index default)
+(defsubst ebb-parse--param (params index default)
   "Get PARAMS[INDEX], or DEFAULT if missing or zero.
 If the parameter is a sub-parameter list, return the first element."
   (let ((val (if (< index (length params)) (aref params index) 0)))
@@ -141,36 +141,36 @@ If the parameter is a sub-parameter list, return the first element."
 
 ;;;; ---- Constructor ----------------------------------------------------
 
-(defun chomp-parse-create (screen &optional write-fn emit-fn)
+(defun ebb-parse-create (screen &optional write-fn emit-fn)
   "Create a parser for SCREEN with optional WRITE-FN and EMIT-FN."
-  (make-chomp-parser
+  (make-ebb-parser
    :screen screen
    :write-fn write-fn
    :emit-fn emit-fn))
 
 ;;;; ---- Entry Point ----------------------------------------------------
 
-(defun chomp-parse-bytes (parser string &optional start end)
+(defun ebb-parse-bytes (parser string &optional start end)
   "Parse STRING from START to END through PARSER.
 Returns the number of characters consumed."
   (let ((i (or start 0))
         (e (or end (length string)))
-        (screen (chomp-parser-screen parser)))
+        (screen (ebb-parser-screen parser)))
     (while (< i e)
       (let ((ch (aref string i)))
         ;; The common case for terminal output is a run of printable text while
         ;; the parser is in ground state.  Dispatch that whole run to the
         ;; screen model at once instead of re-entering the parser for each byte.
-        (if (and (eq (chomp-parser-state parser) :ground)
+        (if (and (eq (ebb-parser-state parser) :ground)
                  (= ch ?\e)
                  (< (+ i 2) e)
                  (= (aref string (1+ i)) ?\[))
-            (let ((next (chomp-parse--fast-csi-at parser string (+ i 2) e)))
+            (let ((next (ebb-parse--fast-csi-at parser string (+ i 2) e)))
               (if next
                   (setq i next)
-                (chomp-parse--process-char parser ch)
+                (ebb-parse--process-char parser ch)
                 (cl-incf i)))
-          (if (and (eq (chomp-parser-state parser) :ground)
+          (if (and (eq (ebb-parser-state parser) :ground)
                    (>= ch ?\s)
                    (/= ch ?\x7f))
             (let ((run-start i))
@@ -178,21 +178,21 @@ Returns the number of characters consumed."
                           (let ((c (aref string i)))
                             (and (>= c ?\s) (/= c ?\x7f))))
                 (cl-incf i))
-              (chomp-screen-write-string screen string run-start i)
+              (ebb-screen-write-string screen string run-start i)
               ;; Bulk command output commonly arrives as printable text followed
               ;; by CRLF.  Handle that pair inline in ground state to avoid two
               ;; full parser dispatches per line.
               (when (and (< (1+ i) e)
                          (= (aref string i) ?\r)
                          (= (aref string (1+ i)) ?\n))
-                (chomp-screen-carriage-return screen)
-                (chomp-screen-index screen)
+                (ebb-screen-carriage-return screen)
+                (ebb-screen-index screen)
                 (cl-incf i 2)))
-            (chomp-parse--process-char parser ch)
+            (ebb-parse--process-char parser ch)
             (cl-incf i)))))
     (- i (or start 0))))
 
-(defun chomp-parse--fast-csi-at (parser string start end)
+(defun ebb-parse--fast-csi-at (parser string start end)
   "Handle a common CSI beginning at START, returning the next index.
 START is the first byte after ESC [.  Return nil when the sequence is not one
 of the simple forms handled here."
@@ -204,7 +204,7 @@ of the simple forms handled here."
            ((or (and (>= c ?0) (<= c ?9)) (= c ?\;))
             (cl-incf j))
            ((and (>= c ?@) (<= c ?~))
-            (let ((screen (chomp-parser-screen parser)))
+            (let ((screen (ebb-parser-screen parser)))
               (cond
                ((= c ?H)
                 (let ((row 0)
@@ -221,33 +221,33 @@ of the simple forms handled here."
                             (setq col (+ (* col 10) (- p ?0)))
                           (setq row (+ (* row 10) (- p ?0))))))
                     (cl-incf k))
-                  (chomp-screen-cursor-goto screen
+                  (ebb-screen-cursor-goto screen
                                             (1- (if (zerop row) 1 row))
                                             (1- (if (zerop col) 1 col)))
                   (throw 'done (1+ j))))
                ((and (= c ?J)
                      (= (- j start) 1)
                      (= (aref string start) ?2))
-                (chomp-screen-erase-in-display screen 2)
+                (ebb-screen-erase-in-display screen 2)
                 (throw 'done (1+ j)))
                ((= c ?m)
-                (if (chomp-parse--fast-sgr-at parser string start j)
+                (if (ebb-parse--fast-sgr-at parser string start j)
                     (throw 'done (1+ j))
                   (throw 'done nil)))
                (t (throw 'done nil)))))
            (t (throw 'done nil))))))))
 
-(defun chomp-parse--fast-sgr-at (parser string start end)
+(defun ebb-parse--fast-sgr-at (parser string start end)
   "Apply simple SGR params from STRING[START, END); return non-nil if handled.
 This avoids the allocation-heavy generic `split-string' parameter parser for
 common color-heavy output.  The caller has already verified that the bytes are
 only digits and semicolons."
-  (let ((screen (chomp-parser-screen parser)))
+  (let ((screen (ebb-parser-screen parser)))
     (if (= start end)
         (progn
-          (chomp-screen-reset-attr screen)
+          (ebb-screen-reset-attr screen)
           t)
-      (or (chomp-parse--fast-simple-sgr-at screen string start end)
+      (or (ebb-parse--fast-simple-sgr-at screen string start end)
           (catch 'fallback
         ;; Most SGR sequences are very short.  Keep the vector stack-local and
         ;; fall back for unusually long forms rather than growing structures in
@@ -273,401 +273,401 @@ only digits and semicolons."
             (while (< idx count)
               (let ((p (aref params idx)))
                 (cond
-                 ((= p 0)  (chomp-screen-reset-attr screen))
-                 ((= p 1)  (chomp-screen-set-attr screen :bold t))
-                 ((= p 2)  (chomp-screen-set-attr screen :faint t))
-                 ((= p 3)  (chomp-screen-set-attr screen :italic t))
-                 ((= p 4)  (chomp-screen-set-attr screen :underline 'line))
-                 ((= p 5)  (chomp-screen-set-attr screen :blink 'slow))
-                 ((= p 6)  (chomp-screen-set-attr screen :blink 'fast))
-                 ((= p 7)  (chomp-screen-set-attr screen :inverse t))
-                 ((= p 8)  (chomp-screen-set-attr screen :conceal t))
-                 ((= p 9)  (chomp-screen-set-attr screen :crossed t))
+                 ((= p 0)  (ebb-screen-reset-attr screen))
+                 ((= p 1)  (ebb-screen-set-attr screen :bold t))
+                 ((= p 2)  (ebb-screen-set-attr screen :faint t))
+                 ((= p 3)  (ebb-screen-set-attr screen :italic t))
+                 ((= p 4)  (ebb-screen-set-attr screen :underline 'line))
+                 ((= p 5)  (ebb-screen-set-attr screen :blink 'slow))
+                 ((= p 6)  (ebb-screen-set-attr screen :blink 'fast))
+                 ((= p 7)  (ebb-screen-set-attr screen :inverse t))
+                 ((= p 8)  (ebb-screen-set-attr screen :conceal t))
+                 ((= p 9)  (ebb-screen-set-attr screen :crossed t))
                  ((and (>= p 10) (<= p 19))
-                  (chomp-screen-set-attr screen :font (- p 10)))
-                 ((= p 21) (chomp-screen-set-attr screen :underline 'double))
-                 ((= p 22) (chomp-screen-set-attr screen :bold nil)
-                            (chomp-screen-set-attr screen :faint nil))
-                 ((= p 23) (chomp-screen-set-attr screen :italic nil))
-                 ((= p 24) (chomp-screen-set-attr screen :underline nil))
-                 ((= p 25) (chomp-screen-set-attr screen :blink nil))
-                 ((= p 27) (chomp-screen-set-attr screen :inverse nil))
-                 ((= p 28) (chomp-screen-set-attr screen :conceal nil))
-                 ((= p 29) (chomp-screen-set-attr screen :crossed nil))
+                  (ebb-screen-set-attr screen :font (- p 10)))
+                 ((= p 21) (ebb-screen-set-attr screen :underline 'double))
+                 ((= p 22) (ebb-screen-set-attr screen :bold nil)
+                            (ebb-screen-set-attr screen :faint nil))
+                 ((= p 23) (ebb-screen-set-attr screen :italic nil))
+                 ((= p 24) (ebb-screen-set-attr screen :underline nil))
+                 ((= p 25) (ebb-screen-set-attr screen :blink nil))
+                 ((= p 27) (ebb-screen-set-attr screen :inverse nil))
+                 ((= p 28) (ebb-screen-set-attr screen :conceal nil))
+                 ((= p 29) (ebb-screen-set-attr screen :crossed nil))
                  ((and (>= p 30) (<= p 37))
-                  (chomp-screen-set-attr screen :fg (- p 30)))
+                  (ebb-screen-set-attr screen :fg (- p 30)))
                  ((= p 38)
                   (cond
                    ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (chomp-screen-set-attr screen :fg (aref params (+ idx 2)))
+                    (ebb-screen-set-attr screen :fg (aref params (+ idx 2)))
                     (cl-incf idx 2))
                    ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (chomp-screen-set-attr
+                    (ebb-screen-set-attr
                      screen :fg
                      (list (aref params (+ idx 2))
                            (aref params (+ idx 3))
                            (aref params (+ idx 4))))
                     (cl-incf idx 4))
                    (t (throw 'fallback nil))))
-                 ((= p 39) (chomp-screen-set-attr screen :fg nil))
+                 ((= p 39) (ebb-screen-set-attr screen :fg nil))
                  ((and (>= p 40) (<= p 47))
-                  (chomp-screen-set-attr screen :bg (- p 40)))
+                  (ebb-screen-set-attr screen :bg (- p 40)))
                  ((= p 48)
                   (cond
                    ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (chomp-screen-set-attr screen :bg (aref params (+ idx 2)))
+                    (ebb-screen-set-attr screen :bg (aref params (+ idx 2)))
                     (cl-incf idx 2))
                    ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (chomp-screen-set-attr
+                    (ebb-screen-set-attr
                      screen :bg
                      (list (aref params (+ idx 2))
                            (aref params (+ idx 3))
                            (aref params (+ idx 4))))
                     (cl-incf idx 4))
                    (t (throw 'fallback nil))))
-                 ((= p 49) (chomp-screen-set-attr screen :bg nil))
+                 ((= p 49) (ebb-screen-set-attr screen :bg nil))
                  ((= p 58)
                   (cond
                    ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (chomp-screen-set-attr screen :ul-color (aref params (+ idx 2)))
+                    (ebb-screen-set-attr screen :ul-color (aref params (+ idx 2)))
                     (cl-incf idx 2))
                    ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (chomp-screen-set-attr
+                    (ebb-screen-set-attr
                      screen :ul-color
                      (list (aref params (+ idx 2))
                            (aref params (+ idx 3))
                            (aref params (+ idx 4))))
                     (cl-incf idx 4))
                    (t (throw 'fallback nil))))
-                 ((= p 59) (chomp-screen-set-attr screen :ul-color nil))
+                 ((= p 59) (ebb-screen-set-attr screen :ul-color nil))
                  ((and (>= p 90) (<= p 97))
-                  (chomp-screen-set-attr screen :fg (+ 8 (- p 90))))
+                  (ebb-screen-set-attr screen :fg (+ 8 (- p 90))))
                  ((and (>= p 100) (<= p 107))
-                  (chomp-screen-set-attr screen :bg (+ 8 (- p 100))))
+                  (ebb-screen-set-attr screen :bg (+ 8 (- p 100))))
                  (t (throw 'fallback nil))))
               (cl-incf idx)))
           t))))))
 
-(defun chomp-parse--fast-simple-sgr-at (screen string start end)
+(defun ebb-parse--fast-simple-sgr-at (screen string start end)
   "Handle the shortest and most frequent SGR forms in STRING[START, END)."
   (let ((len (- end start)))
     (cond
      ((and (= len 1) (= (aref string start) ?0))
-      (chomp-screen-reset-attr screen)
+      (ebb-screen-reset-attr screen)
       t)
      ((and (= len 2)
            (= (aref string start) ?3)
            (<= ?0 (aref string (1+ start)))
            (<= (aref string (1+ start)) ?7))
-      (chomp-screen-set-attr screen :fg (- (aref string (1+ start)) ?0))
+      (ebb-screen-set-attr screen :fg (- (aref string (1+ start)) ?0))
       t)
      ((and (= len 2)
            (= (aref string start) ?4)
            (<= ?0 (aref string (1+ start)))
            (<= (aref string (1+ start)) ?7))
-      (chomp-screen-set-attr screen :bg (- (aref string (1+ start)) ?0))
+      (ebb-screen-set-attr screen :bg (- (aref string (1+ start)) ?0))
       t))))
 
 ;;;; ---- Main Dispatch --------------------------------------------------
 
-(defun chomp-parse--process-char (parser ch)
+(defun ebb-parse--process-char (parser ch)
   "Process a single character CH through the parser state machine."
   (cond
    ;; ESC always starts a new escape sequence
    ((= ch ?\e)
     ;; Save string-state if we were inside OSC/DCS
-    (setf (chomp-parser-string-state parser)
-          (pcase (chomp-parser-state parser)
+    (setf (ebb-parser-string-state parser)
+          (pcase (ebb-parser-state parser)
             (:osc-string :osc)
             (:dcs-passthrough :dcs)
             (_ nil)))
-    (setf (chomp-parser-state parser) :escape)
-    (setf (chomp-parser-param-string parser) "")
-    (setf (chomp-parser-private parser) nil)
-    (setf (chomp-parser-intermediates parser) ""))
+    (setf (ebb-parser-state parser) :escape)
+    (setf (ebb-parser-param-string parser) "")
+    (setf (ebb-parser-private parser) nil)
+    (setf (ebb-parser-intermediates parser) ""))
 
    ;; C0 controls (0x00-0x1F) handled inline in most states
    ((and (< ch ?\s)
-         (memq (chomp-parser-state parser)
+         (memq (ebb-parser-state parser)
                '(:ground :escape :csi-entry :csi-param :csi-intermediate)))
-    (chomp-parse--dispatch-c0 parser ch))
+    (ebb-parse--dispatch-c0 parser ch))
 
    ;; DEL -- ignore
    ((= ch ?\x7f) nil)
 
    ;; State-specific processing
    (t
-    (pcase (chomp-parser-state parser)
-      (:ground            (chomp-parse--ground parser ch))
-      (:escape            (chomp-parse--escape parser ch))
-      (:csi-entry         (chomp-parse--csi-entry parser ch))
-      (:csi-param         (chomp-parse--csi-param parser ch))
-      (:csi-intermediate  (chomp-parse--csi-intermediate parser ch))
-      (:osc-string        (chomp-parse--osc-string parser ch))
-      (:dcs-entry         (chomp-parse--dcs-entry parser ch))
-      (:dcs-param         (chomp-parse--dcs-param parser ch))
-      (:dcs-passthrough   (chomp-parse--dcs-passthrough parser ch))
-      (:charset-designate (chomp-parse--charset-designate parser ch))
-      (:sos-pm-apc        (chomp-parse--sos-pm-apc parser ch))))))
+    (pcase (ebb-parser-state parser)
+      (:ground            (ebb-parse--ground parser ch))
+      (:escape            (ebb-parse--escape parser ch))
+      (:csi-entry         (ebb-parse--csi-entry parser ch))
+      (:csi-param         (ebb-parse--csi-param parser ch))
+      (:csi-intermediate  (ebb-parse--csi-intermediate parser ch))
+      (:osc-string        (ebb-parse--osc-string parser ch))
+      (:dcs-entry         (ebb-parse--dcs-entry parser ch))
+      (:dcs-param         (ebb-parse--dcs-param parser ch))
+      (:dcs-passthrough   (ebb-parse--dcs-passthrough parser ch))
+      (:charset-designate (ebb-parse--charset-designate parser ch))
+      (:sos-pm-apc        (ebb-parse--sos-pm-apc parser ch))))))
 
 ;;;; ---- C0 Control Dispatch --------------------------------------------
 
-(defun chomp-parse--dispatch-c0 (parser ch)
+(defun ebb-parse--dispatch-c0 (parser ch)
   "Handle C0 control character CH."
-  (let ((screen (chomp-parser-screen parser)))
+  (let ((screen (ebb-parser-screen parser)))
     (cond
-     ((= ch ?\a) (chomp-parse--emit parser 'bell))          ; BEL
-     ((= ch ?\b) (chomp-screen-backspace screen))            ; BS
-     ((= ch ?\t) (chomp-screen-tab-forward screen 1))        ; HT
-     ((= ch ?\n) (chomp-screen-index screen))                ; LF
-     ((= ch ?\v) (chomp-screen-index screen))                ; VT
-     ((= ch ?\f) (chomp-screen-index screen))                ; FF
-     ((= ch ?\r) (chomp-screen-carriage-return screen))      ; CR
-     ((= ch 14)  (chomp-screen-shift-out screen))            ; SO
-     ((= ch 15)  (chomp-screen-shift-in screen))             ; SI
+     ((= ch ?\a) (ebb-parse--emit parser 'bell))          ; BEL
+     ((= ch ?\b) (ebb-screen-backspace screen))            ; BS
+     ((= ch ?\t) (ebb-screen-tab-forward screen 1))        ; HT
+     ((= ch ?\n) (ebb-screen-index screen))                ; LF
+     ((= ch ?\v) (ebb-screen-index screen))                ; VT
+     ((= ch ?\f) (ebb-screen-index screen))                ; FF
+     ((= ch ?\r) (ebb-screen-carriage-return screen))      ; CR
+     ((= ch 14)  (ebb-screen-shift-out screen))            ; SO
+     ((= ch 15)  (ebb-screen-shift-in screen))             ; SI
      (t nil))))                                               ; NUL etc.
 
 ;;;; ---- State: Ground --------------------------------------------------
 
-(defun chomp-parse--ground (parser ch)
+(defun ebb-parse--ground (parser ch)
   "Handle printable character in ground state."
   (when (>= ch ?\s)
-    (chomp-screen-write-char (chomp-parser-screen parser) ch)))
+    (ebb-screen-write-char (ebb-parser-screen parser) ch)))
 
 ;;;; ---- State: Escape --------------------------------------------------
 
-(defun chomp-parse--escape (parser ch)
+(defun ebb-parse--escape (parser ch)
   "Handle character after ESC."
   (cond
    ;; ST (ESC \) terminates a pending string
-   ((and (= ch ?\\) (chomp-parser-string-state parser))
-    (chomp-parse--complete-string parser)
-    (setf (chomp-parser-string-state parser) nil)
-    (setf (chomp-parser-state parser) :ground))
+   ((and (= ch ?\\) (ebb-parser-string-state parser))
+    (ebb-parse--complete-string parser)
+    (setf (ebb-parser-string-state parser) nil)
+    (setf (ebb-parser-state parser) :ground))
    ;; CSI
    ((= ch ?\[)
-    (setf (chomp-parser-string-state parser) nil)
-    (setf (chomp-parser-state parser) :csi-entry))
+    (setf (ebb-parser-string-state parser) nil)
+    (setf (ebb-parser-state parser) :csi-entry))
    ;; OSC
    ((= ch ?\])
-    (setf (chomp-parser-string-state parser) nil)
-    (setf (chomp-parser-osc-string parser) "")
-    (setf (chomp-parser-state parser) :osc-string))
+    (setf (ebb-parser-string-state parser) nil)
+    (setf (ebb-parser-osc-string parser) "")
+    (setf (ebb-parser-state parser) :osc-string))
    ;; DCS
    ((= ch ?P)
-    (setf (chomp-parser-string-state parser) nil)
-    (setf (chomp-parser-dcs-params parser) "")
-    (setf (chomp-parser-dcs-string parser) "")
-    (setf (chomp-parser-state parser) :dcs-entry))
+    (setf (ebb-parser-string-state parser) nil)
+    (setf (ebb-parser-dcs-params parser) "")
+    (setf (ebb-parser-dcs-string parser) "")
+    (setf (ebb-parser-state parser) :dcs-entry))
    ;; Charset designation
    ((memq ch '(?\( ?\) ?* ?+ ?- ?. ?/))
-    (setf (chomp-parser-string-state parser) nil)
-    (setf (chomp-parser-charset-slot parser) ch)
-    (setf (chomp-parser-state parser) :charset-designate))
+    (setf (ebb-parser-string-state parser) nil)
+    (setf (ebb-parser-charset-slot parser) ch)
+    (setf (ebb-parser-state parser) :charset-designate))
    ;; SOS / PM / APC
    ((memq ch '(?X ?^ ?_))
-    (setf (chomp-parser-string-state parser) nil)
-    (setf (chomp-parser-state parser) :sos-pm-apc))
+    (setf (ebb-parser-string-state parser) nil)
+    (setf (ebb-parser-state parser) :sos-pm-apc))
    ;; Simple ESC commands
    (t
-    (setf (chomp-parser-string-state parser) nil)
-    (chomp-parse--dispatch-esc parser ch)
-    (setf (chomp-parser-state parser) :ground))))
+    (setf (ebb-parser-string-state parser) nil)
+    (ebb-parse--dispatch-esc parser ch)
+    (setf (ebb-parser-state parser) :ground))))
 
-(defun chomp-parse--dispatch-esc (parser ch)
+(defun ebb-parse--dispatch-esc (parser ch)
   "Dispatch a simple ESC sequence."
-  (let ((screen (chomp-parser-screen parser)))
+  (let ((screen (ebb-parser-screen parser)))
     (condition-case err
         (pcase ch
-          (?7 (chomp-screen-save-cursor screen))
-          (?8 (chomp-screen-restore-cursor screen))
-          (?D (chomp-screen-index screen))
-          (?E (chomp-screen-next-line screen))
-          (?M (chomp-screen-reverse-index screen))
-          (?c (chomp-screen-reset screen)
-              (chomp-parse--emit parser 'reset))
-          (?n (setf (chomp-screen-charset-active screen) 'g2))
-          (?o (setf (chomp-screen-charset-active screen) 'g3))
-          (_ (chomp-parse--log "Unknown ESC %c (0x%02x)" ch ch)))
-      (error (chomp-parse--log "ESC dispatch error for %c: %S" ch err)))))
+          (?7 (ebb-screen-save-cursor screen))
+          (?8 (ebb-screen-restore-cursor screen))
+          (?D (ebb-screen-index screen))
+          (?E (ebb-screen-next-line screen))
+          (?M (ebb-screen-reverse-index screen))
+          (?c (ebb-screen-reset screen)
+              (ebb-parse--emit parser 'reset))
+          (?n (setf (ebb-screen-charset-active screen) 'g2))
+          (?o (setf (ebb-screen-charset-active screen) 'g3))
+          (_ (ebb-parse--log "Unknown ESC %c (0x%02x)" ch ch)))
+      (error (ebb-parse--log "ESC dispatch error for %c: %S" ch err)))))
 
-(defun chomp-parse--complete-string (parser)
+(defun ebb-parse--complete-string (parser)
   "Complete a pending OSC or DCS string."
-  (pcase (chomp-parser-string-state parser)
-    (:osc (chomp-parse--dispatch-osc parser))
-    (:dcs (chomp-parse--dispatch-dcs parser))))
+  (pcase (ebb-parser-string-state parser)
+    (:osc (ebb-parse--dispatch-osc parser))
+    (:dcs (ebb-parse--dispatch-dcs parser))))
 
 ;;;; ---- State: CSI Entry -----------------------------------------------
 
-(defun chomp-parse--csi-entry (parser ch)
+(defun ebb-parse--csi-entry (parser ch)
   "Handle first char after CSI (ESC [)."
   (cond
    ;; Private marker
    ((memq ch '(?? ?> ?=))
-    (setf (chomp-parser-private parser) ch)
-    (setf (chomp-parser-state parser) :csi-param))
+    (setf (ebb-parser-private parser) ch)
+    (setf (ebb-parser-state parser) :csi-param))
    ;; Parameter char
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;) (= ch ?:))
-    (setf (chomp-parser-param-string parser) (string ch))
-    (setf (chomp-parser-state parser) :csi-param))
+    (setf (ebb-parser-param-string parser) (string ch))
+    (setf (ebb-parser-state parser) :csi-param))
    ;; Intermediate byte
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (chomp-parser-intermediates parser) (string ch))
-    (setf (chomp-parser-state parser) :csi-intermediate))
+    (setf (ebb-parser-intermediates parser) (string ch))
+    (setf (ebb-parser-state parser) :csi-intermediate))
    ;; Final byte -- dispatch immediately
    ((and (>= ch ?@) (<= ch ?~))
-    (chomp-parse--dispatch-csi parser ch))
+    (ebb-parse--dispatch-csi parser ch))
    ;; Invalid
-   (t (setf (chomp-parser-state parser) :ground))))
+   (t (setf (ebb-parser-state parser) :ground))))
 
 ;;;; ---- State: CSI Param -----------------------------------------------
 
-(defun chomp-parse--csi-param (parser ch)
+(defun ebb-parse--csi-param (parser ch)
   "Collect CSI parameters."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;) (= ch ?:))
-    (setf (chomp-parser-param-string parser)
-          (concat (chomp-parser-param-string parser) (string ch))))
+    (setf (ebb-parser-param-string parser)
+          (concat (ebb-parser-param-string parser) (string ch))))
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (chomp-parser-intermediates parser) (string ch))
-    (setf (chomp-parser-state parser) :csi-intermediate))
+    (setf (ebb-parser-intermediates parser) (string ch))
+    (setf (ebb-parser-state parser) :csi-intermediate))
    ((and (>= ch ?@) (<= ch ?~))
-    (chomp-parse--dispatch-csi parser ch))
-   (t (setf (chomp-parser-state parser) :ground))))
+    (ebb-parse--dispatch-csi parser ch))
+   (t (setf (ebb-parser-state parser) :ground))))
 
 ;;;; ---- State: CSI Intermediate ----------------------------------------
 
-(defun chomp-parse--csi-intermediate (parser ch)
+(defun ebb-parse--csi-intermediate (parser ch)
   "Collect CSI intermediate bytes."
   (cond
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (chomp-parser-intermediates parser)
-          (concat (chomp-parser-intermediates parser) (string ch))))
+    (setf (ebb-parser-intermediates parser)
+          (concat (ebb-parser-intermediates parser) (string ch))))
    ((and (>= ch ?@) (<= ch ?~))
-    (chomp-parse--dispatch-csi parser ch))
-   (t (setf (chomp-parser-state parser) :ground))))
+    (ebb-parse--dispatch-csi parser ch))
+   (t (setf (ebb-parser-state parser) :ground))))
 
 ;;;; ---- State: OSC String ----------------------------------------------
 
-(defun chomp-parse--osc-string (parser ch)
+(defun ebb-parse--osc-string (parser ch)
   "Collect OSC string payload."
   (cond
    ;; BEL terminates
    ((= ch ?\a)
-    (chomp-parse--dispatch-osc parser)
-    (setf (chomp-parser-state parser) :ground))
+    (ebb-parse--dispatch-osc parser)
+    (setf (ebb-parser-state parser) :ground))
    ;; ESC handled in process-char
    ;; Accumulate (limit length for safety)
-   ((< (length (chomp-parser-osc-string parser)) 65536)
-    (setf (chomp-parser-osc-string parser)
-          (concat (chomp-parser-osc-string parser) (string ch))))))
+   ((< (length (ebb-parser-osc-string parser)) 65536)
+    (setf (ebb-parser-osc-string parser)
+          (concat (ebb-parser-osc-string parser) (string ch))))))
 
 ;;;; ---- State: DCS Entry/Param/Passthrough -----------------------------
 
-(defun chomp-parse--dcs-entry (parser ch)
+(defun ebb-parse--dcs-entry (parser ch)
   "Handle first char after DCS (ESC P)."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;))
-    (setf (chomp-parser-dcs-params parser) (string ch))
-    (setf (chomp-parser-state parser) :dcs-param))
+    (setf (ebb-parser-dcs-params parser) (string ch))
+    (setf (ebb-parser-state parser) :dcs-param))
    ((and (>= ch ?@) (<= ch ?~))
-    (setf (chomp-parser-dcs-final parser) ch)
-    (setf (chomp-parser-state parser) :dcs-passthrough))
-   (t (setf (chomp-parser-state parser) :ground))))
+    (setf (ebb-parser-dcs-final parser) ch)
+    (setf (ebb-parser-state parser) :dcs-passthrough))
+   (t (setf (ebb-parser-state parser) :ground))))
 
-(defun chomp-parse--dcs-param (parser ch)
+(defun ebb-parse--dcs-param (parser ch)
   "Collect DCS parameters."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;))
-    (setf (chomp-parser-dcs-params parser)
-          (concat (chomp-parser-dcs-params parser) (string ch))))
+    (setf (ebb-parser-dcs-params parser)
+          (concat (ebb-parser-dcs-params parser) (string ch))))
    ((and (>= ch ?@) (<= ch ?~))
-    (setf (chomp-parser-dcs-final parser) ch)
-    (setf (chomp-parser-state parser) :dcs-passthrough))
-   (t (setf (chomp-parser-state parser) :ground))))
+    (setf (ebb-parser-dcs-final parser) ch)
+    (setf (ebb-parser-state parser) :dcs-passthrough))
+   (t (setf (ebb-parser-state parser) :ground))))
 
-(defun chomp-parse--dcs-passthrough (parser ch)
+(defun ebb-parse--dcs-passthrough (parser ch)
   "Accumulate DCS body.  ESC handled in process-char for ST."
   ;; Just accumulate (limit for safety)
-  (when (< (length (chomp-parser-dcs-string parser)) 1048576)
-    (setf (chomp-parser-dcs-string parser)
-          (concat (chomp-parser-dcs-string parser) (string ch)))))
+  (when (< (length (ebb-parser-dcs-string parser)) 1048576)
+    (setf (ebb-parser-dcs-string parser)
+          (concat (ebb-parser-dcs-string parser) (string ch)))))
 
 ;;;; ---- State: Charset Designate ---------------------------------------
 
-(defun chomp-parse--charset-designate (parser ch)
+(defun ebb-parse--charset-designate (parser ch)
   "Handle charset designation: ESC SLOT CH."
-  (chomp-screen-designate-charset
-   (chomp-parser-screen parser)
-   (chomp-parser-charset-slot parser)
+  (ebb-screen-designate-charset
+   (ebb-parser-screen parser)
+   (ebb-parser-charset-slot parser)
    ch)
-  (setf (chomp-parser-state parser) :ground))
+  (setf (ebb-parser-state parser) :ground))
 
 ;;;; ---- State: SOS/PM/APC (consume and ignore) ------------------------
 
-(defun chomp-parse--sos-pm-apc (parser ch)
+(defun ebb-parse--sos-pm-apc (parser ch)
   "Consume SOS/PM/APC strings until ST.  ESC handled in process-char."
   ;; Just ignore the character; ESC \ (ST) transitions via :escape state
   (ignore parser ch))
 
 ;;;; ---- CSI Dispatch Table ---------------------------------------------
 
-(defun chomp-parse--csi-unknown (parser params)
+(defun ebb-parse--csi-unknown (parser params)
   "Handler for unrecognized CSI sequences."
-  (chomp-parse--log "Unknown CSI %s %s %c"
-                    (or (chomp-parser-private parser) "")
-                    (chomp-parser-param-string parser)
+  (ebb-parse--log "Unknown CSI %s %s %c"
+                    (or (ebb-parser-private parser) "")
+                    (ebb-parser-param-string parser)
                     0)
   (ignore parser params))
 
-(defvar chomp-parse--csi-dispatch
-  (let ((tbl (make-vector 128 #'chomp-parse--csi-unknown)))
-    (aset tbl ?@ #'chomp-parse--csi-ich)
-    (aset tbl ?A #'chomp-parse--csi-cuu)
-    (aset tbl ?B #'chomp-parse--csi-cud)
-    (aset tbl ?C #'chomp-parse--csi-cuf)
-    (aset tbl ?D #'chomp-parse--csi-cub)
-    (aset tbl ?E #'chomp-parse--csi-cnl)
-    (aset tbl ?F #'chomp-parse--csi-cpl)
-    (aset tbl ?G #'chomp-parse--csi-cha)
-    (aset tbl ?H #'chomp-parse--csi-cup)
-    (aset tbl ?I #'chomp-parse--csi-cht)
-    (aset tbl ?J #'chomp-parse--csi-ed)
-    (aset tbl ?K #'chomp-parse--csi-el)
-    (aset tbl ?L #'chomp-parse--csi-il)
-    (aset tbl ?M #'chomp-parse--csi-dl)
-    (aset tbl ?P #'chomp-parse--csi-dch)
-    (aset tbl ?S #'chomp-parse--csi-su)
-    (aset tbl ?T #'chomp-parse--csi-sd)
-    (aset tbl ?X #'chomp-parse--csi-ech)
-    (aset tbl ?Z #'chomp-parse--csi-cbt)
-    (aset tbl ?` #'chomp-parse--csi-hpa)
-    (aset tbl ?a #'chomp-parse--csi-hpr)
-    (aset tbl ?b #'chomp-parse--csi-rep)
-    (aset tbl ?c #'chomp-parse--csi-da)
-    (aset tbl ?d #'chomp-parse--csi-vpa)
-    (aset tbl ?e #'chomp-parse--csi-vpr)
-    (aset tbl ?f #'chomp-parse--csi-hvp)
-    (aset tbl ?g #'chomp-parse--csi-tbc)
-    (aset tbl ?h #'chomp-parse--csi-sm)
-    (aset tbl ?j #'chomp-parse--csi-cub)   ; VPB alias for CUB
-    (aset tbl ?k #'chomp-parse--csi-cuu)   ; VPB alias for CUU
-    (aset tbl ?l #'chomp-parse--csi-rm)
-    (aset tbl ?m #'chomp-parse--csi-sgr)
-    (aset tbl ?n #'chomp-parse--csi-dsr)
-    (aset tbl ?q #'chomp-parse--csi-decscusr)
-    (aset tbl ?r #'chomp-parse--csi-decstbm)
-    (aset tbl ?s #'chomp-parse--csi-scp)
-    (aset tbl ?t #'chomp-parse--csi-winops)
-    (aset tbl ?u #'chomp-parse--csi-rcp)
+(defvar ebb-parse--csi-dispatch
+  (let ((tbl (make-vector 128 #'ebb-parse--csi-unknown)))
+    (aset tbl ?@ #'ebb-parse--csi-ich)
+    (aset tbl ?A #'ebb-parse--csi-cuu)
+    (aset tbl ?B #'ebb-parse--csi-cud)
+    (aset tbl ?C #'ebb-parse--csi-cuf)
+    (aset tbl ?D #'ebb-parse--csi-cub)
+    (aset tbl ?E #'ebb-parse--csi-cnl)
+    (aset tbl ?F #'ebb-parse--csi-cpl)
+    (aset tbl ?G #'ebb-parse--csi-cha)
+    (aset tbl ?H #'ebb-parse--csi-cup)
+    (aset tbl ?I #'ebb-parse--csi-cht)
+    (aset tbl ?J #'ebb-parse--csi-ed)
+    (aset tbl ?K #'ebb-parse--csi-el)
+    (aset tbl ?L #'ebb-parse--csi-il)
+    (aset tbl ?M #'ebb-parse--csi-dl)
+    (aset tbl ?P #'ebb-parse--csi-dch)
+    (aset tbl ?S #'ebb-parse--csi-su)
+    (aset tbl ?T #'ebb-parse--csi-sd)
+    (aset tbl ?X #'ebb-parse--csi-ech)
+    (aset tbl ?Z #'ebb-parse--csi-cbt)
+    (aset tbl ?` #'ebb-parse--csi-hpa)
+    (aset tbl ?a #'ebb-parse--csi-hpr)
+    (aset tbl ?b #'ebb-parse--csi-rep)
+    (aset tbl ?c #'ebb-parse--csi-da)
+    (aset tbl ?d #'ebb-parse--csi-vpa)
+    (aset tbl ?e #'ebb-parse--csi-vpr)
+    (aset tbl ?f #'ebb-parse--csi-hvp)
+    (aset tbl ?g #'ebb-parse--csi-tbc)
+    (aset tbl ?h #'ebb-parse--csi-sm)
+    (aset tbl ?j #'ebb-parse--csi-cub)   ; VPB alias for CUB
+    (aset tbl ?k #'ebb-parse--csi-cuu)   ; VPB alias for CUU
+    (aset tbl ?l #'ebb-parse--csi-rm)
+    (aset tbl ?m #'ebb-parse--csi-sgr)
+    (aset tbl ?n #'ebb-parse--csi-dsr)
+    (aset tbl ?q #'ebb-parse--csi-decscusr)
+    (aset tbl ?r #'ebb-parse--csi-decstbm)
+    (aset tbl ?s #'ebb-parse--csi-scp)
+    (aset tbl ?t #'ebb-parse--csi-winops)
+    (aset tbl ?u #'ebb-parse--csi-rcp)
     tbl)
   "CSI final-byte dispatch table.  Indexed by character code.")
 
-(defun chomp-parse--fast-csi (parser final-byte param)
+(defun ebb-parse--fast-csi (parser final-byte param)
   "Fast-path common CSI sequences; return non-nil when handled."
-  (and (null (chomp-parser-private parser))
-       (string-empty-p (chomp-parser-intermediates parser))
-       (let ((screen (chomp-parser-screen parser)))
+  (and (null (ebb-parser-private parser))
+       (string-empty-p (ebb-parser-intermediates parser))
+       (let ((screen (ebb-parser-screen parser)))
          (cond
           ;; TUI repaint streams are dominated by row/column addressing.
           ((= final-byte ?H)
@@ -690,7 +690,7 @@ only digits and semicolons."
                    (setq ok nil))))
                (cl-incf i))
              (when ok
-               (chomp-screen-cursor-goto screen
+               (ebb-screen-cursor-goto screen
                                          (1- (if (zerop row) 1 row))
                                          (1- (if (zerop col) 1 col)))
                t)))
@@ -698,303 +698,303 @@ only digits and semicolons."
           ((and (= final-byte ?J)
                 (= (length param) 1)
                 (= (aref param 0) ?2))
-           (chomp-screen-erase-in-display screen 2)
+           (ebb-screen-erase-in-display screen 2)
            t)
           ;; Simple SGR reset and ANSI foreground/background colors.
           ((= final-byte ?m)
            (cond
             ((or (string-empty-p param) (string= param "0"))
-             (chomp-screen-reset-attr screen)
+             (ebb-screen-reset-attr screen)
              t)
             ((and (= (length param) 2)
                   (= (aref param 0) ?4)
                   (<= ?0 (aref param 1))
                   (<= (aref param 1) ?7))
-             (chomp-screen-set-attr screen :bg (- (aref param 1) ?0))
+             (ebb-screen-set-attr screen :bg (- (aref param 1) ?0))
              t)
             ((and (= (length param) 2)
                   (= (aref param 0) ?3)
                   (<= ?0 (aref param 1))
                   (<= (aref param 1) ?7))
-             (chomp-screen-set-attr screen :fg (- (aref param 1) ?0))
+             (ebb-screen-set-attr screen :fg (- (aref param 1) ?0))
              t)))
           (t nil)))))
 
-(defun chomp-parse--dispatch-csi (parser final-byte)
+(defun ebb-parse--dispatch-csi (parser final-byte)
   "Parse parameters and dispatch CSI sequence."
   (condition-case err
-      (let ((param (chomp-parser-param-string parser)))
-        (unless (chomp-parse--fast-csi parser final-byte param)
-          (let ((params (chomp-parse--parse-params param))
+      (let ((param (ebb-parser-param-string parser)))
+        (unless (ebb-parse--fast-csi parser final-byte param)
+          (let ((params (ebb-parse--parse-params param))
                 (handler (if (< final-byte 128)
-                             (aref chomp-parse--csi-dispatch final-byte)
-                           #'chomp-parse--csi-unknown)))
+                             (aref ebb-parse--csi-dispatch final-byte)
+                           #'ebb-parse--csi-unknown)))
             (funcall handler parser params))))
     (error
-     (chomp-parse--log "CSI dispatch error for %c: %S" final-byte err)))
-  (setf (chomp-parser-state parser) :ground))
+     (ebb-parse--log "CSI dispatch error for %c: %S" final-byte err)))
+  (setf (ebb-parser-state parser) :ground))
 
 ;;;; ---- CSI Handlers ---------------------------------------------------
 
 ;; ICH - Insert Character
-(defun chomp-parse--csi-ich (parser params)
-  (chomp-screen-insert-chars (chomp-parser-screen parser)
-                             (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-ich (parser params)
+  (ebb-screen-insert-chars (ebb-parser-screen parser)
+                             (ebb-parse--param params 0 1)))
 
 ;; CUU - Cursor Up
-(defun chomp-parse--csi-cuu (parser params)
-  (chomp-screen-cursor-move (chomp-parser-screen parser)
-                            'up (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-cuu (parser params)
+  (ebb-screen-cursor-move (ebb-parser-screen parser)
+                            'up (ebb-parse--param params 0 1)))
 
 ;; CUD - Cursor Down
-(defun chomp-parse--csi-cud (parser params)
-  (chomp-screen-cursor-move (chomp-parser-screen parser)
-                            'down (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-cud (parser params)
+  (ebb-screen-cursor-move (ebb-parser-screen parser)
+                            'down (ebb-parse--param params 0 1)))
 
 ;; CUF - Cursor Forward
-(defun chomp-parse--csi-cuf (parser params)
-  (chomp-screen-cursor-move (chomp-parser-screen parser)
-                            'right (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-cuf (parser params)
+  (ebb-screen-cursor-move (ebb-parser-screen parser)
+                            'right (ebb-parse--param params 0 1)))
 
 ;; CUB - Cursor Back
-(defun chomp-parse--csi-cub (parser params)
-  (chomp-screen-cursor-move (chomp-parser-screen parser)
-                            'left (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-cub (parser params)
+  (ebb-screen-cursor-move (ebb-parser-screen parser)
+                            'left (ebb-parse--param params 0 1)))
 
 ;; CNL - Cursor Next Line
-(defun chomp-parse--csi-cnl (parser params)
-  (chomp-screen-cursor-next-line (chomp-parser-screen parser)
-                                 (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-cnl (parser params)
+  (ebb-screen-cursor-next-line (ebb-parser-screen parser)
+                                 (ebb-parse--param params 0 1)))
 
 ;; CPL - Cursor Previous Line
-(defun chomp-parse--csi-cpl (parser params)
-  (chomp-screen-cursor-prev-line (chomp-parser-screen parser)
-                                  (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-cpl (parser params)
+  (ebb-screen-cursor-prev-line (ebb-parser-screen parser)
+                                  (ebb-parse--param params 0 1)))
 
 ;; CHA - Cursor Horizontal Absolute
-(defun chomp-parse--csi-cha (parser params)
-  (let* ((screen (chomp-parser-screen parser))
-         (col (1- (chomp-parse--param params 0 1))))
-    (setf (chomp-screen-pending-wrap screen) nil)
-    (setf (chomp-screen-cursor-x screen)
-          (chomp--clamp col 0 (1- (chomp-screen-width screen))))))
+(defun ebb-parse--csi-cha (parser params)
+  (let* ((screen (ebb-parser-screen parser))
+         (col (1- (ebb-parse--param params 0 1))))
+    (setf (ebb-screen-pending-wrap screen) nil)
+    (setf (ebb-screen-cursor-x screen)
+          (ebb--clamp col 0 (1- (ebb-screen-width screen))))))
 
 ;; CUP - Cursor Position
-(defun chomp-parse--csi-cup (parser params)
-  (chomp-screen-cursor-goto (chomp-parser-screen parser)
-                            (1- (chomp-parse--param params 0 1))
-                            (1- (chomp-parse--param params 1 1))))
+(defun ebb-parse--csi-cup (parser params)
+  (ebb-screen-cursor-goto (ebb-parser-screen parser)
+                            (1- (ebb-parse--param params 0 1))
+                            (1- (ebb-parse--param params 1 1))))
 
 ;; CHT - Cursor Horizontal Tab
-(defun chomp-parse--csi-cht (parser params)
-  (chomp-screen-tab-forward (chomp-parser-screen parser)
-                            (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-cht (parser params)
+  (ebb-screen-tab-forward (ebb-parser-screen parser)
+                            (ebb-parse--param params 0 1)))
 
 ;; ED - Erase in Display
-(defun chomp-parse--csi-ed (parser params)
-  (chomp-screen-erase-in-display (chomp-parser-screen parser)
-                                 (chomp-parse--param params 0 0)))
+(defun ebb-parse--csi-ed (parser params)
+  (ebb-screen-erase-in-display (ebb-parser-screen parser)
+                                 (ebb-parse--param params 0 0)))
 
 ;; EL - Erase in Line
-(defun chomp-parse--csi-el (parser params)
-  (chomp-screen-erase-in-line (chomp-parser-screen parser)
-                              (chomp-parse--param params 0 0)))
+(defun ebb-parse--csi-el (parser params)
+  (ebb-screen-erase-in-line (ebb-parser-screen parser)
+                              (ebb-parse--param params 0 0)))
 
 ;; IL - Insert Line
-(defun chomp-parse--csi-il (parser params)
-  (chomp-screen-insert-lines (chomp-parser-screen parser)
-                             (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-il (parser params)
+  (ebb-screen-insert-lines (ebb-parser-screen parser)
+                             (ebb-parse--param params 0 1)))
 
 ;; DL - Delete Line
-(defun chomp-parse--csi-dl (parser params)
-  (chomp-screen-delete-lines (chomp-parser-screen parser)
-                             (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-dl (parser params)
+  (ebb-screen-delete-lines (ebb-parser-screen parser)
+                             (ebb-parse--param params 0 1)))
 
 ;; DCH - Delete Character
-(defun chomp-parse--csi-dch (parser params)
-  (chomp-screen-delete-chars (chomp-parser-screen parser)
-                             (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-dch (parser params)
+  (ebb-screen-delete-chars (ebb-parser-screen parser)
+                             (ebb-parse--param params 0 1)))
 
 ;; SU - Scroll Up
-(defun chomp-parse--csi-su (parser params)
-  (if (eql (chomp-parser-private parser) ??)
+(defun ebb-parse--csi-su (parser params)
+  (if (eql (ebb-parser-private parser) ??)
       ;; XTSMGRAPHICS: CSI ? Ps ; Pm S
-      (chomp-parse--csi-xtsmgraphics parser params)
-    (chomp-screen-scroll (chomp-parser-screen parser)
-                         'up (chomp-parse--param params 0 1))))
+      (ebb-parse--csi-xtsmgraphics parser params)
+    (ebb-screen-scroll (ebb-parser-screen parser)
+                         'up (ebb-parse--param params 0 1))))
 
 ;; XTSMGRAPHICS - Send/query graphics attributes
-(defun chomp-parse--csi-xtsmgraphics (parser params)
+(defun ebb-parse--csi-xtsmgraphics (parser params)
   "Handle XTSMGRAPHICS (CSI ? Ps ; Pm S).
 Ps=1: color register count, Ps=2: graphics geometry.
 Pm=1: read, Pm=4: read maximum."
-  (let ((attr (chomp-parse--param params 0 0))
-        (op (chomp-parse--param params 1 0)))
+  (let ((attr (ebb-parse--param params 0 0))
+        (op (ebb-parse--param params 1 0)))
     (if (memq op '(1 4))
         (pcase attr
           (1 ;; Color registers: report 256
-           (chomp-parse--respond parser "\e[?1;0;256S"))
+           (ebb-parse--respond parser "\e[?1;0;256S"))
           (2 ;; Graphics geometry: report pixel size based on screen
-           (let* ((screen (chomp-parser-screen parser))
-                  (pw (min (* (chomp-screen-width screen) 8) 1000))
-                  (ph (min (* (chomp-screen-height screen) 16) 1000)))
-             (chomp-parse--respond parser (format "\e[?2;0;%d;%dS" pw ph))))
+           (let* ((screen (ebb-parser-screen parser))
+                  (pw (min (* (ebb-screen-width screen) 8) 1000))
+                  (ph (min (* (ebb-screen-height screen) 16) 1000)))
+             (ebb-parse--respond parser (format "\e[?2;0;%d;%dS" pw ph))))
           (_ ;; Unknown attribute
-           (chomp-parse--respond parser (format "\e[?%d;1S" attr))))
+           (ebb-parse--respond parser (format "\e[?%d;1S" attr))))
       ;; Unsupported operation
-      (chomp-parse--respond
+      (ebb-parse--respond
        parser
        (format "\e[?%d;%dS" attr (if (<= 1 attr 2) (if (<= 2 op 3) 3 2) 1))))))
 
 ;; SD - Scroll Down
-(defun chomp-parse--csi-sd (parser params)
-  (chomp-screen-scroll (chomp-parser-screen parser)
-                       'down (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-sd (parser params)
+  (ebb-screen-scroll (ebb-parser-screen parser)
+                       'down (ebb-parse--param params 0 1)))
 
 ;; ECH - Erase Character
-(defun chomp-parse--csi-ech (parser params)
-  (chomp-screen-erase-chars (chomp-parser-screen parser)
-                            (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-ech (parser params)
+  (ebb-screen-erase-chars (ebb-parser-screen parser)
+                            (ebb-parse--param params 0 1)))
 
 ;; CBT - Cursor Backward Tab
-(defun chomp-parse--csi-cbt (parser params)
-  (chomp-screen-tab-backward (chomp-parser-screen parser)
-                             (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-cbt (parser params)
+  (ebb-screen-tab-backward (ebb-parser-screen parser)
+                             (ebb-parse--param params 0 1)))
 
 ;; HPA - Horizontal Position Absolute
-(defun chomp-parse--csi-hpa (parser params)
-  (chomp-parse--csi-cha parser params))
+(defun ebb-parse--csi-hpa (parser params)
+  (ebb-parse--csi-cha parser params))
 
 ;; HPR - Horizontal Position Relative
-(defun chomp-parse--csi-hpr (parser params)
-  (chomp-screen-cursor-move (chomp-parser-screen parser)
-                            'right (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-hpr (parser params)
+  (ebb-screen-cursor-move (ebb-parser-screen parser)
+                            'right (ebb-parse--param params 0 1)))
 
 ;; REP - Repeat last character
-(defun chomp-parse--csi-rep (parser params)
-  (chomp-screen-repeat-char (chomp-parser-screen parser)
-                            (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-rep (parser params)
+  (ebb-screen-repeat-char (ebb-parser-screen parser)
+                            (ebb-parse--param params 0 1)))
 
 ;; DA - Device Attributes
-(defun chomp-parse--csi-da (parser _params)
+(defun ebb-parse--csi-da (parser _params)
   (cond
-   ((not (chomp-parser-private parser))
+   ((not (ebb-parser-private parser))
     ;; Primary DA: report as VT220 with ANSI color
-    (chomp-parse--respond parser "\e[?62;22c"))
-   ((eql (chomp-parser-private parser) ?>)
+    (ebb-parse--respond parser "\e[?62;22c"))
+   ((eql (ebb-parser-private parser) ?>)
     ;; Secondary DA
-    (chomp-parse--respond parser "\e[>1;1;0c"))))
+    (ebb-parse--respond parser "\e[>1;1;0c"))))
 
 ;; VPA - Vertical Position Absolute
-(defun chomp-parse--csi-vpa (parser params)
-  (let* ((screen (chomp-parser-screen parser))
-         (row (1- (chomp-parse--param params 0 1)))
-         (min-y (if (chomp-screen-origin-mode screen)
-                    (chomp-screen-scroll-top screen) 0))
-         (max-y (if (chomp-screen-origin-mode screen)
-                    (chomp-screen-scroll-bottom screen)
-                  (1- (chomp-screen-height screen)))))
-    (setf (chomp-screen-pending-wrap screen) nil)
-    (setf (chomp-screen-cursor-y screen)
-          (chomp--clamp (+ min-y row) min-y max-y))))
+(defun ebb-parse--csi-vpa (parser params)
+  (let* ((screen (ebb-parser-screen parser))
+         (row (1- (ebb-parse--param params 0 1)))
+         (min-y (if (ebb-screen-origin-mode screen)
+                    (ebb-screen-scroll-top screen) 0))
+         (max-y (if (ebb-screen-origin-mode screen)
+                    (ebb-screen-scroll-bottom screen)
+                  (1- (ebb-screen-height screen)))))
+    (setf (ebb-screen-pending-wrap screen) nil)
+    (setf (ebb-screen-cursor-y screen)
+          (ebb--clamp (+ min-y row) min-y max-y))))
 
 ;; VPR - Vertical Position Relative
-(defun chomp-parse--csi-vpr (parser params)
-  (chomp-screen-cursor-move (chomp-parser-screen parser)
-                            'down (chomp-parse--param params 0 1)))
+(defun ebb-parse--csi-vpr (parser params)
+  (ebb-screen-cursor-move (ebb-parser-screen parser)
+                            'down (ebb-parse--param params 0 1)))
 
 ;; HVP - Horizontal Vertical Position (same as CUP)
-(defun chomp-parse--csi-hvp (parser params)
-  (chomp-parse--csi-cup parser params))
+(defun ebb-parse--csi-hvp (parser params)
+  (ebb-parse--csi-cup parser params))
 
 ;; TBC - Tab Clear
-(defun chomp-parse--csi-tbc (parser params)
-  (chomp-screen-clear-tab-stop (chomp-parser-screen parser)
-                               (chomp-parse--param params 0 0)))
+(defun ebb-parse--csi-tbc (parser params)
+  (ebb-screen-clear-tab-stop (ebb-parser-screen parser)
+                               (ebb-parse--param params 0 0)))
 
 ;; SM - Set Mode
-(defun chomp-parse--csi-sm (parser params)
-  (let ((screen (chomp-parser-screen parser)))
-    (if (chomp-parser-private parser)
+(defun ebb-parse--csi-sm (parser params)
+  (let ((screen (ebb-parser-screen parser)))
+    (if (ebb-parser-private parser)
         ;; DECSET
         (dotimes (i (length params))
           (let ((mode (aref params i)))
-            (chomp-screen-set-mode screen mode t)
-            (chomp-parse--emit parser 'mode-set mode t)))
+            (ebb-screen-set-mode screen mode t)
+            (ebb-parse--emit parser 'mode-set mode t)))
       ;; Standard SM
       (dotimes (i (length params))
         (pcase (aref params i)
-          (4 (setf (chomp-screen-insert-mode screen) t)))))))
+          (4 (setf (ebb-screen-insert-mode screen) t)))))))
 
 ;; RM - Reset Mode
-(defun chomp-parse--csi-rm (parser params)
-  (let ((screen (chomp-parser-screen parser)))
-    (if (chomp-parser-private parser)
+(defun ebb-parse--csi-rm (parser params)
+  (let ((screen (ebb-parser-screen parser)))
+    (if (ebb-parser-private parser)
         ;; DECRST
         (dotimes (i (length params))
           (let ((mode (aref params i)))
-            (chomp-screen-set-mode screen mode nil)
-            (chomp-parse--emit parser 'mode-set mode nil)))
+            (ebb-screen-set-mode screen mode nil)
+            (ebb-parse--emit parser 'mode-set mode nil)))
       ;; Standard RM
       (dotimes (i (length params))
         (pcase (aref params i)
-          (4 (setf (chomp-screen-insert-mode screen) nil)))))))
+          (4 (setf (ebb-screen-insert-mode screen) nil)))))))
 
 ;; DECSTBM - Set Scrolling Region
-(defun chomp-parse--csi-decstbm (parser params)
-  (let* ((screen (chomp-parser-screen parser))
-         (h (chomp-screen-height screen))
-         (top (1- (chomp-parse--param params 0 1)))
-         (bot (1- (chomp-parse--param params 1 h))))
-    (chomp-screen-set-scroll-region screen top bot)))
+(defun ebb-parse--csi-decstbm (parser params)
+  (let* ((screen (ebb-parser-screen parser))
+         (h (ebb-screen-height screen))
+         (top (1- (ebb-parse--param params 0 1)))
+         (bot (1- (ebb-parse--param params 1 h))))
+    (ebb-screen-set-scroll-region screen top bot)))
 
 ;; SCP - Save Cursor Position
-(defun chomp-parse--csi-scp (parser params)
-  (when (and (null (chomp-parser-private parser))
-             (string-empty-p (chomp-parser-intermediates parser))
+(defun ebb-parse--csi-scp (parser params)
+  (when (and (null (ebb-parser-private parser))
+             (string-empty-p (ebb-parser-intermediates parser))
              (zerop (length params)))
-    (chomp-screen-save-cursor (chomp-parser-screen parser))))
+    (ebb-screen-save-cursor (ebb-parser-screen parser))))
 
 ;; RCP - Restore Cursor Position
-(defun chomp-parse--csi-rcp (parser params)
-  (when (and (null (chomp-parser-private parser))
-             (string-empty-p (chomp-parser-intermediates parser))
+(defun ebb-parse--csi-rcp (parser params)
+  (when (and (null (ebb-parser-private parser))
+             (string-empty-p (ebb-parser-intermediates parser))
              (zerop (length params)))
-    (chomp-screen-restore-cursor (chomp-parser-screen parser))))
+    (ebb-screen-restore-cursor (ebb-parser-screen parser))))
 
 ;; DECSCUSR - Set Cursor Style (with SP intermediate)
-(defun chomp-parse--csi-decscusr (parser params)
-  (when (string= (chomp-parser-intermediates parser) " ")
-    (let ((style (chomp-parse--param params 0 0)))
-      (chomp-screen-set-cursor-style (chomp-parser-screen parser) style)
-      (chomp-parse--emit parser 'cursor-style style))))
+(defun ebb-parse--csi-decscusr (parser params)
+  (when (string= (ebb-parser-intermediates parser) " ")
+    (let ((style (ebb-parse--param params 0 0)))
+      (ebb-screen-set-cursor-style (ebb-parser-screen parser) style)
+      (ebb-parse--emit parser 'cursor-style style))))
 
 ;; DSR - Device Status Report
-(defun chomp-parse--csi-dsr (parser params)
-  (let ((screen (chomp-parser-screen parser)))
-    (pcase (chomp-parse--param params 0 0)
-      (5 (chomp-parse--respond parser "\e[0n"))
-      (6 (chomp-parse--respond
+(defun ebb-parse--csi-dsr (parser params)
+  (let ((screen (ebb-parser-screen parser)))
+    (pcase (ebb-parse--param params 0 0)
+      (5 (ebb-parse--respond parser "\e[0n"))
+      (6 (ebb-parse--respond
           parser
           (format "\e[%d;%dR"
-                  (1+ (chomp-screen-cursor-y screen))
-                  (1+ (chomp-screen-cursor-x screen))))))))
+                  (1+ (ebb-screen-cursor-y screen))
+                  (1+ (ebb-screen-cursor-x screen))))))))
 
 ;; Window manipulation (CSI t) -- mostly ignore, report minimal
-(defun chomp-parse--csi-winops (parser params)
-  (let ((screen (chomp-parser-screen parser)))
-    (pcase (chomp-parse--param params 0 0)
+(defun ebb-parse--csi-winops (parser params)
+  (let ((screen (ebb-parser-screen parser)))
+    (pcase (ebb-parse--param params 0 0)
       ;; Report terminal size in chars
-      (18 (chomp-parse--respond
+      (18 (ebb-parse--respond
            parser
            (format "\e[8;%d;%dt"
-                   (chomp-screen-height screen)
-                   (chomp-screen-width screen))))
+                   (ebb-screen-height screen)
+                   (ebb-screen-width screen))))
       (_ nil))))
 
 ;;;; ---- SGR Handler (Select Graphic Rendition) -------------------------
 
-(defun chomp-parse--set-colon-sgr-color (screen params)
+(defun ebb-parse--set-colon-sgr-color (screen params)
   "Apply colon-form color PARAMS to SCREEN."
   (let ((property (pcase (car params)
                     (38 :fg)
@@ -1003,22 +1003,22 @@ Pm=1: read, Pm=4: read maximum."
     (when property
       (pcase (cdr params)
         (`(5 ,index)
-         (chomp-screen-set-attr screen property index))
+         (ebb-screen-set-attr screen property index))
         (`(2 ,r ,g ,b)
-         (chomp-screen-set-attr screen property (list r g b)))
+         (ebb-screen-set-attr screen property (list r g b)))
         (`(2 ,_color-space ,r ,g ,b)
-         (chomp-screen-set-attr screen property (list r g b)))))))
+         (ebb-screen-set-attr screen property (list r g b)))))))
 
-(defun chomp-parse--csi-sgr (parser params)
+(defun ebb-parse--csi-sgr (parser params)
   "Handle SGR (CSI m) -- the most complex single CSI handler.
 Private CSI sequences ending in `m' (e.g. CSI > 4 ; 1 m for
 modifyOtherKeys) are not SGR and must be ignored."
   ;; Fast path already requires null private; generic dispatch does not.
-  (unless (chomp-parser-private parser)
-  (let ((screen (chomp-parser-screen parser))
+  (unless (ebb-parser-private parser)
+  (let ((screen (ebb-parser-screen parser))
         (len (length params)))
     (if (zerop len)
-        (chomp-screen-reset-attr screen)
+        (ebb-screen-reset-attr screen)
       (let ((i 0))
         (while (< i len)
           (let ((p (aref params i)))
@@ -1029,7 +1029,7 @@ modifyOtherKeys) are not SGR and must be ignored."
                 (4
                  ;; 4:0=off, 4:1=line, 4:2=double, 4:3=curly, etc.
                  (let ((sub (if (cdr p) (cadr p) 1)))
-                   (chomp-screen-set-attr
+                   (ebb-screen-set-attr
                     screen :underline
                     (pcase sub
                       (0 nil)
@@ -1040,40 +1040,40 @@ modifyOtherKeys) are not SGR and must be ignored."
                       (5 'dashed)
                       (_ 'line)))))
                 ((or 38 48 58)
-                 (chomp-parse--set-colon-sgr-color screen p))))
+                 (ebb-parse--set-colon-sgr-color screen p))))
              ;; Reset
-             ((= p 0)  (chomp-screen-reset-attr screen))
+             ((= p 0)  (ebb-screen-reset-attr screen))
              ;; Bold / faint / italic
-             ((= p 1)  (chomp-screen-set-attr screen :bold t))
-             ((= p 2)  (chomp-screen-set-attr screen :faint t))
-             ((= p 3)  (chomp-screen-set-attr screen :italic t))
+             ((= p 1)  (ebb-screen-set-attr screen :bold t))
+             ((= p 2)  (ebb-screen-set-attr screen :faint t))
+             ((= p 3)  (ebb-screen-set-attr screen :italic t))
              ;; Underline (plain, no sub-params)
-             ((= p 4)  (chomp-screen-set-attr screen :underline 'line))
+             ((= p 4)  (ebb-screen-set-attr screen :underline 'line))
              ;; Blink
-             ((= p 5)  (chomp-screen-set-attr screen :blink 'slow))
-             ((= p 6)  (chomp-screen-set-attr screen :blink 'fast))
+             ((= p 5)  (ebb-screen-set-attr screen :blink 'slow))
+             ((= p 6)  (ebb-screen-set-attr screen :blink 'fast))
              ;; Inverse / conceal / crossed
-             ((= p 7)  (chomp-screen-set-attr screen :inverse t))
-             ((= p 8)  (chomp-screen-set-attr screen :conceal t))
-             ((= p 9)  (chomp-screen-set-attr screen :crossed t))
+             ((= p 7)  (ebb-screen-set-attr screen :inverse t))
+             ((= p 8)  (ebb-screen-set-attr screen :conceal t))
+             ((= p 9)  (ebb-screen-set-attr screen :crossed t))
              ;; Fonts 10-19
              ((and (>= p 10) (<= p 19))
-              (chomp-screen-set-attr screen :font (- p 10)))
+              (ebb-screen-set-attr screen :font (- p 10)))
              ;; Double underline
-             ((= p 21) (chomp-screen-set-attr screen :underline 'double))
+             ((= p 21) (ebb-screen-set-attr screen :underline 'double))
              ;; Reset intensity
-             ((= p 22) (chomp-screen-set-attr screen :bold nil)
-                        (chomp-screen-set-attr screen :faint nil))
+             ((= p 22) (ebb-screen-set-attr screen :bold nil)
+                        (ebb-screen-set-attr screen :faint nil))
              ;; Reset individual attrs
-             ((= p 23) (chomp-screen-set-attr screen :italic nil))
-             ((= p 24) (chomp-screen-set-attr screen :underline nil))
-             ((= p 25) (chomp-screen-set-attr screen :blink nil))
-             ((= p 27) (chomp-screen-set-attr screen :inverse nil))
-             ((= p 28) (chomp-screen-set-attr screen :conceal nil))
-             ((= p 29) (chomp-screen-set-attr screen :crossed nil))
+             ((= p 23) (ebb-screen-set-attr screen :italic nil))
+             ((= p 24) (ebb-screen-set-attr screen :underline nil))
+             ((= p 25) (ebb-screen-set-attr screen :blink nil))
+             ((= p 27) (ebb-screen-set-attr screen :inverse nil))
+             ((= p 28) (ebb-screen-set-attr screen :conceal nil))
+             ((= p 29) (ebb-screen-set-attr screen :crossed nil))
              ;; Foreground ANSI 30-37
              ((and (>= p 30) (<= p 37))
-              (chomp-screen-set-attr screen :fg (- p 30)))
+              (ebb-screen-set-attr screen :fg (- p 30)))
              ;; Extended foreground
              ((= p 38)
               (when (< (1+ i) len)
@@ -1081,7 +1081,7 @@ modifyOtherKeys) are not SGR and must be ignored."
                   (cond
                    ;; Truecolor: 38;2;R;G;B
                    ((and (= sub 2) (<= (+ i 4) (1- len)))
-                    (chomp-screen-set-attr
+                    (ebb-screen-set-attr
                      screen :fg
                      (list (aref params (+ i 2))
                            (aref params (+ i 3))
@@ -1089,64 +1089,64 @@ modifyOtherKeys) are not SGR and must be ignored."
                     (cl-incf i 4))
                    ;; 256-color: 38;5;N
                    ((and (= sub 5) (<= (+ i 2) (1- len)))
-                    (chomp-screen-set-attr screen :fg (aref params (+ i 2)))
+                    (ebb-screen-set-attr screen :fg (aref params (+ i 2)))
                     (cl-incf i 2))
                    (t (cl-incf i))))))
              ;; Default foreground
-             ((= p 39) (chomp-screen-set-attr screen :fg nil))
+             ((= p 39) (ebb-screen-set-attr screen :fg nil))
              ;; Background ANSI 40-47
              ((and (>= p 40) (<= p 47))
-              (chomp-screen-set-attr screen :bg (- p 40)))
+              (ebb-screen-set-attr screen :bg (- p 40)))
              ;; Extended background
              ((= p 48)
               (when (< (1+ i) len)
                 (let ((sub (aref params (1+ i))))
                   (cond
                    ((and (= sub 2) (<= (+ i 4) (1- len)))
-                    (chomp-screen-set-attr
+                    (ebb-screen-set-attr
                      screen :bg
                      (list (aref params (+ i 2))
                            (aref params (+ i 3))
                            (aref params (+ i 4))))
                     (cl-incf i 4))
                    ((and (= sub 5) (<= (+ i 2) (1- len)))
-                    (chomp-screen-set-attr screen :bg (aref params (+ i 2)))
+                    (ebb-screen-set-attr screen :bg (aref params (+ i 2)))
                     (cl-incf i 2))
                    (t (cl-incf i))))))
              ;; Default background
-             ((= p 49) (chomp-screen-set-attr screen :bg nil))
+             ((= p 49) (ebb-screen-set-attr screen :bg nil))
              ;; Underline color
              ((= p 58)
               (when (< (1+ i) len)
                 (let ((sub (aref params (1+ i))))
                   (cond
                    ((and (= sub 2) (<= (+ i 4) (1- len)))
-                    (chomp-screen-set-attr
+                    (ebb-screen-set-attr
                      screen :ul-color
                      (list (aref params (+ i 2))
                            (aref params (+ i 3))
                            (aref params (+ i 4))))
                     (cl-incf i 4))
                    ((and (= sub 5) (<= (+ i 2) (1- len)))
-                    (chomp-screen-set-attr screen :ul-color
+                    (ebb-screen-set-attr screen :ul-color
                                            (aref params (+ i 2)))
                     (cl-incf i 2))
                    (t (cl-incf i))))))
              ;; Default underline color
-             ((= p 59) (chomp-screen-set-attr screen :ul-color nil))
+             ((= p 59) (ebb-screen-set-attr screen :ul-color nil))
              ;; Bright foreground 90-97
              ((and (>= p 90) (<= p 97))
-              (chomp-screen-set-attr screen :fg (+ 8 (- p 90))))
+              (ebb-screen-set-attr screen :fg (+ 8 (- p 90))))
              ;; Bright background 100-107
              ((and (>= p 100) (<= p 107))
-              (chomp-screen-set-attr screen :bg (+ 8 (- p 100))))
+              (ebb-screen-set-attr screen :bg (+ 8 (- p 100))))
              ;; Unknown -- silently skip
              (t nil)))
           (cl-incf i)))))))
 
 ;;;; ---- OSC Helpers ----------------------------------------------------
 
-(defun chomp-parse--handle-osc-4 (parser payload)
+(defun ebb-parse--handle-osc-4 (parser payload)
   "Handle OSC 4 color palette queries in PAYLOAD.
 Supports xterm-style query pairs such as 4;2;? and 4;0;?;1;?.
 Palette-setting requests are ignored."
@@ -1160,33 +1160,33 @@ Palette-setting requests are ignored."
                        (string= spec "?"))
              do (let ((index (string-to-number index-str)))
                   (when (<= 0 index 255)
-                    (chomp-parse--respond
+                    (ebb-parse--respond
                      parser
                      (format "\e]4;%d;%s\e\\"
                              index
-                             (chomp-parse--palette-color-to-xterm index))))))))
+                             (ebb-parse--palette-color-to-xterm index))))))))
 
-(defun chomp-parse--handle-progress (parser payload)
+(defun ebb-parse--handle-progress (parser payload)
   "Emit a normalized progress event parsed from OSC 9;4 PAYLOAD."
   (when (string-match "\\`\\([0-4]\\);\\(-?[0-9]+\\)\\'" payload)
     (let ((state (aref [remove set error indeterminate pause]
                        (string-to-number (match-string 1 payload))))
-          (progress (chomp--clamp (string-to-number (match-string 2 payload))
+          (progress (ebb--clamp (string-to-number (match-string 2 payload))
                                   0 100)))
-      (chomp-parse--emit parser 'progress state progress))))
+      (ebb-parse--emit parser 'progress state progress))))
 
-(defun chomp-parse--handle-osc-777 (parser payload)
+(defun ebb-parse--handle-osc-777 (parser payload)
   "Emit a notification described by OSC 777 PAYLOAD."
   (when (string-match "\\`notify;\\([^;]+\\);\\(.+\\)\\'" payload)
-    (chomp-parse--emit parser 'notification
+    (ebb-parse--emit parser 'notification
                        (match-string 1 payload) (match-string 2 payload))))
 
-(defun chomp-parse--handle-osc-52 (parser payload)
+(defun ebb-parse--handle-osc-52 (parser payload)
   "Handle OSC 52 clipboard manipulation.
 PAYLOAD format: TARGET;BASE64-DATA
 TARGET is one or more of: c (clipboard), p (primary), s (secondary), etc.
 If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
-  (when (and chomp-enable-osc52
+  (when (and ebb-enable-osc52
              (string-match "\\`\\([^;]*\\);\\(.*\\)\\'" payload))
     (let ((_target (match-string 1 payload))
           (data (match-string 2 payload)))
@@ -1197,7 +1197,7 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
                          (ignore-errors (current-kill 0 t))
                          ""))
                (encoded (base64-encode-string (encode-coding-string text 'utf-8) t)))
-          (chomp-parse--respond parser (format "\e]52;c;%s\e\\" encoded))))
+          (ebb-parse--respond parser (format "\e]52;c;%s\e\\" encoded))))
        ;; Empty string: clear clipboard
        ((string-empty-p data)
         (when (fboundp 'gui-set-selection)
@@ -1211,23 +1211,23 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
           (kill-new text)
           (when (fboundp 'gui-set-selection)
             (ignore-errors (gui-set-selection 'CLIPBOARD text)))
-          (chomp-parse--emit parser 'clipboard text)))))))
+          (ebb-parse--emit parser 'clipboard text)))))))
 
 ;;;; ---- OSC Dispatch ---------------------------------------------------
 
-(defun chomp-parse--dispatch-osc (parser)
+(defun ebb-parse--dispatch-osc (parser)
   "Dispatch a completed OSC sequence."
   (condition-case err
-      (let* ((str (chomp-parser-osc-string parser))
-             (screen (chomp-parser-screen parser)))
+      (let* ((str (ebb-parser-osc-string parser))
+             (screen (ebb-parser-screen parser)))
         (if (string-match "\\`\\([0-9]+\\)\\(?:;\\(\\(?:.\\|\n\\)*\\)\\)?\\'" str)
             (let ((num (string-to-number (match-string 1 str)))
                   (payload (or (match-string 2 str) "")))
               (pcase num
                 ;; Set title (+ icon name)
                 ((or 0 1 2)
-                 (setf (chomp-screen-title screen) payload)
-                 (chomp-parse--emit parser 'title payload))
+                 (setf (ebb-screen-title screen) payload)
+                 (ebb-parse--emit parser 'title payload))
                 ;; Set CWD
                 (7
                  (let ((host nil)
@@ -1241,66 +1241,66 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
                                             (url-unhex-string
                                              (match-string 2 payload))
                                             'utf-8))))
-                   (setf (chomp-screen-cwd screen) cwd)
+                   (setf (ebb-screen-cwd screen) cwd)
                    ;; HOST lets the handler build a TRAMP path when the
                    ;; report comes from a remote shell.
-                   (chomp-parse--emit parser 'cwd cwd host)))
+                   (ebb-parse--emit parser 'cwd cwd host)))
                 ;; Query palette entries
                 (4
-                 (chomp-parse--handle-osc-4 parser payload))
+                 (ebb-parse--handle-osc-4 parser payload))
                 ;; Desktop notification and progress.
                 (9
                  (cond
                   ((string-prefix-p "4;" payload)
-                   (chomp-parse--handle-progress parser (substring payload 2)))
+                   (ebb-parse--handle-progress parser (substring payload 2)))
                   ((not (string-empty-p payload))
-                   (chomp-parse--emit parser 'notification nil payload))))
+                   (ebb-parse--emit parser 'notification nil payload))))
                 ;; Query foreground
                 (10
                  (when (string= payload "?")
-                   (chomp-parse--respond
+                   (ebb-parse--respond
                     parser
-                    (concat "\e]10;" (chomp-parse--color-to-xterm
+                    (concat "\e]10;" (ebb-parse--color-to-xterm
                                       (face-foreground 'default nil t))
                             "\e\\"))))
                 ;; Query background
                 (11
                  (when (string= payload "?")
-                   (chomp-parse--respond
+                   (ebb-parse--respond
                     parser
-                    (concat "\e]11;" (chomp-parse--color-to-xterm
+                    (concat "\e]11;" (ebb-parse--color-to-xterm
                                       (face-background 'default nil t))
                             "\e\\"))))
                 ;; Shell integration
                 (51
-                 (chomp-parse--emit parser 'osc-51 payload))
+                 (ebb-parse--emit parser 'osc-51 payload))
                 ;; Clipboard (selection manipulation)
                 (52
-                 (chomp-parse--handle-osc-52 parser payload))
+                 (ebb-parse--handle-osc-52 parser payload))
                 ;; rxvt notification protocol.
                 (777
-                 (chomp-parse--handle-osc-777 parser payload))
+                 (ebb-parse--handle-osc-777 parser payload))
                 ;; Unknown
-                (_ (chomp-parse--log "Unknown OSC %d" num))))
-          (chomp-parse--log "Malformed OSC: %s"
+                (_ (ebb-parse--log "Unknown OSC %d" num))))
+          (ebb-parse--log "Malformed OSC: %s"
                             (substring str 0 (min (length str) 40)))))
     (error
-     (chomp-parse--log "OSC dispatch error: %S" err))))
+     (ebb-parse--log "OSC dispatch error: %S" err))))
 
 ;;;; ---- DCS Dispatch ---------------------------------------------------
 
-(defun chomp-parse--dispatch-dcs (parser)
+(defun ebb-parse--dispatch-dcs (parser)
   "Dispatch a completed DCS sequence."
   (condition-case err
-      (let ((final (chomp-parser-dcs-final parser))
-            (body (chomp-parser-dcs-string parser)))
+      (let ((final (ebb-parser-dcs-final parser))
+            (body (ebb-parser-dcs-string parser)))
         (pcase final
           ;; Sixel graphics
-          (?q (chomp-parse--emit parser 'sixel body))
+          (?q (ebb-parse--emit parser 'sixel body))
           ;; Unknown
-          (_ (chomp-parse--log "Unknown DCS final %c" final))))
+          (_ (ebb-parse--log "Unknown DCS final %c" final))))
     (error
-     (chomp-parse--log "DCS dispatch error: %S" err))))
+     (ebb-parse--log "DCS dispatch error: %S" err))))
 
-(provide 'chomp-parse)
-;;; chomp-parse.el ends here
+(provide 'ebb-parse)
+;;; ebb-parse.el ends here

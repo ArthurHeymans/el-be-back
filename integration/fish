@@ -1,24 +1,24 @@
-# integration/fish --- Fish integration for chomp
+# integration/fish --- Fish integration for ebb
 
 # Copyright (C) 2026
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Shell integration for chomp terminal emulator.
+# Shell integration for ebb terminal emulator.
 # Compatible with eat's OSC 51 protocol.
 
-# Only enable once and only in chomp/eat terminals.
-if set -q __chomp_integration_enabled
+# Only enable once and only in ebb/eat terminals.
+if set -q __ebb_integration_enabled
     return 0
 end
-if not string match -q 'chomp-*' -- $TERM
+if not string match -q 'ebb-*' -- $TERM
     if not string match -q 'eat-*' -- $TERM
         return 0
     end
 end
 
-set -g __chomp_integration_enabled yes
-set -g __chomp_current_command ""
-set -g __chomp_exit_status 0
+set -g __ebb_integration_enabled yes
+set -g __ebb_current_command ""
+set -g __ebb_exit_status 0
 
 # We use fish's event system to emit OSC 51 sequences.
 # The B (prompt start) and C (prompt end) sequences are emitted via
@@ -26,15 +26,15 @@ set -g __chomp_exit_status 0
 # may override fish_prompt AFTER us, we install the wrapper lazily
 # on the first fish_prompt event.
 
-function __chomp_install_prompt_wrapper --on-event fish_prompt
+function __ebb_install_prompt_wrapper --on-event fish_prompt
     # Remove ourselves - only need to run once
-    functions -e __chomp_install_prompt_wrapper
+    functions -e __ebb_install_prompt_wrapper
 
     # Save whatever fish_prompt is now (after all config is loaded)
     if functions -q fish_prompt
-        functions -c fish_prompt __chomp_original_fish_prompt
+        functions -c fish_prompt __ebb_original_fish_prompt
     else
-        function __chomp_original_fish_prompt
+        function __ebb_original_fish_prompt
             echo "> "
         end
     end
@@ -46,10 +46,10 @@ function __chomp_install_prompt_wrapper --on-event fish_prompt
         set -l last_pipestatus $pipestatus
 
         # Send exit status of previous command
-        if test -n "$__chomp_current_command"
-            printf '\e]51;e;H;%d\e\\' $__chomp_exit_status
+        if test -n "$__ebb_current_command"
+            printf '\e]51;e;H;%d\e\\' $__ebb_exit_status
         end
-        set -g __chomp_current_command ""
+        set -g __ebb_current_command ""
 
         # Before new prompt
         printf '\e]51;e;J\e\\'
@@ -68,7 +68,7 @@ function __chomp_install_prompt_wrapper --on-event fish_prompt
 
         # Restore status for the original prompt function
         # (starship and other prompts read $status)
-        set -g __chomp_exit_status $last_status
+        set -g __ebb_exit_status $last_status
         if set -q STARSHIP_CMD_STATUS
             set STARSHIP_CMD_STATUS $last_status
         end
@@ -77,7 +77,7 @@ function __chomp_install_prompt_wrapper --on-event fish_prompt
         end
 
         # Call original prompt
-        __chomp_original_fish_prompt
+        __ebb_original_fish_prompt
 
         # Prompt end marker (after prompt text)
         printf '\e]51;e;C\e\\'
@@ -88,9 +88,9 @@ function __chomp_install_prompt_wrapper --on-event fish_prompt
     # The prompt will be re-rendered by fish automatically.
 end
 
-function __chomp_preexec --on-event fish_preexec
-    set -g __chomp_exit_status $status
-    set -g __chomp_current_command $argv[1]
+function __ebb_preexec --on-event fish_preexec
+    set -g __ebb_exit_status $status
+    set -g __ebb_current_command $argv[1]
     # Send current command
     printf '\e]51;e;F;%s\e\\' \
         (printf "%s" $argv[1] | base64)
@@ -102,7 +102,7 @@ function __chomp_preexec --on-event fish_preexec
         $argv[1]
 end
 
-function _chomp_msg
+function _ebb_msg
     set -l msg '\e]51;e;M'
     for arg in $argv
         set msg "$msg;"(printf "%s" $arg | base64)

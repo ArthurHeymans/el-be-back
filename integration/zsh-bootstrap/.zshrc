@@ -1,11 +1,11 @@
-# Load the user's prompt first, then wrap it with Chomp markers.
-__chomp_user_zdotdir="${CHOMP_ZSH_USER_ZDOTDIR:-$HOME}"
-[[ -r "$__chomp_user_zdotdir/.zshrc" ]] && source "$__chomp_user_zdotdir/.zshrc"
-source "$CHOMP_SHELL_INTEGRATION_DIR/zsh"
+# Load the user's prompt first, then wrap it with Ebb markers.
+__ebb_user_zdotdir="${EBB_ZSH_USER_ZDOTDIR:-$HOME}"
+[[ -r "$__ebb_user_zdotdir/.zshrc" ]] && source "$__ebb_user_zdotdir/.zshrc"
+source "$EBB_SHELL_INTEGRATION_DIR/zsh"
 
-if [[ "$CHOMP_ZSH_RESTORE_ZDOTDIR" == 1 ]]; then
-  export ZDOTDIR="$CHOMP_ZSH_USER_ZDOTDIR"
+if [[ "$EBB_ZSH_RESTORE_ZDOTDIR" == 1 ]]; then
+  export ZDOTDIR="$EBB_ZSH_USER_ZDOTDIR"
 else
   unset ZDOTDIR
 fi
-unset CHOMP_ZSH_USER_ZDOTDIR CHOMP_ZSH_RESTORE_ZDOTDIR __chomp_user_zdotdir
+unset EBB_ZSH_USER_ZDOTDIR EBB_ZSH_RESTORE_ZDOTDIR __ebb_user_zdotdir

@@ -1,4 +1,4 @@
-;;; chomp-input.el --- Key translation for chomp -*- lexical-binding: t; -*-
+;;; ebb-input.el --- Key translation for ebb -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -11,27 +11,27 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'chomp-term)
+(require 'ebb-term)
 
-;; Forward declarations for functions defined in chomp.el
-(declare-function chomp-self-input "chomp")
-(declare-function chomp-quoted-input "chomp")
-(declare-function chomp-yank "chomp")
-(declare-function chomp-yank-pop "chomp")
-(declare-function chomp-mouse-input "chomp")
-(declare-function chomp-char-mode "chomp")
-(declare-function chomp-semi-char-mode "chomp")
-(declare-function chomp-emacs-mode "chomp")
-(declare-function chomp-kill-process "chomp")
-(declare-function chomp-previous-prompt "chomp")
-(declare-function chomp-next-prompt "chomp")
-(declare-function chomp-scroll-up "chomp")
-(declare-function chomp-scroll-down "chomp")
-(declare-function chomp-copy-region "chomp")
+;; Forward declarations for functions defined in ebb.el
+(declare-function ebb-self-input "ebb")
+(declare-function ebb-quoted-input "ebb")
+(declare-function ebb-yank "ebb")
+(declare-function ebb-yank-pop "ebb")
+(declare-function ebb-mouse-input "ebb")
+(declare-function ebb-char-mode "ebb")
+(declare-function ebb-semi-char-mode "ebb")
+(declare-function ebb-emacs-mode "ebb")
+(declare-function ebb-kill-process "ebb")
+(declare-function ebb-previous-prompt "ebb")
+(declare-function ebb-next-prompt "ebb")
+(declare-function ebb-scroll-up "ebb")
+(declare-function ebb-scroll-down "ebb")
+(declare-function ebb-copy-region "ebb")
 
 ;;;; ---- Function Key Tables --------------------------------------------
 
-(defconst chomp-input--function-keys
+(defconst ebb-input--function-keys
   '((f1  . "\eOP")   (f2  . "\eOQ")   (f3  . "\eOR")   (f4  . "\eOS")
     (f5  . "\e[15~")  (f6  . "\e[17~")  (f7  . "\e[18~")  (f8  . "\e[19~")
     (f9  . "\e[20~")  (f10 . "\e[21~")  (f11 . "\e[23~")  (f12 . "\e[24~")
@@ -53,7 +53,7 @@
     (f61 . "\e[1;4P")   (f62 . "\e[1;4Q")   (f63 . "\e[1;4R"))
   "Escape sequences for function keys (F1-F63).")
 
-(defconst chomp-input--special-keys
+(defconst ebb-input--special-keys
   '((insert   . "\e[2~")
     (delete   . "\e[3~")
     (home     . "\e[H")
@@ -62,17 +62,17 @@
     (next     . "\e[6~"))  ; PageDown
   "Escape sequences for special keys.")
 
-(defconst chomp-input--arrow-keys-normal
+(defconst ebb-input--arrow-keys-normal
   '((up . "\e[A") (down . "\e[B") (right . "\e[C") (left . "\e[D"))
   "Arrow key sequences in normal mode.")
 
-(defconst chomp-input--arrow-keys-app
+(defconst ebb-input--arrow-keys-app
   '((up . "\eOA") (down . "\eOB") (right . "\eOC") (left . "\eOD"))
   "Arrow key sequences in application cursor mode.")
 
 ;;;; ---- Modifier Encoding ----------------------------------------------
 
-(defun chomp-input--modifier-code (mods)
+(defun ebb-input--modifier-code (mods)
   "Return the xterm modifier code for MODS (list of symbols).
 Returns 1 + sum of: shift=1, meta/alt=2, control=4."
   (let ((code 1))
@@ -83,7 +83,7 @@ Returns 1 + sum of: shift=1, meta/alt=2, control=4."
 
 ;;;; ---- Main Translation -----------------------------------------------
 
-(defun chomp-input-translate (key &optional screen)
+(defun ebb-input-translate (key &optional screen)
   "Translate Emacs key event KEY to a terminal escape sequence string.
 SCREEN is consulted for mode flags.  Returns a string or nil.
 A string KEY is committed input text from an input method."
@@ -91,7 +91,7 @@ A string KEY is committed input text from an input method."
       key
     (let* ((mods (event-modifiers key))
          (basic (event-basic-type key))
-         (keypad (and screen (chomp-screen-keypad-mode screen))))
+         (keypad (and screen (ebb-screen-keypad-mode screen))))
     (cond
      ;; ---- Self-inserting ASCII character ----
      ((and (characterp key) (>= key ?\s) (<= key ?~) (null mods))
@@ -128,29 +128,29 @@ A string KEY is committed input text from an input method."
      ;; ---- Arrow keys ----
      ((memq basic '(up down left right))
       (let* ((arrows (if keypad
-                         chomp-input--arrow-keys-app
-                       chomp-input--arrow-keys-normal))
+                         ebb-input--arrow-keys-app
+                       ebb-input--arrow-keys-normal))
              (base-seq (cdr (assq basic arrows))))
         (if (and mods (not (equal mods nil)))
             ;; Modified arrow: ESC [ 1 ; mod A
-            (let ((mod-code (chomp-input--modifier-code mods))
+            (let ((mod-code (ebb-input--modifier-code mods))
                   (final (aref base-seq (1- (length base-seq)))))
               (format "\e[1;%d%c" mod-code final))
           base-seq)))
 
      ;; ---- Function keys ----
-     ((assq basic chomp-input--function-keys)
-      (let ((base-seq (cdr (assq basic chomp-input--function-keys))))
+     ((assq basic ebb-input--function-keys)
+      (let ((base-seq (cdr (assq basic ebb-input--function-keys))))
         (if (and mods (not (equal mods nil)))
             ;; Modified: insert modifier before final char/~
-            (chomp-input--add-modifier base-seq mods)
+            (ebb-input--add-modifier base-seq mods)
           base-seq)))
 
      ;; ---- Special keys (Insert, Delete, Home, End, Page*) ----
-     ((assq basic chomp-input--special-keys)
-      (let ((base-seq (cdr (assq basic chomp-input--special-keys))))
+     ((assq basic ebb-input--special-keys)
+      (let ((base-seq (cdr (assq basic ebb-input--special-keys))))
         (if (and mods (not (equal mods nil)))
-            (chomp-input--add-modifier base-seq mods)
+            (ebb-input--add-modifier base-seq mods)
           base-seq)))
 
      ;; ---- Backspace (all modifier variants) ----
@@ -165,7 +165,7 @@ A string KEY is committed input text from an input method."
      ((memq basic '(delete deletechar))
       (let ((base "\e[3~"))
         (if (and mods (not (equal mods nil)))
-            (chomp-input--add-modifier base mods)
+            (ebb-input--add-modifier base mods)
           base)))
 
      ;; ---- Return ----
@@ -194,9 +194,9 @@ A string KEY is committed input text from an input method."
 
 ;;;; ---- Modifier Insertion Helper --------------------------------------
 
-(defun chomp-input--add-modifier (seq mods)
+(defun ebb-input--add-modifier (seq mods)
   "Add modifier encoding to an escape SEQ for MODS."
-  (let ((mod-code (chomp-input--modifier-code mods)))
+  (let ((mod-code (ebb-input--modifier-code mods)))
     (cond
      ;; Tilde-terminated: ESC[N~ -> ESC[N;mod~
      ((string-suffix-p "~" seq)
@@ -212,26 +212,26 @@ A string KEY is committed input text from an input method."
 
 ;;;; ---- Mouse Encoding -------------------------------------------------
 
-(defun chomp-input-encode-mouse (event screen pos-offset)
+(defun ebb-input-encode-mouse (event screen pos-offset)
   "Encode mouse EVENT as terminal escape sequence.
 POS-OFFSET is the buffer position of display line 0, col 0.
 Returns a string or nil."
-  (when-let ((mouse-mode (chomp-screen-mouse-mode screen)))
-    (when (chomp-input--mouse-event-allowed-p event mouse-mode screen)
-      (when-let* ((coords (chomp-input--mouse-coordinates event screen pos-offset))
+  (when-let ((mouse-mode (ebb-screen-mouse-mode screen)))
+    (when (ebb-input--mouse-event-allowed-p event mouse-mode screen)
+      (when-let* ((coords (ebb-input--mouse-coordinates event screen pos-offset))
                   (x (car coords))
                   (y (cdr coords))
-                  (button (chomp-input--mouse-button event screen)))
-        (when (chomp-input--mouse-press-p event)
-          (chomp-input--mouse-remember-press event screen button))
-        (let ((code (+ button (chomp-input--mouse-mod-bits event))))
-          (when (chomp-input--mouse-release-p event)
-            (chomp-input--mouse-forget-press event screen))
-          (if (chomp-screen-mouse-sgr screen)
+                  (button (ebb-input--mouse-button event screen)))
+        (when (ebb-input--mouse-press-p event)
+          (ebb-input--mouse-remember-press event screen button))
+        (let ((code (+ button (ebb-input--mouse-mod-bits event))))
+          (when (ebb-input--mouse-release-p event)
+            (ebb-input--mouse-forget-press event screen))
+          (if (ebb-screen-mouse-sgr screen)
               ;; SGR encoding
               (format "\e[<%d;%d;%d%c"
                       code (1+ x) (1+ y)
-                      (if (chomp-input--mouse-release-p event) ?m ?M))
+                      (if (ebb-input--mouse-release-p event) ?m ?M))
             ;; Legacy encoding (coordinates limited to 223)
             (when (and (<= x 222) (<= y 222))
               (format "\e[M%c%c%c"
@@ -239,15 +239,15 @@ Returns a string or nil."
                       (+ x 33)
                       (+ y 33)))))))))
 
-(defun chomp-input--mouse-posn (event)
+(defun ebb-input--mouse-posn (event)
   "Return the position object for mouse EVENT."
   (or (and (memq 'drag (event-modifiers event))
            (ignore-errors (event-end event)))
       (event-start event)))
 
-(defun chomp-input--mouse-coordinates (event screen pos-offset)
+(defun ebb-input--mouse-coordinates (event screen pos-offset)
   "Return zero-based terminal coordinates for mouse EVENT on SCREEN."
-  (let* ((posn (chomp-input--mouse-posn event))
+  (let* ((posn (ebb-input--mouse-posn event))
          (pt (posn-point posn))
          coords)
     (setq coords
@@ -263,12 +263,12 @@ Returns a string or nil."
             (posn-col-row posn))))
     (when (and coords
                (<= 0 (car coords))
-               (< (car coords) (chomp-screen-width screen))
+               (< (car coords) (ebb-screen-width screen))
                (<= 0 (cdr coords))
-               (< (cdr coords) (chomp-screen-height screen)))
+               (< (cdr coords) (ebb-screen-height screen)))
       coords)))
 
-(defun chomp-input--mouse-event-allowed-p (event mode screen)
+(defun ebb-input--mouse-event-allowed-p (event mode screen)
   "Return non-nil if EVENT should be reported in DEC mouse MODE."
   (let ((mods (event-modifiers event))
         (basic (event-basic-type event)))
@@ -279,16 +279,16 @@ Returns a string or nil."
        (not (or (mouse-movement-p event) (memq 'drag mods))))
       ('button-event
        (or (not (mouse-movement-p event))
-           (chomp-screen-mouse-pressed screen)))
+           (ebb-screen-mouse-pressed screen)))
       ('any-event t)
       (_ nil))))
 
-(defun chomp-input--mouse-button (event screen)
+(defun ebb-input--mouse-button (event screen)
   "Return xterm mouse button code for EVENT on SCREEN, or nil."
   (let ((basic (event-basic-type event)))
     (cond
      ((mouse-movement-p event)
-      (if-let ((pressed (car (chomp-screen-mouse-pressed screen))))
+      (if-let ((pressed (car (ebb-screen-mouse-pressed screen))))
           (+ pressed 32)
         35))
      ((eq basic 'mouse-1) 0)
@@ -304,34 +304,34 @@ Returns a string or nil."
      ((eq basic 'mouse-11) 131)
      (t nil))))
 
-(defun chomp-input--mouse-press-p (event)
+(defun ebb-input--mouse-press-p (event)
   "Return non-nil if EVENT is a button press."
   (memq 'down (event-modifiers event)))
 
-(defun chomp-input--mouse-release-p (event)
+(defun ebb-input--mouse-release-p (event)
   "Return non-nil if EVENT is a button release."
   (let ((basic (event-basic-type event))
         (mods (event-modifiers event)))
     (and (memq basic '(mouse-1 mouse-2 mouse-3))
          (or (memq 'click mods) (memq 'drag mods)))))
 
-(defun chomp-input--mouse-remember-press (event screen button)
+(defun ebb-input--mouse-remember-press (event screen button)
   "Remember pressed mouse BUTTON from EVENT on SCREEN."
   (when (and (memq (event-basic-type event) '(mouse-1 mouse-2 mouse-3))
              (< button 3))
-    (setf (chomp-screen-mouse-pressed screen)
-          (sort (cons button (chomp-screen-mouse-pressed screen)) #'<))))
+    (setf (ebb-screen-mouse-pressed screen)
+          (sort (cons button (ebb-screen-mouse-pressed screen)) #'<))))
 
-(defun chomp-input--mouse-forget-press (event screen)
+(defun ebb-input--mouse-forget-press (event screen)
   "Forget the released button from EVENT on SCREEN."
   (let ((button (pcase (event-basic-type event)
                   ('mouse-1 0) ('mouse-2 1) ('mouse-3 2))))
     (when button
-      (setf (chomp-screen-mouse-pressed screen)
+      (setf (ebb-screen-mouse-pressed screen)
             (cl-delete-if (lambda (b) (= b button))
-                          (chomp-screen-mouse-pressed screen))))))
+                          (ebb-screen-mouse-pressed screen))))))
 
-(defun chomp-input--mouse-mod-bits (event)
+(defun ebb-input--mouse-mod-bits (event)
   "Return modifier bits for mouse EVENT."
   (let ((mods (event-modifiers event))
         (bits 0))
@@ -342,27 +342,27 @@ Returns a string or nil."
 
 ;;;; ---- Focus Events ---------------------------------------------------
 
-(defun chomp-input-focus-in ()
+(defun ebb-input-focus-in ()
   "Return the focus-in escape sequence."
   "\e[I")
 
-(defun chomp-input-focus-out ()
+(defun ebb-input-focus-out ()
   "Return the focus-out escape sequence."
   "\e[O")
 
 ;;;; ---- Bracketed Paste ------------------------------------------------
 
-(defun chomp-input-bracketed-paste-start ()
+(defun ebb-input-bracketed-paste-start ()
   "Return the bracketed paste start sequence."
   "\e[200~")
 
-(defun chomp-input-bracketed-paste-end ()
+(defun ebb-input-bracketed-paste-end ()
   "Return the bracketed paste end sequence."
   "\e[201~")
 
 ;;;; ---- Keymaps --------------------------------------------------------
 
-(defcustom chomp-semi-char-non-bound-keys
+(defcustom ebb-semi-char-non-bound-keys
   '([?\C-x] [?\C-\\] [?\C-q] [?\C-g] [?\C-h] [?\e ?\C-c] [?\C-u]
     [?\e ?x] [?\e ?:] [?\e ?!] [?\e ?&]
     [C-insert] [M-insert] [S-insert] [C-M-insert]
@@ -391,13 +391,13 @@ Returns a string or nil."
 These fall through to normal Emacs bindings.
 Use ESC notation for Meta keys, not M-."
   :type '(repeat key-sequence)
-  :group 'chomp
+  :group 'ebb
   :set (lambda (sym val)
          (set-default sym val)
-         (when (fboundp 'chomp-update-semi-char-mode-map)
-           (chomp-update-semi-char-mode-map))))
+         (when (fboundp 'ebb-update-semi-char-mode-map)
+           (ebb-update-semi-char-mode-map))))
 
-(defun chomp-input-make-keymap (input-command categories exceptions)
+(defun ebb-input-make-keymap (input-command categories exceptions)
   "Build a keymap binding INPUT-COMMAND to events in CATEGORIES.
 CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
 `:function'.  EXCEPTIONS is a list of key sequences to exclude."
@@ -460,14 +460,14 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
 
 ;;;; ---- Mouse Keymap ---------------------------------------------------
 
-(defconst chomp-input--mouse-mod-prefixes
+(defconst ebb-input--mouse-mod-prefixes
   '("" "C-" "M-" "S-" "C-M-" "C-S-" "M-S-" "C-M-S-")
   "Modifier prefixes used for mouse event symbols.")
 
-(defun chomp-input--mouse-event-symbols ()
-  "Return mouse event symbols that Chomp should pass through to TUIs."
+(defun ebb-input--mouse-event-symbols ()
+  "Return mouse event symbols that Ebb should pass through to TUIs."
   (let (events)
-    (dolist (prefix chomp-input--mouse-mod-prefixes)
+    (dolist (prefix ebb-input--mouse-mod-prefixes)
       (dotimes (i 11)
         (push (intern (format "%smouse-%d" prefix (1+ i))) events))
       (dotimes (i 3)
@@ -478,90 +478,90 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
     (push 'mouse-movement events)
     events))
 
-(defun chomp--prepare-mouse-mode-map ()
+(defun ebb--prepare-mouse-mode-map ()
   "Build the transient DEC mouse tracking keymap."
   (let ((map (make-sparse-keymap)))
-    (dolist (key (chomp-input--mouse-event-symbols))
-      (define-key map (vector key) #'chomp-mouse-input))
+    (dolist (key (ebb-input--mouse-event-symbols))
+      (define-key map (vector key) #'ebb-mouse-input))
     ;; Mouse events can arrive through window decoration prefixes while dragging.
     (dolist (prefix '(mode-line header-line tab-line vertical-line
                       right-divider bottom-divider))
       (define-key map (vector prefix) map))
     map))
 
-(defvar chomp-mouse-mode-map
-  (ignore-errors (chomp--prepare-mouse-mode-map))
+(defvar ebb-mouse-mode-map
+  (ignore-errors (ebb--prepare-mouse-mode-map))
   "Keymap active while a child program has enabled DEC mouse tracking.")
 
 ;;;; ---- Semi-Char Keymap -----------------------------------------------
 
-(defun chomp--prepare-semi-char-mode-map ()
+(defun ebb--prepare-semi-char-mode-map ()
   "Build the semi-char mode keymap."
-  (let ((map (chomp-input-make-keymap
-              #'chomp-self-input '(:ascii :arrow :navigation :function)
+  (let ((map (ebb-input-make-keymap
+              #'ebb-self-input '(:ascii :arrow :navigation :function)
               `([?\C-c] [?\C-q] [?\C-y] [?\e ?y]
-                ,@chomp-semi-char-non-bound-keys))))
+                ,@ebb-semi-char-non-bound-keys))))
     ;; Overrides
-    (define-key map [?\C-q] #'chomp-quoted-input)
-    (define-key map [?\C-y] #'chomp-yank)
-    (define-key map [?\M-y] #'chomp-yank-pop)
+    (define-key map [?\C-q] #'ebb-quoted-input)
+    (define-key map [?\C-y] #'ebb-yank)
+    (define-key map [?\M-y] #'ebb-yank-pop)
     ;; C-c C-c sends literal C-c to terminal
-    (define-key map [?\C-c ?\C-c] #'chomp-self-input)
+    (define-key map [?\C-c ?\C-c] #'ebb-self-input)
     map))
 
-(defvar chomp-semi-char-mode-map
-  (ignore-errors (chomp--prepare-semi-char-mode-map))
+(defvar ebb-semi-char-mode-map
+  (ignore-errors (ebb--prepare-semi-char-mode-map))
   "Keymap for semi-char mode.")
 
-(defun chomp-update-semi-char-mode-map ()
+(defun ebb-update-semi-char-mode-map ()
   "Rebuild the semi-char keymap after customization changes."
-  (setq chomp-semi-char-mode-map (chomp--prepare-semi-char-mode-map))
+  (setq ebb-semi-char-mode-map (ebb--prepare-semi-char-mode-map))
   ;; `define-minor-mode' records the original map object in this alist.
-  (when-let ((entry (assq 'chomp--semi-char-mode minor-mode-map-alist)))
-    (setcdr entry chomp-semi-char-mode-map)))
+  (when-let ((entry (assq 'ebb--semi-char-mode minor-mode-map-alist)))
+    (setcdr entry ebb-semi-char-mode-map)))
 
 ;;;; ---- Char Keymap ----------------------------------------------------
 
-(defun chomp--prepare-char-mode-map ()
+(defun ebb--prepare-char-mode-map ()
   "Build the char mode keymap."
-  (let ((map (chomp-input-make-keymap
-              #'chomp-self-input
+  (let ((map (ebb-input-make-keymap
+              #'ebb-self-input
               '(:ascii :arrow :navigation :function)
               nil)))
     ;; Escape back to semi-char
-    (define-key map [?\C-\M-m] #'chomp-semi-char-mode)
+    (define-key map [?\C-\M-m] #'ebb-semi-char-mode)
     map))
 
-(defvar chomp-char-mode-map
-  (ignore-errors (chomp--prepare-char-mode-map))
+(defvar ebb-char-mode-map
+  (ignore-errors (ebb--prepare-char-mode-map))
   "Keymap for char mode.")
 
 ;;;; ---- Other Keymaps --------------------------------------------------
 
-(defvar chomp-mode-map
+(defvar ebb-mode-map
   (let ((map (make-sparse-keymap)))
     ;; Mode switching
-    (define-key map (kbd "C-c M-d") #'chomp-char-mode)
-    (define-key map (kbd "C-c C-j") #'chomp-semi-char-mode)
-    (define-key map (kbd "C-c C-e") #'chomp-emacs-mode)
-    (define-key map (kbd "C-c C-k") #'chomp-kill-process)
+    (define-key map (kbd "C-c M-d") #'ebb-char-mode)
+    (define-key map (kbd "C-c C-j") #'ebb-semi-char-mode)
+    (define-key map (kbd "C-c C-e") #'ebb-emacs-mode)
+    (define-key map (kbd "C-c C-k") #'ebb-kill-process)
     ;; Prompt navigation
-    (define-key map (kbd "C-c C-p") #'chomp-previous-prompt)
-    (define-key map (kbd "C-c C-n") #'chomp-next-prompt)
+    (define-key map (kbd "C-c C-p") #'ebb-previous-prompt)
+    (define-key map (kbd "C-c C-n") #'ebb-next-prompt)
     ;; The history buffer is a bounded materialized slab.
-    (define-key map [remap scroll-up-command] #'chomp-scroll-up)
-    (define-key map [remap scroll-down-command] #'chomp-scroll-down)
-    (define-key map [wheel-up] #'chomp-scroll-down)
-    (define-key map [wheel-down] #'chomp-scroll-up)
-    (define-key map [remap kill-ring-save] #'chomp-copy-region)
+    (define-key map [remap scroll-up-command] #'ebb-scroll-up)
+    (define-key map [remap scroll-down-command] #'ebb-scroll-down)
+    (define-key map [wheel-up] #'ebb-scroll-down)
+    (define-key map [wheel-down] #'ebb-scroll-up)
+    (define-key map [remap kill-ring-save] #'ebb-copy-region)
     map)
-  "Base keymap for `chomp-mode'.")
+  "Base keymap for `ebb-mode'.")
 
-(defvar chomp-emacs-mode-map
+(defvar ebb-emacs-mode-map
   (let ((map (make-sparse-keymap)))
     ;; Normal Emacs keys; only RET and a few overrides go to terminal.
     map)
   "Keymap for emacs mode.")
 
-(provide 'chomp-input)
-;;; chomp-input.el ends here
+(provide 'ebb-input)
+;;; ebb-input.el ends here

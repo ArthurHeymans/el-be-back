@@ -5,7 +5,7 @@ feature set while fixing its architectural weaknesses. Uses `futur.el` for async
 I/O so the main thread never hangs, and a separated screen model so buffer state
 is always consistent.
 
-Working name: **chomp** (it eats terminals, but faster).
+Working name: **ebb** (it eats terminals, but faster).
 
 ---
 
@@ -14,17 +14,17 @@ Working name: **chomp** (it eats terminals, but faster).
 1. [Design Principles](#1-design-principles)
 2. [Architecture Overview](#2-architecture-overview)
 3. [Module Breakdown](#3-module-breakdown)
-4. [Module 1: chomp-term -- Screen Model](#4-module-1-chomp-term----screen-model)
-5. [Module 2: chomp-parse -- VT State Machine](#5-module-2-chomp-parse----vt-state-machine)
-   - [5.7: Tree-sitter VT Grammar Backend](#57-tree-sitter-vt-grammar-backend-chomp-parse-tsel)
-6. [Module 3: chomp-render -- Buffer Display](#6-module-3-chomp-render----buffer-display)
-7. [Module 4: chomp-input -- Key Translation](#7-module-4-chomp-input----key-translation)
-8. [Module 5: chomp-shell -- Shell Integration](#8-module-5-chomp-shell----shell-integration)
-9. [Module 6: chomp-io -- Async Process I/O](#9-module-6-chomp-io----async-process-io)
-10. [Module 7: chomp-sixel -- Inline Images](#10-module-7-chomp-sixel----inline-images)
-11. [Module 8: chomp-eshell -- Eshell Integration](#11-module-8-chomp-eshell----eshell-integration)
-12. [Module 9: chomp.el -- Entry Points & Mode](#12-module-9-chompel----entry-points--mode)
-13. [Module 10: chomp-highlight -- Content Highlighting](#13-module-10-chomp-highlight----tree-sitter-content-highlighting)
+4. [Module 1: ebb-term -- Screen Model](#4-module-1-ebb-term----screen-model)
+5. [Module 2: ebb-parse -- VT State Machine](#5-module-2-ebb-parse----vt-state-machine)
+   - [5.7: Tree-sitter VT Grammar Backend](#57-tree-sitter-vt-grammar-backend-ebb-parse-tsel)
+6. [Module 3: ebb-render -- Buffer Display](#6-module-3-ebb-render----buffer-display)
+7. [Module 4: ebb-input -- Key Translation](#7-module-4-ebb-input----key-translation)
+8. [Module 5: ebb-shell -- Shell Integration](#8-module-5-ebb-shell----shell-integration)
+9. [Module 6: ebb-io -- Async Process I/O](#9-module-6-ebb-io----async-process-io)
+10. [Module 7: ebb-sixel -- Inline Images](#10-module-7-ebb-sixel----inline-images)
+11. [Module 8: ebb-eshell -- Eshell Integration](#11-module-8-ebb-eshell----eshell-integration)
+12. [Module 9: ebb.el -- Entry Points & Mode](#12-module-9-ebbel----entry-points--mode)
+13. [Module 10: ebb-highlight -- Content Highlighting](#13-module-10-ebb-highlight----tree-sitter-content-highlighting)
 14. [Terminfo & Shell Integration Scripts](#14-terminfo--shell-integration-scripts)
 15. [Test Strategy](#15-test-strategy)
 16. [Implementation Phases](#16-implementation-phases)
@@ -38,7 +38,7 @@ Working name: **chomp** (it eats terminals, but faster).
 
 This is the single most important departure from eat. In eat, `cat /etc/localtime`
 or any large binary dump freezes Emacs because the VT parser runs synchronously in
-the process filter. In chomp:
+the process filter. In ebb:
 
 - The process filter only appends raw bytes to a queue. It never parses.
 - Parsing happens in bounded chunks (configurable, default 4KB per chunk).
@@ -52,7 +52,7 @@ Eat uses the Emacs buffer as its screen model -- text properties on buffer text 
 the terminal state. This causes: undo history pollution, conflicts with hl-line-mode,
 flicker from fighting with Emacs redisplay, and tight coupling.
 
-In chomp, the screen is a pure Elisp data structure (vector of line records). The
+In ebb, the screen is a pure Elisp data structure (vector of line records). The
 buffer is a *view* that gets refreshed from the model in controlled render passes.
 The model is always consistent. The buffer is write-only from the terminal's
 perspective.
@@ -71,15 +71,15 @@ translator can be tested without a process.
 
 ### 1.5 Tree-sitter accelerated parsing
 
-Emacs 29+ includes built-in tree-sitter support. Chomp uses this in two ways:
+Emacs 29+ includes built-in tree-sitter support. Ebb uses this in two ways:
 
-1. **VT grammar parser** (`chomp-parse-ts.el`): A tree-sitter grammar for VT escape
+1. **VT grammar parser** (`ebb-parse-ts.el`): A tree-sitter grammar for VT escape
    sequences provides C-speed structural parsing with built-in error recovery. The
    grammar identifies sequence boundaries and extracts parameters; the Elisp layer
    handles semantic dispatch (applying operations to the screen model). Falls back to
    the pure-Elisp state machine on Emacs < 29.
 
-2. **Terminal content highlighting** (`chomp-highlight.el`): After rendering, optionally
+2. **Terminal content highlighting** (`ebb-highlight.el`): After rendering, optionally
    run tree-sitter on the visible terminal text to syntax-highlight code output.
    Auto-detects language from shell context (e.g., `python foo.py` → Python highlighting
    on the output) or lets the user pin a language. A unique feature no other terminal
@@ -90,7 +90,7 @@ Emacs 29+ includes built-in tree-sitter support. Chomp uses this in two ways:
 The core (state machine parser, screen model, renderer) is 100% Emacs Lisp and works
 on Emacs >= 28.1. Tree-sitter integration is an optional acceleration/feature layer
 requiring Emacs 29+. The architecture supports both paths via a parser backend
-abstraction -- `chomp-parse.el` defines the interface, `chomp-parse-ts.el` provides
+abstraction -- `ebb-parse.el` defines the interface, `ebb-parse-ts.el` provides
 the fast path.
 
 ---
@@ -106,7 +106,7 @@ the fast path.
                            |
                            v
               +------------------------+
-              |  chomp-io (futur.el)   |  Process filter: append to queue.
+              |  ebb-io (futur.el)   |  Process filter: append to queue.
               |  Chunk scheduler.      |  Timer/futur drives parse loop.
               +----------+-------------+
                          |
@@ -114,7 +114,7 @@ the fast path.
                          |
                          v
               +------------------------+     +------------------------+
-              |  chomp-parse           |     |  chomp-parse-ts        |
+              |  ebb-parse           |     |  ebb-parse-ts        |
               |  Elisp state machine.  | <=> |  tree-sitter grammar.  |
               |  Fallback for Emacs<29.|     |  C-speed, error-       |
               |  Always available.     |     |  tolerant. Emacs 29+.  |
@@ -125,7 +125,7 @@ the fast path.
                          |
                          v
               +------------------------+
-              |  chomp-term            |  Screen model.
+              |  ebb-term            |  Screen model.
               |  Vector of line recs.  |  Applies commands. Tracks dirty lines.
               |  Main + alt screen.    |
               +----------+-------------+
@@ -134,7 +134,7 @@ the fast path.
                          |
                          v
               +------------------------+     +------------------------+
-              |  chomp-render          |     |  chomp-highlight       |
+              |  ebb-render          |     |  ebb-highlight       |
               |  Buffer renderer.      | --> |  tree-sitter content   |
               |  Writes to Emacs buf.  |     |  highlighting.         |
               |  Only dirty lines.     |     |  Post-render pass.     |
@@ -142,29 +142,29 @@ the fast path.
                                              +------------------------+
 
               +------------------------+
-              |  chomp-input           |  Key event -> escape sequence.
+              |  ebb-input           |  Key event -> escape sequence.
               |  Three keybinding modes|  Sends bytes to PTY.
               +------------------------+
 
               +------------------------+
-              |  chomp-shell           |  OSC 51 handler.
+              |  ebb-shell           |  OSC 51 handler.
               |  Directory tracking.   |  Prompt annotation.
               |  History exchange.     |  Message handlers.
               +------------------------+
 
               +------------------------+
-              |  chomp-sixel           |  DCS Sixel renderer.
+              |  ebb-sixel           |  DCS Sixel renderer.
               |  Image protocol.       |  Multiple output formats.
               +------------------------+
 
               +------------------------+
-              |  chomp-eshell          |  eat-eshell-mode equivalent.
+              |  ebb-eshell          |  eat-eshell-mode equivalent.
               |  Visual command mode.  |
               +------------------------+
 
               +------------------------+
-              |  chomp.el              |  Entry points: M-x chomp
-              |  chomp-mode.           |  Buffer/window/process mgmt.
+              |  ebb.el              |  Entry points: M-x ebb
+              |  ebb-mode.           |  Buffer/window/process mgmt.
               +------------------------+
 ```
 
@@ -174,17 +174,17 @@ the fast path.
 
 | Module | File | Approx. Lines | Depends On |
 |--------|------|---------------|------------|
-| Screen Model | `chomp-term.el` | ~800 | nothing |
-| VT Parser | `chomp-parse.el` | ~1500 | chomp-term |
-| TS VT Parser | `chomp-parse-ts.el` | ~400 | chomp-parse, treesit |
-| Buffer Renderer | `chomp-render.el` | ~600 | chomp-term |
-| Content Highlight | `chomp-highlight.el` | ~500 | chomp-render, treesit |
-| Input Translator | `chomp-input.el` | ~500 | nothing |
-| Shell Integration | `chomp-shell.el` | ~400 | chomp-term |
-| Async I/O | `chomp-io.el` | ~300 | futur, chomp-parse, chomp-term, chomp-render |
-| Sixel | `chomp-sixel.el` | ~400 | chomp-term |
-| Eshell | `chomp-eshell.el` | ~400 | chomp.el |
-| Main | `chomp.el` | ~600 | all of the above |
+| Screen Model | `ebb-term.el` | ~800 | nothing |
+| VT Parser | `ebb-parse.el` | ~1500 | ebb-term |
+| TS VT Parser | `ebb-parse-ts.el` | ~400 | ebb-parse, treesit |
+| Buffer Renderer | `ebb-render.el` | ~600 | ebb-term |
+| Content Highlight | `ebb-highlight.el` | ~500 | ebb-render, treesit |
+| Input Translator | `ebb-input.el` | ~500 | nothing |
+| Shell Integration | `ebb-shell.el` | ~400 | ebb-term |
+| Async I/O | `ebb-io.el` | ~300 | futur, ebb-parse, ebb-term, ebb-render |
+| Sixel | `ebb-sixel.el` | ~400 | ebb-term |
+| Eshell | `ebb-eshell.el` | ~400 | ebb.el |
+| Main | `ebb.el` | ~600 | all of the above |
 | **Total** | | **~6400** | |
 
 Dependencies: `futur` (GNU ELPA), `compat` (for older Emacs versions).
@@ -196,7 +196,7 @@ Also ships: `tree-sitter-vt/grammar.js` (grammar source) and precompiled
 
 ---
 
-## 4. Module 1: chomp-term -- Screen Model
+## 4. Module 1: ebb-term -- Screen Model
 
 This is the heart. A pure data structure with no buffer or display dependencies.
 
@@ -204,13 +204,13 @@ This is the heart. A pure data structure with no buffer or display dependencies.
 
 ```elisp
 ;; A single cell on the screen.
-(cl-defstruct chomp-cell
+(cl-defstruct ebb-cell
   (char ?\s)        ; character (Unicode codepoint)
   (width 1)         ; display width (1 or 2 for CJK)
   (attr nil))       ; attribute record, or nil for default
 
 ;; Text attributes for a cell.
-(cl-defstruct chomp-attr
+(cl-defstruct ebb-attr
   (fg nil)          ; foreground: nil (default), integer (0-255), or (R G B)
   (bg nil)          ; background: same
   (ul-color nil)    ; underline color: same
@@ -225,15 +225,15 @@ This is the heart. A pure data structure with no buffer or display dependencies.
   (font 0))         ; font index 0-9
 
 ;; A single line in the terminal.
-(cl-defstruct chomp-line
-  (cells nil)       ; vector of chomp-cell, length = terminal width
+(cl-defstruct ebb-line
+  (cells nil)       ; vector of ebb-cell, length = terminal width
   (wrapped nil)     ; boolean: was this line auto-wrapped from the previous?
   (dirty t))        ; boolean: needs re-rendering?
 
 ;; The complete screen state.
-(cl-defstruct chomp-screen
+(cl-defstruct ebb-screen
   ;; Display area
-  (lines nil)       ; vector of chomp-line, length = terminal height
+  (lines nil)       ; vector of ebb-line, length = terminal height
   (width 80)
   (height 24)
   ;; Cursor
@@ -245,7 +245,7 @@ This is the heart. A pure data structure with no buffer or display dependencies.
   (cursor-style :block)    ; :block, :bar, :underline, :blinking-block, etc.
   (cursor-visible t)
   ;; Current attributes (applied to next character written)
-  (current-attr (make-chomp-attr))
+  (current-attr (make-ebb-attr))
   ;; Scroll region
   (scroll-top 0)
   (scroll-bottom 23)  ; 0-indexed, inclusive
@@ -266,9 +266,9 @@ This is the heart. A pure data structure with no buffer or display dependencies.
   (charset-g3 'us-ascii)
   (charset-active 'g0)
   ;; Alternate screen
-  (alt-screen nil)     ; saved chomp-screen when in alt mode, nil when in main
+  (alt-screen nil)     ; saved ebb-screen when in alt mode, nil when in main
   ;; Scrollback (main screen only)
-  (scrollback nil)     ; list of chomp-line (newest first)
+  (scrollback nil)     ; list of ebb-line (newest first)
   (scrollback-max 131072)  ; max characters (not lines)
   ;; Sixel state
   (sixel-scrolling t)
@@ -288,35 +288,35 @@ This is the heart. A pure data structure with no buffer or display dependencies.
 
 ```elisp
 ;; Construction
-(chomp-screen-create width height) -> chomp-screen
+(ebb-screen-create width height) -> ebb-screen
 
 ;; The screen model operations. Each returns the list of dirty line indices.
-(chomp-screen-write-char screen char)
-(chomp-screen-cursor-move screen direction count)  ; direction: up/down/left/right
-(chomp-screen-cursor-goto screen row col)
-(chomp-screen-set-attr screen attr-changes)
-(chomp-screen-erase screen type)         ; type: to-end, to-start, whole, line-*, display-*
-(chomp-screen-scroll screen direction count)
-(chomp-screen-insert-lines screen count)
-(chomp-screen-delete-lines screen count)
-(chomp-screen-insert-chars screen count)
-(chomp-screen-delete-chars screen count)
-(chomp-screen-resize screen new-width new-height)  ; reflow + clamp + dirty all (see 9.6.5)
-(chomp-screen-set-scroll-region screen top bottom)
-(chomp-screen-enter-alt screen)
-(chomp-screen-leave-alt screen)
-(chomp-screen-save-cursor screen)
-(chomp-screen-restore-cursor screen)
-(chomp-screen-reset screen)
-(chomp-screen-set-mode screen mode value)
-(chomp-screen-tab-forward screen count)
-(chomp-screen-tab-backward screen count)
+(ebb-screen-write-char screen char)
+(ebb-screen-cursor-move screen direction count)  ; direction: up/down/left/right
+(ebb-screen-cursor-goto screen row col)
+(ebb-screen-set-attr screen attr-changes)
+(ebb-screen-erase screen type)         ; type: to-end, to-start, whole, line-*, display-*
+(ebb-screen-scroll screen direction count)
+(ebb-screen-insert-lines screen count)
+(ebb-screen-delete-lines screen count)
+(ebb-screen-insert-chars screen count)
+(ebb-screen-delete-chars screen count)
+(ebb-screen-resize screen new-width new-height)  ; reflow + clamp + dirty all (see 9.6.5)
+(ebb-screen-set-scroll-region screen top bottom)
+(ebb-screen-enter-alt screen)
+(ebb-screen-leave-alt screen)
+(ebb-screen-save-cursor screen)
+(ebb-screen-restore-cursor screen)
+(ebb-screen-reset screen)
+(ebb-screen-set-mode screen mode value)
+(ebb-screen-tab-forward screen count)
+(ebb-screen-tab-backward screen count)
 
 ;; Query
-(chomp-screen-get-line screen row) -> chomp-line
-(chomp-screen-get-dirty screen) -> list of row indices
-(chomp-screen-clear-dirty screen)
-(chomp-screen-scrollback-lines screen) -> list of chomp-line
+(ebb-screen-get-line screen row) -> ebb-line
+(ebb-screen-get-dirty screen) -> list of row indices
+(ebb-screen-clear-dirty screen)
+(ebb-screen-scrollback-lines screen) -> list of ebb-line
 ```
 
 ### 4.3 Key Design Decisions
@@ -331,31 +331,31 @@ loop bug (eat issue #227).
 `[0, height-1]` (or scroll region bounds when origin mode is on). No negative values
 ever propagate. This prevents the `wholenump` crashes (eat issues #111, #141).
 
-**Dirty tracking**: Each `chomp-line` has a `dirty` flag. Screen operations set it.
+**Dirty tracking**: Each `ebb-line` has a `dirty` flag. Screen operations set it.
 The renderer reads and clears it. Only dirty lines are re-rendered.
 
-**Scrollback**: Stored as a list of `chomp-line` structs (newest first). On scroll-up
+**Scrollback**: Stored as a list of `ebb-line` structs (newest first). On scroll-up
 in main display, lines pushed off top get prepended to scrollback. Scrollback is
 trimmed by character count during render passes.
 
 ---
 
-## 5. Module 2: chomp-parse -- VT State Machine
+## 5. Module 2: ebb-parse -- VT State Machine
 
 ### 5.1 Parser Architecture
 
 The parser is a state machine that consumes a byte string and emits calls to
-`chomp-screen-*` functions. It is a pure transformer: it takes bytes in and produces
+`ebb-screen-*` functions. It is a pure transformer: it takes bytes in and produces
 screen operations.
 
 ```elisp
-(cl-defstruct chomp-parser
+(cl-defstruct ebb-parser
   (state :ground)        ; current parser state
   (params nil)           ; collected CSI/DCS parameters
   (intermediates nil)    ; collected intermediate bytes
   (osc-string "")       ; collected OSC string
   (dcs-string "")       ; collected DCS string
-  (screen nil)           ; reference to chomp-screen
+  (screen nil)           ; reference to ebb-screen
   (callbacks nil))       ; alist of callback functions for OSC/title/bell/etc.
 ```
 
@@ -380,7 +380,7 @@ Following the VT500 parser model (Paul Flo Williams' state diagram):
 ### 5.3 Parse Function
 
 ```elisp
-(defun chomp-parse-bytes (parser bytes &optional start end)
+(defun ebb-parse-bytes (parser bytes &optional start end)
   "Parse BYTES from START to END through PARSER.
 Applies resulting operations to the parser's screen.
 Returns the number of bytes consumed (may be less than (- end start)
@@ -389,7 +389,7 @@ if processing was interrupted by a yield point)."
 ```
 
 The key innovation: this function accepts a byte limit. It processes at most
-`chomp-io-chunk-size` bytes per call, then returns the number consumed. The I/O
+`ebb-io-chunk-size` bytes per call, then returns the number consumed. The I/O
 layer calls it repeatedly with the remaining bytes, yielding between calls.
 
 ### 5.4 CSI Dispatch Table
@@ -397,50 +397,50 @@ layer calls it repeatedly with the remaining bytes, yielding between calls.
 Rather than a giant `pcase`, use a dispatch vector indexed by the final byte:
 
 ```elisp
-(defvar chomp-parse--csi-dispatch
-  (let ((table (make-vector 128 #'chomp-parse--csi-unknown)))
-    (aset table ?@ #'chomp-parse--csi-ich)    ; Insert Character
-    (aset table ?A #'chomp-parse--csi-cuu)    ; Cursor Up
-    (aset table ?B #'chomp-parse--csi-cud)    ; Cursor Down
-    (aset table ?C #'chomp-parse--csi-cuf)    ; Cursor Forward
-    (aset table ?D #'chomp-parse--csi-cub)    ; Cursor Back
-    (aset table ?E #'chomp-parse--csi-cnl)    ; Cursor Next Line
-    (aset table ?F #'chomp-parse--csi-cpl)    ; Cursor Previous Line
-    (aset table ?G #'chomp-parse--csi-cha)    ; Cursor Horizontal Absolute
-    (aset table ?H #'chomp-parse--csi-cup)    ; Cursor Position
-    (aset table ?I #'chomp-parse--csi-cht)    ; Cursor Horizontal Tab
-    (aset table ?J #'chomp-parse--csi-ed)     ; Erase in Display
-    (aset table ?K #'chomp-parse--csi-el)     ; Erase in Line
-    (aset table ?L #'chomp-parse--csi-il)     ; Insert Line
-    (aset table ?M #'chomp-parse--csi-dl)     ; Delete Line
-    (aset table ?P #'chomp-parse--csi-dch)    ; Delete Character
-    (aset table ?S #'chomp-parse--csi-su)     ; Scroll Up
-    (aset table ?T #'chomp-parse--csi-sd)     ; Scroll Down
-    (aset table ?X #'chomp-parse--csi-ech)    ; Erase Character
-    (aset table ?Z #'chomp-parse--csi-cbt)    ; Cursor Backward Tab
-    (aset table ?` #'chomp-parse--csi-hpa)    ; Horizontal Position Absolute
-    (aset table ?a #'chomp-parse--csi-hpr)    ; Horizontal Position Relative
-    (aset table ?b #'chomp-parse--csi-rep)    ; Repeat
-    (aset table ?c #'chomp-parse--csi-da)     ; Device Attributes
-    (aset table ?d #'chomp-parse--csi-vpa)    ; Vertical Position Absolute
-    (aset table ?e #'chomp-parse--csi-vpr)    ; Vertical Position Relative
-    (aset table ?f #'chomp-parse--csi-hvp)    ; Horizontal Vertical Position
-    (aset table ?h #'chomp-parse--csi-sm)     ; Set Mode
-    (aset table ?j #'chomp-parse--csi-cub)    ; alias for Cursor Back
-    (aset table ?k #'chomp-parse--csi-cuu)    ; alias for Cursor Up (VPB)
-    (aset table ?l #'chomp-parse--csi-rm)     ; Reset Mode
-    (aset table ?m #'chomp-parse--csi-sgr)    ; Select Graphic Rendition
-    (aset table ?n #'chomp-parse--csi-dsr)    ; Device Status Report
-    (aset table ?q #'chomp-parse--csi-decscusr) ; with SP intermediate
-    (aset table ?r #'chomp-parse--csi-decstbm)  ; Set Scroll Region
-    (aset table ?s #'chomp-parse--csi-scp)    ; Save Cursor Position
-    (aset table ?u #'chomp-parse--csi-rcp)    ; Restore Cursor Position
+(defvar ebb-parse--csi-dispatch
+  (let ((table (make-vector 128 #'ebb-parse--csi-unknown)))
+    (aset table ?@ #'ebb-parse--csi-ich)    ; Insert Character
+    (aset table ?A #'ebb-parse--csi-cuu)    ; Cursor Up
+    (aset table ?B #'ebb-parse--csi-cud)    ; Cursor Down
+    (aset table ?C #'ebb-parse--csi-cuf)    ; Cursor Forward
+    (aset table ?D #'ebb-parse--csi-cub)    ; Cursor Back
+    (aset table ?E #'ebb-parse--csi-cnl)    ; Cursor Next Line
+    (aset table ?F #'ebb-parse--csi-cpl)    ; Cursor Previous Line
+    (aset table ?G #'ebb-parse--csi-cha)    ; Cursor Horizontal Absolute
+    (aset table ?H #'ebb-parse--csi-cup)    ; Cursor Position
+    (aset table ?I #'ebb-parse--csi-cht)    ; Cursor Horizontal Tab
+    (aset table ?J #'ebb-parse--csi-ed)     ; Erase in Display
+    (aset table ?K #'ebb-parse--csi-el)     ; Erase in Line
+    (aset table ?L #'ebb-parse--csi-il)     ; Insert Line
+    (aset table ?M #'ebb-parse--csi-dl)     ; Delete Line
+    (aset table ?P #'ebb-parse--csi-dch)    ; Delete Character
+    (aset table ?S #'ebb-parse--csi-su)     ; Scroll Up
+    (aset table ?T #'ebb-parse--csi-sd)     ; Scroll Down
+    (aset table ?X #'ebb-parse--csi-ech)    ; Erase Character
+    (aset table ?Z #'ebb-parse--csi-cbt)    ; Cursor Backward Tab
+    (aset table ?` #'ebb-parse--csi-hpa)    ; Horizontal Position Absolute
+    (aset table ?a #'ebb-parse--csi-hpr)    ; Horizontal Position Relative
+    (aset table ?b #'ebb-parse--csi-rep)    ; Repeat
+    (aset table ?c #'ebb-parse--csi-da)     ; Device Attributes
+    (aset table ?d #'ebb-parse--csi-vpa)    ; Vertical Position Absolute
+    (aset table ?e #'ebb-parse--csi-vpr)    ; Vertical Position Relative
+    (aset table ?f #'ebb-parse--csi-hvp)    ; Horizontal Vertical Position
+    (aset table ?h #'ebb-parse--csi-sm)     ; Set Mode
+    (aset table ?j #'ebb-parse--csi-cub)    ; alias for Cursor Back
+    (aset table ?k #'ebb-parse--csi-cuu)    ; alias for Cursor Up (VPB)
+    (aset table ?l #'ebb-parse--csi-rm)     ; Reset Mode
+    (aset table ?m #'ebb-parse--csi-sgr)    ; Select Graphic Rendition
+    (aset table ?n #'ebb-parse--csi-dsr)    ; Device Status Report
+    (aset table ?q #'ebb-parse--csi-decscusr) ; with SP intermediate
+    (aset table ?r #'ebb-parse--csi-decstbm)  ; Set Scroll Region
+    (aset table ?s #'ebb-parse--csi-scp)    ; Save Cursor Position
+    (aset table ?u #'ebb-parse--csi-rcp)    ; Restore Cursor Position
     table)
   "Dispatch table for CSI final bytes.")
 ```
 
 This is O(1) dispatch instead of eat's O(n) `pcase` chain. Every slot in the table
-has a handler; unrecognized ones go to `chomp-parse--csi-unknown` which logs a
+has a handler; unrecognized ones go to `ebb-parse--csi-unknown` which logs a
 debug message and does nothing.
 
 ### 5.5 SGR Handler
@@ -449,25 +449,25 @@ The SGR handler (CSI m) is the most complex single function. It walks the parame
 list and builds attribute changes:
 
 ```elisp
-(defun chomp-parse--csi-sgr (parser params)
+(defun ebb-parse--csi-sgr (parser params)
   "Handle Select Graphic Rendition."
-  (let ((screen (chomp-parser-screen parser))
+  (let ((screen (ebb-parser-screen parser))
         (i 0)
         (len (length params)))
     (when (zerop len)
       ;; No params = reset all
-      (chomp-screen-reset-attr screen)
-      (cl-return-from chomp-parse--csi-sgr))
+      (ebb-screen-reset-attr screen)
+      (cl-return-from ebb-parse--csi-sgr))
     (while (< i len)
       (let ((p (aref params i)))
         (pcase p
-          (0  (chomp-screen-reset-attr screen))
-          (1  (chomp-screen-set-attr screen :bold t))
-          (2  (chomp-screen-set-attr screen :faint t))
-          (3  (chomp-screen-set-attr screen :italic t))
+          (0  (ebb-screen-reset-attr screen))
+          (1  (ebb-screen-set-attr screen :bold t))
+          (2  (ebb-screen-set-attr screen :faint t))
+          (3  (ebb-screen-set-attr screen :italic t))
           (4  ;; Underline -- check for sub-parameters via colon syntax
-           (let ((sub (chomp-parse--get-subparam params i)))
-             (chomp-screen-set-attr screen :underline
+           (let ((sub (ebb-parse--get-subparam params i)))
+             (ebb-screen-set-attr screen :underline
                                     (pcase sub
                                       (0 nil) (1 'line) (2 'double)
                                       (3 'curly) (4 'dotted) (5 'dashed)
@@ -478,9 +478,9 @@ list and builds attribute changes:
              (2 (let ((r (aref params (+ i 2)))
                       (g (aref params (+ i 3)))
                       (b (aref params (+ i 4))))
-                  (chomp-screen-set-attr screen :fg (list r g b))
+                  (ebb-screen-set-attr screen :fg (list r g b))
                   (cl-incf i 4)))
-             (5 (chomp-screen-set-attr screen :fg (aref params (+ i 2)))
+             (5 (ebb-screen-set-attr screen :fg (aref params (+ i 2)))
                 (cl-incf i 2))))
           ;; ... remaining SGR codes
           (_ nil)))  ;; UNKNOWN: silently skip
@@ -492,20 +492,20 @@ list and builds attribute changes:
 Every dispatch handler is wrapped:
 
 ```elisp
-(defun chomp-parse--dispatch-csi (parser final-byte)
+(defun ebb-parse--dispatch-csi (parser final-byte)
   (condition-case err
-      (let ((handler (aref chomp-parse--csi-dispatch final-byte)))
-        (funcall handler parser (chomp-parser-params parser)))
+      (let ((handler (aref ebb-parse--csi-dispatch final-byte)))
+        (funcall handler parser (ebb-parser-params parser)))
     (error
-     (chomp-parse--log parser "CSI dispatch error for %c: %S" final-byte err))))
+     (ebb-parse--log parser "CSI dispatch error for %c: %S" final-byte err))))
 ```
 
 The parser never propagates errors to the caller. Every error is caught, logged, and
 parsing continues from the next ground state.
 
-### 5.7 Tree-sitter VT Grammar Backend (chomp-parse-ts.el)
+### 5.7 Tree-sitter VT Grammar Backend (ebb-parse-ts.el)
 
-On Emacs 29+, chomp can use a tree-sitter grammar for the structural parsing layer.
+On Emacs 29+, ebb can use a tree-sitter grammar for the structural parsing layer.
 The grammar handles the byte-level syntax (identifying sequence boundaries, extracting
 parameters, classifying sequence types). The Elisp layer handles semantic dispatch
 (what each sequence *does* to the screen model). This split is natural because:
@@ -616,25 +616,25 @@ edge cases:
 #### 5.7.3 Elisp Bridge
 
 ```elisp
-(defvar chomp-parse-ts--parser nil
+(defvar ebb-parse-ts--parser nil
   "The tree-sitter parser instance for VT parsing.
 Buffer-local, created on demand.")
 
-(defvar chomp-parse-ts--language nil
+(defvar ebb-parse-ts--language nil
   "Cached tree-sitter language object for the VT grammar.")
 
-(defun chomp-parse-ts-available-p ()
+(defun ebb-parse-ts-available-p ()
   "Return non-nil if tree-sitter VT parsing is available."
   (and (fboundp 'treesit-ready-p)
        (treesit-ready-p 'vt t)))
 
-(defun chomp-parse-ts-init ()
+(defun ebb-parse-ts-init ()
   "Initialize the tree-sitter VT parser."
-  (unless chomp-parse-ts--language
-    (setq chomp-parse-ts--language (treesit-language-at nil))) ;; or explicit load
-  (setq chomp-parse-ts--parser (treesit-parser-create 'vt)))
+  (unless ebb-parse-ts--language
+    (setq ebb-parse-ts--language (treesit-language-at nil))) ;; or explicit load
+  (setq ebb-parse-ts--parser (treesit-parser-create 'vt)))
 
-(defun chomp-parse-ts-parse-chunk (ts-parser elisp-parser bytes start end)
+(defun ebb-parse-ts-parse-chunk (ts-parser elisp-parser bytes start end)
   "Parse BYTES[START..END] using tree-sitter, dispatch via ELISP-PARSER.
 Returns number of bytes consumed."
   (let* ((chunk (substring bytes start end))
@@ -643,43 +643,43 @@ Returns number of bytes consumed."
          (root (treesit-parser-root-node tree))
          (consumed 0))
     ;; Walk the tree and dispatch each node
-    (chomp-parse-ts--walk root elisp-parser)
+    (ebb-parse-ts--walk root elisp-parser)
     ;; Calculate consumed bytes (everything except trailing ERROR nodes
     ;; that might be incomplete sequences waiting for more data)
-    (setq consumed (chomp-parse-ts--usable-extent root))
+    (setq consumed (ebb-parse-ts--usable-extent root))
     consumed))
 
-(defun chomp-parse-ts--walk (node parser)
+(defun ebb-parse-ts--walk (node parser)
   "Walk a tree-sitter NODE tree, dispatching to PARSER's screen model."
   (let ((type (treesit-node-type node))
-        (screen (chomp-parser-screen parser)))
+        (screen (ebb-parser-screen parser)))
     (pcase type
       ("plain_text"
        ;; Fast path: bulk-insert printable text
        (let ((text (treesit-node-text node)))
          (dotimes (i (length text))
-           (chomp-screen-write-char screen (aref text i)))))
+           (ebb-screen-write-char screen (aref text i)))))
 
       ("control_char"
        (let ((byte (aref (treesit-node-text node) 0)))
-         (chomp-parse--dispatch-c0 parser byte)))
+         (ebb-parse--dispatch-c0 parser byte)))
 
       ("csi_sequence"
        (let ((private (treesit-node-child-by-field-name node "private"))
              (params (treesit-node-child-by-field-name node "params"))
              (intermediate (treesit-node-child-by-field-name node "intermediate"))
              (final (treesit-node-child-by-field-name node "final")))
-         (chomp-parse--dispatch-csi-from-tree
+         (ebb-parse--dispatch-csi-from-tree
           parser
           (when private (treesit-node-text private))
-          (when params (chomp-parse-ts--extract-params params))
+          (when params (ebb-parse-ts--extract-params params))
           (when intermediate (treesit-node-text intermediate))
           (aref (treesit-node-text final) 0))))
 
       ("osc_sequence"
        (let ((number (treesit-node-child-by-field-name node "number"))
              (payload (treesit-node-child-by-field-name node "payload")))
-         (chomp-parse--dispatch-osc
+         (ebb-parse--dispatch-osc
           parser
           (string-to-number (treesit-node-text number))
           (when payload (treesit-node-text payload)))))
@@ -688,9 +688,9 @@ Returns number of bytes consumed."
        (let ((params (treesit-node-child-by-field-name node "params"))
              (final (treesit-node-child-by-field-name node "final"))
              (body (treesit-node-child-by-field-name node "body")))
-         (chomp-parse--dispatch-dcs
+         (ebb-parse--dispatch-dcs
           parser
-          (when params (chomp-parse-ts--extract-params params))
+          (when params (ebb-parse-ts--extract-params params))
           (aref (treesit-node-text final) 0)
           (when body (treesit-node-text body)))))
 
@@ -700,25 +700,25 @@ Returns number of bytes consumed."
              (charset (treesit-node-child-by-field-name node "charset")))
          (cond
           (simple
-           (chomp-parse--dispatch-esc parser (aref (treesit-node-text simple) 0)))
+           (ebb-parse--dispatch-esc parser (aref (treesit-node-text simple) 0)))
           (designator
-           (chomp-parse--dispatch-charset
+           (ebb-parse--dispatch-charset
             parser
             (aref (treesit-node-text designator) 0)
             (aref (treesit-node-text charset) 0))))))
 
       ("ERROR"
        ;; Malformed sequence -- log and skip
-       (chomp-parse--log parser "tree-sitter ERROR node at byte %d: %S"
+       (ebb-parse--log parser "tree-sitter ERROR node at byte %d: %S"
                          (treesit-node-start node)
                          (treesit-node-text node)))
 
       ;; For container nodes, recurse into children
       (_
        (dotimes (i (treesit-node-child-count node))
-         (chomp-parse-ts--walk (treesit-node-child node i) parser))))))
+         (ebb-parse-ts--walk (treesit-node-child node i) parser))))))
 
-(defun chomp-parse-ts--extract-params (params-node)
+(defun ebb-parse-ts--extract-params (params-node)
   "Extract CSI parameters from a tree-sitter params node.
 Returns a vector of integers (with -1 for omitted parameters)."
   (let ((text (treesit-node-text params-node)))
@@ -729,7 +729,7 @@ Returns a vector of integers (with -1 for omitted parameters)."
                  (string-to-number p)))
              (split-string text "[;]")))))
 
-(defun chomp-parse-ts--usable-extent (root)
+(defun ebb-parse-ts--usable-extent (root)
   "Return byte count of usably-parsed content from ROOT.
 Excludes any trailing ERROR node (likely an incomplete sequence)."
   (let ((last-child (treesit-node-child root (1- (treesit-node-child-count root)))))
@@ -740,10 +740,10 @@ Excludes any trailing ERROR node (likely an incomplete sequence)."
 
 #### 5.7.4 Parser Backend Dispatch
 
-`chomp-parse.el` selects the backend at init time:
+`ebb-parse.el` selects the backend at init time:
 
 ```elisp
-(defcustom chomp-use-tree-sitter 'auto
+(defcustom ebb-use-tree-sitter 'auto
   "Whether to use tree-sitter for VT parsing.
 `auto' uses it when available, `always' requires it (error if unavailable),
 nil disables it."
@@ -751,24 +751,24 @@ nil disables it."
                  (const :tag "Always" always)
                  (const :tag "Never" nil)))
 
-(defun chomp-parse-create (screen)
+(defun ebb-parse-create (screen)
   "Create a parser for SCREEN, selecting the best available backend."
-  (let ((parser (make-chomp-parser :screen screen)))
-    (when (and chomp-use-tree-sitter
-               (or (eq chomp-use-tree-sitter 'always)
-                   (chomp-parse-ts-available-p)))
-      (chomp-parse-ts-init)
-      (setf (chomp-parser-ts-parser parser) chomp-parse-ts--parser))
+  (let ((parser (make-ebb-parser :screen screen)))
+    (when (and ebb-use-tree-sitter
+               (or (eq ebb-use-tree-sitter 'always)
+                   (ebb-parse-ts-available-p)))
+      (ebb-parse-ts-init)
+      (setf (ebb-parser-ts-parser parser) ebb-parse-ts--parser))
     parser))
 
-(defun chomp-parse-bytes (parser bytes &optional start end)
+(defun ebb-parse-bytes (parser bytes &optional start end)
   "Parse BYTES[START..END] through PARSER using the best backend."
-  (if (chomp-parser-ts-parser parser)
-      (chomp-parse-ts-parse-chunk
-       (chomp-parser-ts-parser parser) parser bytes
+  (if (ebb-parser-ts-parser parser)
+      (ebb-parse-ts-parse-chunk
+       (ebb-parser-ts-parser parser) parser bytes
        (or start 0) (or end (length bytes)))
     ;; Fallback: Elisp state machine
-    (chomp-parse--state-machine parser bytes (or start 0) (or end (length bytes)))))
+    (ebb-parse--state-machine parser bytes (or start 0) (or end (length bytes)))))
 ```
 
 #### 5.7.5 Performance Characteristics
@@ -790,66 +790,66 @@ output floods. Where the Elisp parser might need 8ms per 4KB chunk (leaving only
 
 ---
 
-## 6. Module 3: chomp-render -- Buffer Display
+## 6. Module 3: ebb-render -- Buffer Display
 
 ### 6.1 Render Pass
 
 The renderer is called after each parse chunk completes. It only touches dirty lines.
 
 ```elisp
-(defun chomp-render-refresh (render-state)
+(defun ebb-render-refresh (render-state)
   "Refresh the buffer display from the screen model.
 Only re-renders lines that have changed since the last refresh."
-  (let* ((screen (chomp-render-screen render-state))
-         (buffer (chomp-render-buffer render-state))
-         (dirty (chomp-screen-get-dirty screen)))
+  (let* ((screen (ebb-render-screen render-state))
+         (buffer (ebb-render-buffer render-state))
+         (dirty (ebb-screen-get-dirty screen)))
     (when dirty
       (with-current-buffer buffer
         (let ((inhibit-read-only t)
               (inhibit-modification-hooks t)
               (buffer-undo-list t))   ;; Never record undo
           ;; Render scrollback changes (if any new lines were added)
-          (chomp-render--update-scrollback render-state)
+          (ebb-render--update-scrollback render-state)
           ;; Render each dirty display line
           (dolist (row dirty)
-            (chomp-render--update-line render-state row))
+            (ebb-render--update-line render-state row))
           ;; Update cursor position
-          (chomp-render--update-cursor render-state)))
-      (chomp-screen-clear-dirty screen))))
+          (ebb-render--update-cursor render-state)))
+      (ebb-screen-clear-dirty screen))))
 ```
 
 ### 6.2 Line Rendering
 
-Each line is rendered by converting `chomp-cell` structs to a propertized string:
+Each line is rendered by converting `ebb-cell` structs to a propertized string:
 
 ```elisp
-(defun chomp-render--update-line (render-state row)
+(defun ebb-render--update-line (render-state row)
   "Re-render display line ROW in the buffer."
-  (let* ((screen (chomp-render-screen render-state))
-         (line (chomp-screen-get-line screen row))
-         (cells (chomp-line-cells line))
-         (width (chomp-screen-width screen))
+  (let* ((screen (ebb-render-screen render-state))
+         (line (ebb-screen-get-line screen row))
+         (cells (ebb-line-cells line))
+         (width (ebb-screen-width screen))
          ;; Build the text and property list
-         (result (chomp-render--cells-to-propertized-string cells width)))
+         (result (ebb-render--cells-to-propertized-string cells width)))
     ;; Replace the line in the buffer
-    (chomp-render--replace-buffer-line render-state row result)))
+    (ebb-render--replace-buffer-line render-state row result)))
 ```
 
 ### 6.3 Attribute to Face Conversion
 
 ```elisp
-(defun chomp-render--attr-to-face (attr)
-  "Convert a chomp-attr to an Emacs face specification.
+(defun ebb-render--attr-to-face (attr)
+  "Convert a ebb-attr to an Emacs face specification.
 Returns a plist suitable for the `face' text property."
   (let (face)
-    (when (chomp-attr-bold attr)
-      (push 'chomp-bold face))
-    (when (chomp-attr-italic attr)
-      (push 'chomp-italic face))
-    (when-let ((fg (chomp-attr-fg attr)))
-      (push `(:foreground ,(chomp-render--color-to-string fg)) face))
-    (when-let ((bg (chomp-attr-bg attr)))
-      (push `(:background ,(chomp-render--color-to-string bg)) face))
+    (when (ebb-attr-bold attr)
+      (push 'ebb-bold face))
+    (when (ebb-attr-italic attr)
+      (push 'ebb-italic face))
+    (when-let ((fg (ebb-attr-fg attr)))
+      (push `(:foreground ,(ebb-render--color-to-string fg)) face))
+    (when-let ((bg (ebb-attr-bg attr)))
+      (push `(:background ,(ebb-render--color-to-string bg)) face))
     ;; ... all other attributes
     (if (cdr face) face (car face))))
 ```
@@ -875,23 +875,23 @@ The display region is bounded by two markers. Scrollback grows above
 
 ---
 
-## 7. Module 4: chomp-input -- Key Translation
+## 7. Module 4: ebb-input -- Key Translation
 
 ### 7.1 Keymaps
 
 Three keymaps, just like eat:
 
 ```elisp
-(defvar chomp-char-mode-map ...)       ;; All keys -> terminal
-(defvar chomp-semi-char-mode-map ...)  ;; Most keys -> terminal, some reserved
-(defvar chomp-emacs-mode-map ...)      ;; Normal Emacs keys, few overrides
-(defvar chomp-line-mode-map ...)       ;; Shell-mode-like editing
+(defvar ebb-char-mode-map ...)       ;; All keys -> terminal
+(defvar ebb-semi-char-mode-map ...)  ;; Most keys -> terminal, some reserved
+(defvar ebb-emacs-mode-map ...)      ;; Normal Emacs keys, few overrides
+(defvar ebb-line-mode-map ...)       ;; Shell-mode-like editing
 ```
 
 ### 7.2 Translation Function
 
 ```elisp
-(defun chomp-input-translate (event &optional screen)
+(defun ebb-input-translate (event &optional screen)
   "Translate Emacs key EVENT to terminal escape sequence string.
 SCREEN is consulted for mode flags (keypad mode, etc.).
 Returns a string to send to the PTY, or nil if the event shouldn't be sent."
@@ -915,18 +915,18 @@ The translation covers:
 ### 7.3 Mouse Encoding
 
 ```elisp
-(defun chomp-input-encode-mouse (event screen ref-pos)
+(defun ebb-input-encode-mouse (event screen ref-pos)
   "Encode a mouse EVENT as a terminal escape sequence."
-  (let* ((button (chomp-input--mouse-button event))
-         (mods (chomp-input--mouse-modifiers event))
-         (pos (chomp-input--mouse-position event ref-pos))
+  (let* ((button (ebb-input--mouse-button event))
+         (mods (ebb-input--mouse-modifiers event))
+         (pos (ebb-input--mouse-position event ref-pos))
          (x (car pos))
          (y (cdr pos))
          (code (+ button mods)))
-    (if (chomp-screen-mouse-sgr screen)
+    (if (ebb-screen-mouse-sgr screen)
         ;; SGR encoding: no coordinate limit
         (format "\e[<%d;%d;%d%c" code (1+ x) (1+ y)
-                (if (chomp-input--mouse-release-p event) ?m ?M))
+                (if (ebb-input--mouse-release-p event) ?m ?M))
       ;; Default encoding: coordinates capped at 95
       (when (and (<= x 94) (<= y 94))
         (format "\e[M%c%c%c" (+ code 32) (+ x 33) (+ y 33))))))
@@ -934,7 +934,7 @@ The translation covers:
 
 ---
 
-## 8. Module 5: chomp-shell -- Shell Integration
+## 8. Module 5: ebb-shell -- Shell Integration
 
 ### 8.1 OSC 51 Protocol
 
@@ -942,24 +942,24 @@ Reuses eat's protocol exactly (OSC 51 with `e;` namespace). This means existing
 bash/zsh integration scripts work unchanged.
 
 ```elisp
-(defun chomp-shell-handle-osc51 (screen payload callbacks)
+(defun ebb-shell-handle-osc51 (screen payload callbacks)
   "Handle an OSC 51 shell integration sequence."
   (when (string-prefix-p "e;" payload)
     (let ((cmd (aref payload 2))
-          (args (chomp-shell--split-payload payload 4)))
+          (args (ebb-shell--split-payload payload 4)))
       (pcase cmd
-        (?A (chomp-shell--set-cwd args callbacks))
-        (?B (chomp-shell--pre-prompt callbacks))
-        (?C (chomp-shell--post-prompt callbacks))
+        (?A (ebb-shell--set-cwd args callbacks))
+        (?B (ebb-shell--pre-prompt callbacks))
+        (?C (ebb-shell--post-prompt callbacks))
         (?D nil)  ;; continuation prompt start (unused)
-        (?E (chomp-shell--post-cont-prompt callbacks))
-        (?F (chomp-shell--set-command args callbacks))
-        (?G (chomp-shell--pre-exec callbacks))
-        (?H (chomp-shell--set-exit-status args callbacks))
-        (?I (chomp-shell--history-exchange args screen callbacks))
-        (?J (chomp-shell--before-new-prompt callbacks))
-        (?M (chomp-shell--user-message args callbacks))
-        (_  (chomp-shell--log "Unknown OSC 51 command: %c" cmd))))))
+        (?E (ebb-shell--post-cont-prompt callbacks))
+        (?F (ebb-shell--set-command args callbacks))
+        (?G (ebb-shell--pre-exec callbacks))
+        (?H (ebb-shell--set-exit-status args callbacks))
+        (?I (ebb-shell--history-exchange args screen callbacks))
+        (?J (ebb-shell--before-new-prompt callbacks))
+        (?M (ebb-shell--user-message args callbacks))
+        (_  (ebb-shell--log "Unknown OSC 51 command: %c" cmd))))))
 ```
 
 ### 8.2 Prompt Annotation
@@ -970,7 +970,7 @@ rather than directly manipulating buffer overlays.
 
 ```elisp
 ;; Callback interface
-(cl-defstruct chomp-shell-callbacks
+(cl-defstruct ebb-shell-callbacks
   (set-cwd nil)            ;; (lambda (path))
   (prompt-start nil)       ;; (lambda (position))
   (prompt-end nil)         ;; (lambda (position status))
@@ -984,7 +984,7 @@ rather than directly manipulating buffer overlays.
 
 ---
 
-## 9. Module 6: chomp-io -- Async Process I/O
+## 9. Module 6: ebb-io -- Async Process I/O
 
 This is where `futur.el` comes in. The I/O module ensures the main thread is never
 blocked by terminal output processing.
@@ -992,11 +992,11 @@ blocked by terminal output processing.
 ### 9.1 Core Data Structure
 
 ```elisp
-(cl-defstruct chomp-io
+(cl-defstruct ebb-io
   (process nil)            ;; the PTY process
-  (parser nil)             ;; chomp-parser instance
-  (screen nil)             ;; chomp-screen instance
-  (render nil)             ;; chomp-render-state instance
+  (parser nil)             ;; ebb-parser instance
+  (screen nil)             ;; ebb-screen instance
+  (render nil)             ;; ebb-render-state instance
   (pending-bytes "")       ;; unprocessed byte queue
   (pending-offset 0)       ;; how far into pending-bytes we've parsed
   (processing nil)         ;; non-nil when a parse loop is active
@@ -1013,83 +1013,83 @@ blocked by terminal output processing.
 ### 9.2 Process Filter (never blocks)
 
 ```elisp
-(defun chomp-io--filter (io _process output)
+(defun ebb-io--filter (io _process output)
   "Process filter. Only appends to queue. Never parses."
-  (setf (chomp-io-pending-bytes io)
-        (concat (chomp-io-pending-bytes io) output))
+  (setf (ebb-io-pending-bytes io)
+        (concat (ebb-io-pending-bytes io) output))
   ;; Record time of first unprocessed chunk for latency calculation
-  (unless (chomp-io-first-chunk-time io)
-    (setf (chomp-io-first-chunk-time io) (current-time)))
+  (unless (ebb-io-first-chunk-time io)
+    (setf (ebb-io-first-chunk-time io) (current-time)))
   ;; Schedule processing if not already scheduled
-  (unless (chomp-io-processing io)
-    (chomp-io--schedule-processing io)))
+  (unless (ebb-io-processing io)
+    (ebb-io--schedule-processing io)))
 ```
 
 ### 9.3 Chunked Processing with futur.el
 
 ```elisp
-(defun chomp-io--schedule-processing (io)
+(defun ebb-io--schedule-processing (io)
   "Schedule the next parse+render cycle."
   (let* ((now (current-time))
-         (first (chomp-io-first-chunk-time io))
+         (first (ebb-io-first-chunk-time io))
          (elapsed (float-time (time-subtract now first)))
-         (time-left (- (chomp-io-max-latency io) elapsed))
+         (time-left (- (ebb-io-max-latency io) elapsed))
          (delay (if (<= time-left 0) 0
-                  (min time-left (chomp-io-min-latency io)))))
+                  (min time-left (ebb-io-min-latency io)))))
     ;; Cancel any existing timer
-    (when (chomp-io-render-timer io)
-      (cancel-timer (chomp-io-render-timer io)))
+    (when (ebb-io-render-timer io)
+      (cancel-timer (ebb-io-render-timer io)))
     ;; Schedule via futur-timeout, which yields to the event loop
-    (setf (chomp-io-processing io) t)
+    (setf (ebb-io-processing io) t)
     (futur-let*
         ((_ <- (futur-timeout delay))
-         (_ (chomp-io--process-one-batch io)))
+         (_ (ebb-io--process-one-batch io)))
       ;; After processing, check if more data arrived
-      (setf (chomp-io-processing io) nil)
-      (when (> (length (chomp-io-pending-bytes io))
-               (chomp-io-pending-offset io))
-        (chomp-io--schedule-processing io))
+      (setf (ebb-io-processing io) nil)
+      (when (> (length (ebb-io-pending-bytes io))
+               (ebb-io-pending-offset io))
+        (ebb-io--schedule-processing io))
       (futur-done nil))))
 
-(defun chomp-io--process-one-batch (io)
+(defun ebb-io--process-one-batch (io)
   "Process up to chunk-size bytes, then render dirty lines."
-  (let* ((bytes (chomp-io-pending-bytes io))
-         (offset (chomp-io-pending-offset io))
+  (let* ((bytes (ebb-io-pending-bytes io))
+         (offset (ebb-io-pending-offset io))
          (remaining (- (length bytes) offset))
-         (chunk-size (min remaining (chomp-io-chunk-size io)))
-         (parser (chomp-io-parser io)))
+         (chunk-size (min remaining (ebb-io-chunk-size io)))
+         (parser (ebb-io-parser io)))
     ;; Binary flood detection
-    (chomp-io--update-throughput io chunk-size)
-    (unless (chomp-io-binary-flood io)
+    (ebb-io--update-throughput io chunk-size)
+    (unless (ebb-io-binary-flood io)
       ;; Parse one chunk
-      (let ((consumed (chomp-parse-bytes parser bytes offset (+ offset chunk-size))))
-        (cl-incf (chomp-io-pending-offset io) consumed)))
+      (let ((consumed (ebb-parse-bytes parser bytes offset (+ offset chunk-size))))
+        (cl-incf (ebb-io-pending-offset io) consumed)))
     ;; Compact the pending buffer if we've consumed a lot
-    (when (> (chomp-io-pending-offset io) 65536)
-      (setf (chomp-io-pending-bytes io)
-            (substring (chomp-io-pending-bytes io) (chomp-io-pending-offset io)))
-      (setf (chomp-io-pending-offset io) 0))
+    (when (> (ebb-io-pending-offset io) 65536)
+      (setf (ebb-io-pending-bytes io)
+            (substring (ebb-io-pending-bytes io) (ebb-io-pending-offset io)))
+      (setf (ebb-io-pending-offset io) 0))
     ;; Render
-    (chomp-render-refresh (chomp-io-render io))
+    (ebb-render-refresh (ebb-io-render io))
     ;; Reset latency tracking
-    (setf (chomp-io-first-chunk-time io) nil)))
+    (setf (ebb-io-first-chunk-time io) nil)))
 ```
 
 ### 9.4 Binary Flood Detection
 
 ```elisp
-(defun chomp-io--update-throughput (io chunk-bytes)
+(defun ebb-io--update-throughput (io chunk-bytes)
   "Track throughput and detect binary floods."
   (let* ((now (float-time))
-         (window (chomp-io-throughput-window io)))
+         (window (ebb-io-throughput-window io)))
     ;; Slide the window (1-second window)
     (when (or (null window) (> (- now (car window)) 1.0))
-      (setf (chomp-io-throughput-window io) (cons now 0))
-      (setf (chomp-io-throughput-bytes io) 0))
-    (cl-incf (chomp-io-throughput-bytes io) chunk-bytes)
+      (setf (ebb-io-throughput-window io) (cons now 0))
+      (setf (ebb-io-throughput-bytes io) 0))
+    (cl-incf (ebb-io-throughput-bytes io) chunk-bytes)
     ;; If throughput exceeds 1MB/sec and mostly non-printable, enter flood mode
-    (let ((bytes-per-sec (chomp-io-throughput-bytes io)))
-      (setf (chomp-io-binary-flood io)
+    (let ((bytes-per-sec (ebb-io-throughput-bytes io)))
+      (setf (ebb-io-binary-flood io)
             (> bytes-per-sec 1048576)))))
 ```
 
@@ -1101,10 +1101,10 @@ blocked by terminal output processing.
 ;; This reads as sequential code but never blocks:
 (futur-let*
     ((_ <- (futur-timeout 0.008))          ;; wait min-latency
-     (_ (chomp-io--process-one-batch io))  ;; parse + render
+     (_ (ebb-io--process-one-batch io))  ;; parse + render
      (_ <- (futur-timeout 0))              ;; yield to event loop
      (_ (when more-data                    ;; loop if needed
-          (chomp-io--process-one-batch io))))
+          (ebb-io--process-one-batch io))))
   (futur-done nil))
 ```
 
@@ -1115,27 +1115,27 @@ the buffer is killed).
 For process lifecycle management:
 
 ```elisp
-(defun chomp-io-start (io command &rest args)
+(defun ebb-io-start (io command &rest args)
   "Start the terminal process. Returns a futur that completes when the process exits."
   (futur-new
    (lambda (f)
      (let ((proc (make-process
-                  :name "chomp"
+                  :name "ebb"
                   :buffer nil
                   :command (cons command args)
                   :connection-type 'pty
                   :filter (lambda (proc output)
-                            (chomp-io--filter io proc output))
+                            (ebb-io--filter io proc output))
                   :sentinel (lambda (proc event)
-                              (chomp-io--sentinel io proc event f)))))
-       (setf (chomp-io-process io) proc)
+                              (ebb-io--sentinel io proc event f)))))
+       (setf (ebb-io-process io) proc)
        proc))))
 
-(defun chomp-io--sentinel (io _proc event futur)
+(defun ebb-io--sentinel (io _proc event futur)
   "Process sentinel. Delivers the futur when the process exits."
   (when (string-match-p "\\(finished\\|exited\\|killed\\)" event)
     ;; Process remaining output
-    (chomp-io--process-one-batch io)
+    (ebb-io--process-one-batch io)
     ;; Deliver the exit event
     (futur-deliver-value futur event)))
 ```
@@ -1144,7 +1144,7 @@ For process lifecycle management:
 
 Resize is the one operation that must coordinate all three layers (screen model →
 PTY process → renderer) atomically. In eat, the buffer *is* the screen, so resize
-is a single mutation. In chomp's separated architecture, we need explicit wiring.
+is a single mutation. In ebb's separated architecture, we need explicit wiring.
 
 #### 9.6.1 The Problem
 
@@ -1162,50 +1162,50 @@ When an Emacs window changes size, four things must happen in order:
 #### 9.6.2 Resize Hook
 
 ```elisp
-(defun chomp-io--setup-resize-hook (io buffer)
+(defun ebb-io--setup-resize-hook (io buffer)
   "Install the window-size-change hook for BUFFER."
   (with-current-buffer buffer
-    (setq-local chomp--resize-cookie
+    (setq-local ebb--resize-cookie
                 (add-hook 'window-size-change-functions
                           (lambda (frame)
-                            (chomp-io--handle-resize io buffer frame))
+                            (ebb-io--handle-resize io buffer frame))
                           nil t))))  ;; buffer-local hook
 
-(defun chomp-io--handle-resize (io buffer frame)
+(defun ebb-io--handle-resize (io buffer frame)
   "Handle window resize for BUFFER displayed in FRAME."
   (when-let* ((win (get-buffer-window buffer frame))
               (new-height (window-body-height win))
               (new-width (window-max-chars-per-line win))
-              (screen (chomp-io-screen io)))
+              (screen (ebb-io-screen io)))
     ;; Only act if dimensions actually changed
-    (unless (and (= new-width (chomp-screen-width screen))
-                 (= new-height (chomp-screen-height screen)))
+    (unless (and (= new-width (ebb-screen-width screen))
+                 (= new-height (ebb-screen-height screen)))
 
       ;; Step 1: Resize the screen model.
       ;; This is a pure data operation: reallocate line vectors, reflow wrapped
       ;; lines, clamp cursor, reset scroll region if needed. All coordinate
-      ;; clamping happens inside chomp-screen-resize, so no invalid state leaks.
-      (chomp-screen-resize screen new-width new-height)
+      ;; clamping happens inside ebb-screen-resize, so no invalid state leaks.
+      (ebb-screen-resize screen new-width new-height)
 
       ;; Step 2: Tell the PTY process.
       ;; SIGWINCH is sent to the child process group. The child will query
       ;; the new size via TIOCGWINSZ and start emitting output for the new
       ;; dimensions. Output already buffered in the kernel or our queue was
       ;; computed for the OLD dimensions -- that's fine, see 9.6.3 below.
-      (when-let ((proc (chomp-io-process io)))
+      (when-let ((proc (ebb-io-process io)))
         (when (process-live-p proc)
           (set-process-window-size proc new-height new-width)))
 
       ;; Step 3: Force a full re-render.
       ;; Every line needs re-rendering because column count changed (wrap
       ;; points differ, padding may need adjustment, etc.).
-      (chomp-render-invalidate-all (chomp-io-render io))
-      (chomp-render-refresh (chomp-io-render io)))))
+      (ebb-render-invalidate-all (ebb-io-render io))
+      (ebb-render-refresh (ebb-io-render io)))))
 ```
 
 #### 9.6.3 Race Condition: Resize During Async Parse
 
-Because chomp parses in async chunks via `futur-let*`, a resize can happen *between*
+Because ebb parses in async chunks via `futur-let*`, a resize can happen *between*
 parse chunks. This timeline is possible:
 
 ```
@@ -1218,7 +1218,7 @@ parse chunks. This timeline is possible:
 
 This is safe, and here's why:
 
-1. **The screen model is always consistent.** `chomp-screen-resize` runs on the main
+1. **The screen model is always consistent.** `ebb-screen-resize` runs on the main
    thread between chunks. After it completes, the model is valid for the new size.
    The next parse chunk applies operations to the new-sized model.
 
@@ -1226,7 +1226,7 @@ This is safe, and here's why:
    the terminal width. `CSI 5;40H` means "go to row 5, column 40" -- if the terminal
    is now 120 columns wide, that's still a valid position. If the terminal is now 30
    columns wide, the cursor gets clamped to column 29. The coordinate clamping in
-   `chomp-screen` (design principle 1.3) handles this automatically.
+   `ebb-screen` (design principle 1.3) handles this automatically.
 
 3. **Content reflow is the child's job.** After receiving SIGWINCH, programs like
    bash, vim, htop re-draw themselves for the new size. Until that new output arrives,
@@ -1242,57 +1242,57 @@ This is safe, and here's why:
 
 In eat, resize is simpler in *code* but harder to *reason about*:
 
-| | eat | chomp |
+| | eat | ebb |
 |---|---|---|
-| Resize handler | ~50 lines, directly manipulates buffer text, adjusts markers, calls `set-process-window-size` | ~30 lines, calls `chomp-screen-resize` + `set-process-window-size` + `chomp-render-invalidate-all` |
-| Reflow logic | Interleaved with buffer manipulation (insert/delete text, move overlays) | Pure data operation in `chomp-screen-resize` (testable without a buffer) |
+| Resize handler | ~50 lines, directly manipulates buffer text, adjusts markers, calls `set-process-window-size` | ~30 lines, calls `ebb-screen-resize` + `set-process-window-size` + `ebb-render-invalidate-all` |
+| Reflow logic | Interleaved with buffer manipulation (insert/delete text, move overlays) | Pure data operation in `ebb-screen-resize` (testable without a buffer) |
 | Undo pollution | Must suppress undo around resize mutations | Not applicable (buffer-undo-list is always t) |
 | Async safety | Not relevant (everything is synchronous) | Safe due to coordinate clamping between chunks |
 | Extra cost | None (buffer is screen) | One full re-render pass (~0.2ms for 40 lines) |
 
-The chomp approach trades a trivial re-render cost for testability: `chomp-screen-resize`
+The ebb approach trades a trivial re-render cost for testability: `ebb-screen-resize`
 can be unit-tested with synthetic screen state and no buffer, window, or process.
 
-#### 9.6.5 Resize in chomp-screen (screen model side)
+#### 9.6.5 Resize in ebb-screen (screen model side)
 
 For completeness, the screen model resize operation:
 
 ```elisp
-(defun chomp-screen-resize (screen new-width new-height)
+(defun ebb-screen-resize (screen new-width new-height)
   "Resize SCREEN to NEW-WIDTH x NEW-HEIGHT.
 Reflows wrapped lines, clamps cursor, resets scroll region."
-  (let ((old-width (chomp-screen-width screen))
-        (old-height (chomp-screen-height screen))
-        (old-lines (chomp-screen-lines screen)))
+  (let ((old-width (ebb-screen-width screen))
+        (old-height (ebb-screen-height screen))
+        (old-lines (ebb-screen-lines screen)))
 
     ;; Phase 1: Flatten wrapped lines into logical lines.
-    ;; A sequence of physical lines where (chomp-line-wrapped line) is t
+    ;; A sequence of physical lines where (ebb-line-wrapped line) is t
     ;; is really one logical line that was auto-wrapped. Concatenate them.
-    (let ((logical-lines (chomp-screen--unwrap-lines old-lines old-width)))
+    (let ((logical-lines (ebb-screen--unwrap-lines old-lines old-width)))
 
       ;; Phase 2: Re-wrap logical lines to the new width.
-      (let ((new-lines (chomp-screen--rewrap-lines logical-lines new-width new-height)))
+      (let ((new-lines (ebb-screen--rewrap-lines logical-lines new-width new-height)))
 
         ;; Phase 3: Apply the new geometry.
-        (setf (chomp-screen-lines screen) new-lines)
-        (setf (chomp-screen-width screen) new-width)
-        (setf (chomp-screen-height screen) new-height)
+        (setf (ebb-screen-lines screen) new-lines)
+        (setf (ebb-screen-width screen) new-width)
+        (setf (ebb-screen-height screen) new-height)
 
         ;; Phase 4: Clamp cursor to new bounds.
-        (setf (chomp-screen-cursor-x screen)
-              (min (chomp-screen-cursor-x screen) (1- new-width)))
-        (setf (chomp-screen-cursor-y screen)
-              (min (chomp-screen-cursor-y screen) (1- new-height)))
+        (setf (ebb-screen-cursor-x screen)
+              (min (ebb-screen-cursor-x screen) (1- new-width)))
+        (setf (ebb-screen-cursor-y screen)
+              (min (ebb-screen-cursor-y screen) (1- new-height)))
 
         ;; Phase 5: Reset scroll region (standard terminal behavior on resize).
-        (setf (chomp-screen-scroll-top screen) 0)
-        (setf (chomp-screen-scroll-bottom screen) (1- new-height))
+        (setf (ebb-screen-scroll-top screen) 0)
+        (setf (ebb-screen-scroll-bottom screen) (1- new-height))
 
         ;; Phase 6: Mark all lines dirty.
-        (setf (chomp-screen-dirty-lines screen)
+        (setf (ebb-screen-dirty-lines screen)
               (number-sequence 0 (1- new-height)))))))
 
-(defun chomp-screen--unwrap-lines (lines _old-width)
+(defun ebb-screen--unwrap-lines (lines _old-width)
   "Merge sequences of wrapped physical lines into logical lines.
 Returns a list of (cells . wrapped-p) where cells is a concatenated vector."
   (let ((result nil)
@@ -1300,8 +1300,8 @@ Returns a list of (cells . wrapped-p) where cells is a concatenated vector."
     (dotimes (i (length lines))
       (let ((line (aref lines i)))
         (setq current-cells
-              (vconcat (or current-cells []) (chomp-line-cells line)))
-        (unless (chomp-line-wrapped line)
+              (vconcat (or current-cells []) (ebb-line-cells line)))
+        (unless (ebb-line-wrapped line)
           ;; End of a logical line
           (push (cons current-cells nil) result)
           (setq current-cells nil))))
@@ -1310,7 +1310,7 @@ Returns a list of (cells . wrapped-p) where cells is a concatenated vector."
       (push (cons current-cells t) result))
     (nreverse result)))
 
-(defun chomp-screen--rewrap-lines (logical-lines new-width new-height)
+(defun ebb-screen--rewrap-lines (logical-lines new-width new-height)
   "Re-wrap LOGICAL-LINES to NEW-WIDTH, producing a vector of NEW-HEIGHT lines."
   (let ((physical nil))
     ;; Break each logical line into chunks of new-width
@@ -1319,8 +1319,8 @@ Returns a list of (cells . wrapped-p) where cells is a concatenated vector."
              (len (length cells)))
         (if (<= len new-width)
             ;; Fits on one line, pad to new-width
-            (push (make-chomp-line
-                   :cells (chomp-screen--pad-cells cells new-width)
+            (push (make-ebb-line
+                   :cells (ebb-screen--pad-cells cells new-width)
                    :wrapped nil :dirty t)
                   physical)
           ;; Must wrap: split into chunks
@@ -1329,8 +1329,8 @@ Returns a list of (cells . wrapped-p) where cells is a concatenated vector."
               (let* ((end (min (+ offset new-width) len))
                      (chunk (seq-subseq cells offset end))
                      (last-chunk (>= end len)))
-                (push (make-chomp-line
-                       :cells (chomp-screen--pad-cells chunk new-width)
+                (push (make-ebb-line
+                       :cells (ebb-screen--pad-cells chunk new-width)
                        :wrapped (not last-chunk) :dirty t)
                       physical)
                 (setq offset end)))))))
@@ -1345,21 +1345,21 @@ Returns a list of (cells . wrapped-p) where cells is a concatenated vector."
         ;; Fewer lines: pad with empty lines at the bottom
         (vconcat physical
                  (cl-loop repeat (- new-height count)
-                          collect (chomp-screen--make-empty-line new-width))))
+                          collect (ebb-screen--make-empty-line new-width))))
        (t (vconcat physical))))))
 ```
 
 ---
 
-## 10. Module 7: chomp-sixel -- Inline Images
+## 10. Module 7: ebb-sixel -- Inline Images
 
 ### 10.1 Sixel Accumulator
 
 Sixel data arrives byte-by-byte within a DCS sequence. The parser calls into
-chomp-sixel for each byte:
+ebb-sixel for each byte:
 
 ```elisp
-(cl-defstruct chomp-sixel-state
+(cl-defstruct ebb-sixel-state
   (pixels nil)            ;; 2D pixel array (vector of vectors)
   (width 0)               ;; current image width
   (height 0)              ;; current image height
@@ -1369,20 +1369,20 @@ chomp-sixel for each byte:
   (palette nil)           ;; vector of 256 color values (RGB)
   (repeat-count 1))       ;; pending repeat count
 
-(defun chomp-sixel-feed-byte (state byte)
+(defun ebb-sixel-feed-byte (state byte)
   "Process one byte of Sixel data."
   (cond
    ((<= ?~ byte ?~) nil) ;; shouldn't happen, but defensive
    ((<= ?? byte ?~)      ;; Sixel data byte
-    (chomp-sixel--write-sixel state byte (chomp-sixel-state-repeat-count state))
-    (setf (chomp-sixel-state-repeat-count state) 1))
+    (ebb-sixel--write-sixel state byte (ebb-sixel-state-repeat-count state))
+    (setf (ebb-sixel-state-repeat-count state) 1))
    ((= byte ?!)          ;; Run-length encoding prefix
-    (setf (chomp-sixel-state-repeat-count state) 0)) ;; next digits set it
+    (setf (ebb-sixel-state-repeat-count state) 0)) ;; next digits set it
    ((= byte ?$)          ;; Graphics carriage return
-    (setf (chomp-sixel-state-x state) 0))
+    (setf (ebb-sixel-state-x state) 0))
    ((= byte ?-)          ;; Graphics new line
-    (setf (chomp-sixel-state-x state) 0)
-    (cl-incf (chomp-sixel-state-y state)))
+    (setf (ebb-sixel-state-x state) 0)
+    (cl-incf (ebb-sixel-state-y state)))
    ((= byte ?#)          ;; Color introducer (followed by params)
     ...)
    ;; digits go to repeat count or color params depending on sub-state
@@ -1395,61 +1395,61 @@ Same as eat: XPM, SVG, half-block, background, none. Configurable preference lis
 
 ---
 
-## 11. Module 8: chomp-eshell -- Eshell Integration
+## 11. Module 8: ebb-eshell -- Eshell Integration
 
 ### 11.1 Visual Command Mode
 
 ```elisp
-(define-minor-mode chomp-eshell-visual-command-mode
-  "Use chomp instead of term.el for visual commands in Eshell."
+(define-minor-mode ebb-eshell-visual-command-mode
+  "Use ebb instead of term.el for visual commands in Eshell."
   :global t
-  (if chomp-eshell-visual-command-mode
-      (advice-add 'eshell-exec-visual :override #'chomp-eshell--exec-visual)
-    (advice-remove 'eshell-exec-visual #'chomp-eshell--exec-visual)))
+  (if ebb-eshell-visual-command-mode
+      (advice-add 'eshell-exec-visual :override #'ebb-eshell--exec-visual)
+    (advice-remove 'eshell-exec-visual #'ebb-eshell--exec-visual)))
 ```
 
 ### 11.2 Full Terminal in Eshell
 
 ```elisp
-(define-minor-mode chomp-eshell-mode
-  "Enable chomp terminal emulation inside Eshell."
+(define-minor-mode ebb-eshell-mode
+  "Enable ebb terminal emulation inside Eshell."
   :global t
-  (if chomp-eshell-mode
+  (if ebb-eshell-mode
       (progn
-        (add-hook 'eshell-mode-hook #'chomp-eshell--setup)
-        (add-hook 'eshell-output-filter-functions #'chomp-eshell--output-filter))
-    (remove-hook 'eshell-mode-hook #'chomp-eshell--setup)
-    (remove-hook 'eshell-output-filter-functions #'chomp-eshell--output-filter)))
+        (add-hook 'eshell-mode-hook #'ebb-eshell--setup)
+        (add-hook 'eshell-output-filter-functions #'ebb-eshell--output-filter))
+    (remove-hook 'eshell-mode-hook #'ebb-eshell--setup)
+    (remove-hook 'eshell-output-filter-functions #'ebb-eshell--output-filter)))
 ```
 
 ---
 
-## 12. Module 9: chomp.el -- Entry Points & Mode
+## 12. Module 9: ebb.el -- Entry Points & Mode
 
 ### 12.1 Interactive Commands
 
 ```elisp
-(defun chomp (&optional program arg)
+(defun ebb (&optional program arg)
   "Start a terminal emulator."
   (interactive)
   ...)
 
-(defun chomp-other-window (&optional program arg) ...)
-(defun chomp-project (&optional arg) ...)
+(defun ebb-other-window (&optional program arg) ...)
+(defun ebb-project (&optional arg) ...)
 ```
 
 ### 12.2 Major Mode
 
 ```elisp
-(define-derived-mode chomp-mode fundamental-mode "Chomp"
-  "Major mode for the chomp terminal emulator."
+(define-derived-mode ebb-mode fundamental-mode "Ebb"
+  "Major mode for the ebb terminal emulator."
   (setq-local buffer-read-only t)
   (setq-local buffer-undo-list t)        ;; Never record undo
   (setq-local truncate-lines t)
   (setq-local scroll-margin 0)
-  (setq-local chomp--io (make-chomp-io))
+  (setq-local ebb--io (make-ebb-io))
   ;; Resize hook: coordinates screen model, PTY, and renderer (see 9.6)
-  (chomp-io--setup-resize-hook chomp--io (current-buffer))
+  (ebb-io--setup-resize-hook ebb--io (current-buffer))
   ;; ... setup keymaps, input mode, shell integration, etc.
   )
 ```
@@ -1457,33 +1457,33 @@ Same as eat: XPM, SVG, half-block, background, none. Configurable preference lis
 ### 12.3 Window/Buffer Management
 
 ```elisp
-(defcustom chomp-kill-buffer-on-exit nil ...)
-(defcustom chomp-buffer-name "*chomp*" ...)
-(defcustom chomp-default-shell nil ...)
-(defcustom chomp-query-before-kill 'auto ...)
-(defcustom chomp-show-title t ...)
-(defcustom chomp-scrollback-size 131072 ...)
+(defcustom ebb-kill-buffer-on-exit nil ...)
+(defcustom ebb-buffer-name "*ebb*" ...)
+(defcustom ebb-default-shell nil ...)
+(defcustom ebb-query-before-kill 'auto ...)
+(defcustom ebb-show-title t ...)
+(defcustom ebb-scrollback-size 131072 ...)
 ```
 
 ---
 
-## 13. Module 10: chomp-highlight -- Tree-sitter Content Highlighting
+## 13. Module 10: ebb-highlight -- Tree-sitter Content Highlighting
 
 A unique feature: syntax-highlight code that appears in terminal output. When you
 run `gcc` and get error messages with code snippets, or `git diff` with patch output,
-or `python script.py` and get a traceback -- chomp can apply language-aware
+or `python script.py` and get a traceback -- ebb can apply language-aware
 highlighting on top of the terminal's ANSI colors.
 
 ### 13.1 How It Works
 
-Content highlighting runs as an *optional post-render pass*. After `chomp-render`
-updates the buffer, `chomp-highlight` examines the visible text and applies
+Content highlighting runs as an *optional post-render pass*. After `ebb-render`
+updates the buffer, `ebb-highlight` examines the visible text and applies
 tree-sitter highlighting overlays. It never interferes with the terminal's own
 colors -- it only adds highlighting where the terminal output is unstyled (default
 foreground).
 
 ```elisp
-(cl-defstruct chomp-highlight-state
+(cl-defstruct ebb-highlight-state
   (enabled nil)            ;; master toggle
   (mode 'auto)             ;; 'auto, 'manual, or 'off
   (language nil)           ;; manually pinned language (symbol), or nil for auto
@@ -1493,16 +1493,16 @@ foreground).
   (debounce-timer nil)     ;; don't re-highlight on every render
   (last-command nil))      ;; the shell command that produced current output
 
-(defcustom chomp-highlight-mode 'auto
+(defcustom ebb-highlight-mode 'auto
   "When to apply syntax highlighting to terminal output.
 `auto' detects language from the running command.
-`manual' uses `chomp-highlight-language' only.
+`manual' uses `ebb-highlight-language' only.
 nil disables content highlighting entirely."
   :type '(choice (const :tag "Auto-detect from command" auto)
                  (const :tag "Manual language selection" manual)
                  (const :tag "Disabled" nil)))
 
-(defcustom chomp-highlight-languages
+(defcustom ebb-highlight-languages
   '(python ruby javascript typescript c cpp rust go java
     bash sh diff json yaml toml xml html css sql)
   "Languages to attempt for auto-detection.
@@ -1516,7 +1516,7 @@ The highlight module hooks into shell integration (OSC 51 command notification) 
 know what command is running. From the command string, it infers the language:
 
 ```elisp
-(defvar chomp-highlight--command-language-alist
+(defvar ebb-highlight--command-language-alist
   '(;; Direct interpreters
     ("python[23]?" . python)
     ("ruby"        . ruby)
@@ -1545,9 +1545,9 @@ know what command is running. From the command string, it infers the language:
     ("\\.sh "  . bash))
   "Map command patterns to tree-sitter language symbols.")
 
-(defun chomp-highlight--detect-language (command-string)
+(defun ebb-highlight--detect-language (command-string)
   "Infer tree-sitter language from COMMAND-STRING."
-  (cl-loop for (pattern . lang) in chomp-highlight--command-language-alist
+  (cl-loop for (pattern . lang) in ebb-highlight--command-language-alist
            when (string-match-p pattern command-string)
            return lang))
 ```
@@ -1558,42 +1558,42 @@ The key constraint: terminal ANSI colors take precedence. Highlighting only appl
 to text regions with no explicit foreground color (i.e., default terminal foreground).
 
 ```elisp
-(defun chomp-highlight--apply (hl-state buffer display-start display-end)
+(defun ebb-highlight--apply (hl-state buffer display-start display-end)
   "Apply tree-sitter highlighting to BUFFER between DISPLAY-START and DISPLAY-END.
 Only highlights regions where no terminal foreground color is set."
-  (let* ((lang (or (chomp-highlight-state-language hl-state)
-                   (chomp-highlight-state-detected-lang hl-state)))
-         (parser (chomp-highlight--get-parser hl-state lang)))
+  (let* ((lang (or (ebb-highlight-state-language hl-state)
+                   (ebb-highlight-state-detected-lang hl-state)))
+         (parser (ebb-highlight--get-parser hl-state lang)))
     (when parser
       ;; Remove old overlays
-      (chomp-highlight--clear-overlays hl-state)
+      (ebb-highlight--clear-overlays hl-state)
       ;; Get tree-sitter highlights
       (with-current-buffer buffer
         (let* ((root (treesit-parser-root-node parser))
-               (query (chomp-highlight--get-query lang))
+               (query (ebb-highlight--get-query lang))
                (captures (treesit-query-capture root query display-start display-end)))
           (dolist (capture captures)
             (let* ((node (cdr capture))
                    (name (car capture))
                    (start (treesit-node-start node))
                    (end (treesit-node-end node))
-                   (face (chomp-highlight--capture-to-face name)))
+                   (face (ebb-highlight--capture-to-face name)))
               ;; Only apply if the region has no terminal foreground
-              (when (and face (chomp-highlight--region-unstyled-p buffer start end))
+              (when (and face (ebb-highlight--region-unstyled-p buffer start end))
                 (let ((ov (make-overlay start end buffer)))
                   (overlay-put ov 'face face)
-                  (overlay-put ov 'chomp-highlight t)
+                  (overlay-put ov 'ebb-highlight t)
                   (overlay-put ov 'evaporate t)
-                  (push ov (chomp-highlight-state-overlays hl-state)))))))))))
+                  (push ov (ebb-highlight-state-overlays hl-state)))))))))))
 
-(defun chomp-highlight--region-unstyled-p (buffer start end)
+(defun ebb-highlight--region-unstyled-p (buffer start end)
   "Return non-nil if text in BUFFER from START to END has no terminal foreground."
   (with-current-buffer buffer
     (let ((pos start)
           (unstyled t))
       (while (and unstyled (< pos end))
         (let ((face (get-text-property pos 'face)))
-          (when (and face (chomp-highlight--has-foreground-p face))
+          (when (and face (ebb-highlight--has-foreground-p face))
             (setq unstyled nil)))
         (setq pos (next-single-property-change pos 'face nil end)))
       unstyled)))
@@ -1605,19 +1605,19 @@ Content highlighting is expensive relative to the render pass. It runs on a debo
 timer so it doesn't fire on every parse chunk during rapid output:
 
 ```elisp
-(defun chomp-highlight--schedule (hl-state buffer)
+(defun ebb-highlight--schedule (hl-state buffer)
   "Schedule a highlighting pass after output settles."
-  (when (chomp-highlight-state-enabled hl-state)
-    (when (chomp-highlight-state-debounce-timer hl-state)
-      (cancel-timer (chomp-highlight-state-debounce-timer hl-state)))
-    (setf (chomp-highlight-state-debounce-timer hl-state)
+  (when (ebb-highlight-state-enabled hl-state)
+    (when (ebb-highlight-state-debounce-timer hl-state)
+      (cancel-timer (ebb-highlight-state-debounce-timer hl-state)))
+    (setf (ebb-highlight-state-debounce-timer hl-state)
           (run-with-idle-timer
            0.15 nil
            (lambda ()
              (when (buffer-live-p buffer)
                (let ((win (get-buffer-window buffer)))
                  (when win
-                   (chomp-highlight--apply
+                   (ebb-highlight--apply
                     hl-state buffer
                     (window-start win)
                     (window-end win t))))))))))
@@ -1626,19 +1626,19 @@ timer so it doesn't fire on every parse chunk during rapid output:
 ### 13.5 User Interface
 
 ```elisp
-(defun chomp-highlight-toggle ()
-  "Toggle content highlighting in the current chomp buffer."
+(defun ebb-highlight-toggle ()
+  "Toggle content highlighting in the current ebb buffer."
   (interactive)
   ...)
 
-(defun chomp-highlight-set-language (lang)
+(defun ebb-highlight-set-language (lang)
   "Pin the highlighting language to LANG for this buffer."
   (interactive
    (list (intern (completing-read "Language: "
-                                  chomp-highlight-languages nil t))))
+                                  ebb-highlight-languages nil t))))
   ...)
 
-(defun chomp-highlight-auto ()
+(defun ebb-highlight-auto ()
   "Return to auto-detecting the language from commands."
   (interactive)
   ...)
@@ -1649,10 +1649,10 @@ timer so it doesn't fire on every parse chunk during rapid output:
 The render module calls into highlighting at the end of each render pass:
 
 ```elisp
-;; In chomp-render-refresh, after updating dirty lines:
-(when (and chomp-highlight-state
-           (chomp-highlight-state-enabled chomp-highlight-state))
-  (chomp-highlight--schedule chomp-highlight-state buffer))
+;; In ebb-render-refresh, after updating dirty lines:
+(when (and ebb-highlight-state
+           (ebb-highlight-state-enabled ebb-highlight-state))
+  (ebb-highlight--schedule ebb-highlight-state buffer))
 ```
 
 This keeps highlighting decoupled -- the render module doesn't need to know about
@@ -1668,33 +1668,33 @@ Reuse eat's terminfo definitions (`eat.ti`) directly. The terminal types
 (`eat-mono`, `eat-color`, `eat-256color`, `eat-truecolor`) are stable and
 well-tested. No reason to reinvent them.
 
-Alternatively, create `chomp-*` aliases that use the same capability definitions.
+Alternatively, create `ebb-*` aliases that use the same capability definitions.
 This allows diverging later without breaking eat users.
 
 ### 14.2 Shell Integration Scripts
 
 Reuse eat's bash and zsh integration scripts unchanged. They use OSC 51 with the
-`e;` namespace. Our OSC 51 handler in `chomp-shell.el` speaks the same protocol.
+`e;` namespace. Our OSC 51 handler in `ebb-shell.el` speaks the same protocol.
 
 Add fish integration (eat's PR #133 has been waiting 2+ years):
 
 ```fish
 # integration/fish
-function __chomp_precmd --on-event fish_prompt
+function __ebb_precmd --on-event fish_prompt
     printf '\e]51;e;H;%d\e\\' $status
     printf '\e]51;e;J\e\\'
     printf '\e]51;e;A;%s;%s\e\\' (echo -n $hostname | base64) (echo -n $PWD | base64)
     printf '\e]2;%s@%s:%s\$\e\\' $USER $hostname (prompt_pwd)
 end
 
-function __chomp_preexec --on-event fish_preexec
+function __ebb_preexec --on-event fish_preexec
     set -l cmd (echo -n $argv | base64)
     printf '\e]51;e;F;%s\e\\' $cmd
     printf '\e]51;e;G\e\\'
 end
 
 # PS1 wrapper via fish_prompt event
-function __chomp_prompt_start --on-event fish_prompt
+function __ebb_prompt_start --on-event fish_prompt
     printf '\e]51;e;B\e\\'
 end
 # ... (emit C after the prompt)
@@ -1709,53 +1709,53 @@ end
 The screen model is pure data. Test it by feeding operations and asserting state:
 
 ```elisp
-(ert-deftest chomp-test-cursor-move-clamp ()
+(ert-deftest ebb-test-cursor-move-clamp ()
   "Cursor movement clamps to screen bounds."
-  (let ((screen (chomp-screen-create 20 6)))
-    (chomp-screen-cursor-goto screen 0 0)
-    (chomp-screen-cursor-move screen 'up 100)
-    (should (= 0 (chomp-screen-cursor-y screen)))
-    (chomp-screen-cursor-move screen 'left 100)
-    (should (= 0 (chomp-screen-cursor-x screen)))))
+  (let ((screen (ebb-screen-create 20 6)))
+    (ebb-screen-cursor-goto screen 0 0)
+    (ebb-screen-cursor-move screen 'up 100)
+    (should (= 0 (ebb-screen-cursor-y screen)))
+    (ebb-screen-cursor-move screen 'left 100)
+    (should (= 0 (ebb-screen-cursor-x screen)))))
 
-(ert-deftest chomp-test-resize-reflows-wrapped-lines ()
+(ert-deftest ebb-test-resize-reflows-wrapped-lines ()
   "Resize correctly reflows wrapped content."
-  (let ((screen (chomp-screen-create 10 4)))
+  (let ((screen (ebb-screen-create 10 4)))
     ;; Write a 15-char string at 10 columns → wraps to 2 lines
     (dotimes (i 15)
-      (chomp-screen-write-char screen (+ ?a i)))
-    (should (eq t (chomp-line-wrapped (chomp-screen-get-line screen 0))))
+      (ebb-screen-write-char screen (+ ?a i)))
+    (should (eq t (ebb-line-wrapped (ebb-screen-get-line screen 0))))
     ;; Widen to 20 columns → should unwrap to 1 line
-    (chomp-screen-resize screen 20 4)
-    (should (eq nil (chomp-line-wrapped (chomp-screen-get-line screen 0))))
+    (ebb-screen-resize screen 20 4)
+    (should (eq nil (ebb-line-wrapped (ebb-screen-get-line screen 0))))
     ;; Narrow to 5 columns → should wrap to 3 lines
-    (chomp-screen-resize screen 5 4)
-    (should (eq t (chomp-line-wrapped (chomp-screen-get-line screen 0))))
-    (should (eq t (chomp-line-wrapped (chomp-screen-get-line screen 1))))
-    (should (eq nil (chomp-line-wrapped (chomp-screen-get-line screen 2))))))
+    (ebb-screen-resize screen 5 4)
+    (should (eq t (ebb-line-wrapped (ebb-screen-get-line screen 0))))
+    (should (eq t (ebb-line-wrapped (ebb-screen-get-line screen 1))))
+    (should (eq nil (ebb-line-wrapped (ebb-screen-get-line screen 2))))))
 
-(ert-deftest chomp-test-resize-clamps-cursor ()
+(ert-deftest ebb-test-resize-clamps-cursor ()
   "Resize clamps cursor to new bounds."
-  (let ((screen (chomp-screen-create 80 24)))
-    (chomp-screen-cursor-goto screen 20 70)
-    (chomp-screen-resize screen 40 10)
-    (should (= 39 (chomp-screen-cursor-x screen)))  ;; clamped from 70
-    (should (= 9 (chomp-screen-cursor-y screen))))) ;; clamped from 20
+  (let ((screen (ebb-screen-create 80 24)))
+    (ebb-screen-cursor-goto screen 20 70)
+    (ebb-screen-resize screen 40 10)
+    (should (= 39 (ebb-screen-cursor-x screen)))  ;; clamped from 70
+    (should (= 9 (ebb-screen-cursor-y screen))))) ;; clamped from 20
 
-(ert-deftest chomp-test-resize-resets-scroll-region ()
+(ert-deftest ebb-test-resize-resets-scroll-region ()
   "Resize resets scroll region to full screen."
-  (let ((screen (chomp-screen-create 80 24)))
-    (chomp-screen-set-scroll-region screen 5 15)
-    (chomp-screen-resize screen 80 30)
-    (should (= 0 (chomp-screen-scroll-top screen)))
-    (should (= 29 (chomp-screen-scroll-bottom screen)))))
+  (let ((screen (ebb-screen-create 80 24)))
+    (ebb-screen-set-scroll-region screen 5 15)
+    (ebb-screen-resize screen 80 30)
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 29 (ebb-screen-scroll-bottom screen)))))
 
-(ert-deftest chomp-test-resize-marks-all-dirty ()
+(ert-deftest ebb-test-resize-marks-all-dirty ()
   "After resize, every line is marked dirty."
-  (let ((screen (chomp-screen-create 80 24)))
-    (chomp-screen-clear-dirty screen)
-    (chomp-screen-resize screen 100 30)
-    (should (= 30 (length (chomp-screen-get-dirty screen))))))
+  (let ((screen (ebb-screen-create 80 24)))
+    (ebb-screen-clear-dirty screen)
+    (ebb-screen-resize screen 100 30)
+    (should (= 30 (length (ebb-screen-get-dirty screen))))))
 ```
 
 ### 15.2 Parser Tests
@@ -1777,31 +1777,31 @@ Use `futur-blocking-wait-to-get-result` in tests (it's acceptable in test contex
 
 #### 15.6 Tree-sitter Backend Tests
 
-Run the *entire* test suite twice: once with `chomp-use-tree-sitter` set to nil
+Run the *entire* test suite twice: once with `ebb-use-tree-sitter` set to nil
 (Elisp backend) and once with it set to `always` (tree-sitter backend). Both must
 produce identical screen model state. Automated via:
 
 ```elisp
-(defmacro chomp-test-with-both-backends (&rest body)
+(defmacro ebb-test-with-both-backends (&rest body)
   "Run BODY once with Elisp parser, once with tree-sitter parser.
 Both runs must produce the same result."
   `(dolist (backend '(nil always))
-     (let ((chomp-use-tree-sitter backend))
-       (when (or (null backend) (chomp-parse-ts-available-p))
+     (let ((ebb-use-tree-sitter backend))
+       (when (or (null backend) (ebb-parse-ts-available-p))
          ,@body))))
 ```
 
 #### 15.7 Content Highlighting Tests
 
 ```elisp
-(ert-deftest chomp-test-highlight-auto-detect ()
+(ert-deftest ebb-test-highlight-auto-detect ()
   "Language detection from command string works."
-  (should (eq (chomp-highlight--detect-language "python3 foo.py") 'python))
-  (should (eq (chomp-highlight--detect-language "git diff HEAD~3") 'diff))
-  (should (eq (chomp-highlight--detect-language "cargo build") 'rust))
-  (should (null (chomp-highlight--detect-language "ls -la"))))
+  (should (eq (ebb-highlight--detect-language "python3 foo.py") 'python))
+  (should (eq (ebb-highlight--detect-language "git diff HEAD~3") 'diff))
+  (should (eq (ebb-highlight--detect-language "cargo build") 'rust))
+  (should (null (ebb-highlight--detect-language "ls -la"))))
 
-(ert-deftest chomp-test-highlight-respects-ansi ()
+(ert-deftest ebb-test-highlight-respects-ansi ()
   "Highlighting overlays don't override terminal ANSI colors."
   ;; Set up a screen with some ANSI-colored text and some plain text
   ;; Run highlighting
@@ -1810,11 +1810,11 @@ Both runs must produce the same result."
 ```
 
 ```elisp
-(ert-deftest chomp-test-binary-flood-no-hang ()
+(ert-deftest ebb-test-binary-flood-no-hang ()
   "Processing large binary data doesn't freeze Emacs."
-  (let ((io (make-chomp-io ...)))
+  (let ((io (make-ebb-io ...)))
     ;; Simulate receiving 1MB of random bytes
-    (chomp-io--filter io nil (make-string 1048576 0))
+    (ebb-io--filter io nil (make-string 1048576 0))
     ;; The test framework itself completing proves we didn't hang
     (should t)))
 ```
@@ -1825,7 +1825,7 @@ Both runs must produce the same result."
 
 ### Phase 1: Minimal Viable Terminal (Weeks 1-3) -- **COMPLETE**
 
-**Goal**: `M-x chomp` opens a shell, you can type commands, see output, it doesn't
+**Goal**: `M-x ebb` opens a shell, you can type commands, see output, it doesn't
 hang.
 
 **Status**: All 6 core files implemented. 42 unit tests passing. All C0 controls,
@@ -1835,19 +1835,19 @@ implemented. Async chunked I/O with timer-based scheduling (no futur.el dependen
 for now). Uses `TERM=xterm-256color`.
 
 Files written:
-1. `chomp-term.el` (~960 lines) -- Screen model with full operations: write char,
+1. `ebb-term.el` (~960 lines) -- Screen model with full operations: write char,
    cursor move, scroll, erase, resize, alt screen, save/restore, DEC graphics charset
-2. `chomp-parse.el` (~580 lines) -- Full VT state machine with O(1) CSI dispatch,
+2. `ebb-parse.el` (~580 lines) -- Full VT state machine with O(1) CSI dispatch,
    complete SGR handler (256-color + truecolor), all ESC/CSI/OSC/DCS sequences
-3. `chomp-render.el` (~350 lines) -- Dirty-line renderer with 256-color + truecolor
+3. `ebb-render.el` (~350 lines) -- Dirty-line renderer with 256-color + truecolor
    face conversion, scrollback rendering, cursor overlay
-4. `chomp-io.el` (~250 lines) -- Async I/O with timer-based chunked processing,
+4. `ebb-io.el` (~250 lines) -- Async I/O with timer-based chunked processing,
    latency management, binary flood detection, resize coordination
-5. `chomp-input.el` (~335 lines) -- Char/semi-char keymaps, full key translation
+5. `ebb-input.el` (~335 lines) -- Char/semi-char keymaps, full key translation
    (ASCII, control, meta, arrows, function keys, special keys, mouse, bracketed paste)
-6. `chomp.el` (~340 lines) -- `chomp-mode`, `M-x chomp`, process/window management,
+6. `ebb.el` (~340 lines) -- `ebb-mode`, `M-x ebb`, process/window management,
    event handling, input mode switching
-7. `chomp-test.el` (~370 lines) -- 42 unit tests covering screen model, parser, and
+7. `ebb-test.el` (~370 lines) -- 42 unit tests covering screen model, parser, and
    renderer
 
 **Checkpoint test**: Run `ls --color`, `htop`, `vim`, basic shell usage.
@@ -1871,12 +1871,12 @@ Add to input:
 - Focus events
 - Bracketed paste
 
-Tree-sitter VT grammar (`chomp-parse-ts.el` + `tree-sitter-vt/grammar.js`):
+Tree-sitter VT grammar (`ebb-parse-ts.el` + `tree-sitter-vt/grammar.js`):
 1. Write the tree-sitter grammar in `tree-sitter-vt/grammar.js`
 2. Write test corpus (`tree-sitter-vt/test/corpus/*.txt`) covering all sequence types
 3. Build and test the grammar standalone (`tree-sitter generate && tree-sitter test`)
-4. Write the Elisp bridge (`chomp-parse-ts.el`) with `treesit-parse-string` integration
-5. Add backend dispatch to `chomp-parse.el` (`chomp-use-tree-sitter` defcustom)
+4. Write the Elisp bridge (`ebb-parse-ts.el`) with `treesit-parse-string` integration
+5. Add backend dispatch to `ebb-parse.el` (`ebb-use-tree-sitter` defcustom)
 6. Run the full test suite with *both* backends, compare results
 7. Precompile grammar shared libraries for Linux x86_64, aarch64, macOS arm64/x86_64
 
@@ -1887,7 +1887,7 @@ Tree-sitter backend is measurably faster on the throughput benchmark.
 
 **Goal**: Feature parity with eat's shell integration.
 
-1. `chomp-shell.el` -- Full OSC 51 protocol handler
+1. `ebb-shell.el` -- Full OSC 51 protocol handler
 2. Shell integration scripts (bash, zsh, fish)
 3. Prompt annotation (margin overlays)
 4. Directory tracking
@@ -1900,13 +1900,13 @@ prompts, directory tracking works with `C-x C-f`.
 
 ### Phase 4: Eshell, Sixel, Content Highlighting, Polish (Weeks 10-13)
 
-1. `chomp-eshell.el` -- Visual command mode + full terminal in eshell
-2. `chomp-sixel.el` -- Sixel protocol with XPM/SVG/half-block rendering
-3. `chomp-highlight.el` -- Tree-sitter content highlighting:
+1. `ebb-eshell.el` -- Visual command mode + full terminal in eshell
+2. `ebb-sixel.el` -- Sixel protocol with XPM/SVG/half-block rendering
+3. `ebb-highlight.el` -- Tree-sitter content highlighting:
    a. Language auto-detection from shell command strings (via OSC 51 hook)
    b. Selective overlay application (only unstyled regions)
    c. Debounced highlighting (idle timer, not every render pass)
-   d. Interactive commands: `chomp-highlight-toggle`, `chomp-highlight-set-language`
+   d. Interactive commands: `ebb-highlight-toggle`, `ebb-highlight-set-language`
    e. Support for diff, Python, C, Rust, Go, JS/TS, Bash, JSON, YAML at minimum
 4. TRAMP support (auto terminfo deployment, remote directory tracking)
 5. Cursor blinking
@@ -1931,7 +1931,7 @@ prompts, directory tracking works with `C-x C-f`.
 
 ## 17. Full Escape Sequence Checklist
 
-Every sequence that eat handles, which chomp must also handle for feature parity.
+Every sequence that eat handles, which ebb must also handle for feature parity.
 
 ### C0 Control Characters
 

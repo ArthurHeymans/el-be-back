@@ -1,18 +1,18 @@
-# integration/bash --- Bash integration for chomp
+# integration/bash --- Bash integration for ebb
 
 # Copyright (C) 2026
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# Shell integration for chomp terminal emulator.
+# Shell integration for ebb terminal emulator.
 # Compatible with eat's OSC 51 protocol.
 
-__chomp_prompt_command () {
+__ebb_prompt_command () {
   # Send exit status.
-  if test -n "$__chomp_current_command"
+  if test -n "$__ebb_current_command"
   then
-    printf '\e]51;e;H;%i\e\\' "$__chomp_exit_status"
+    printf '\e]51;e;H;%i\e\\' "$__ebb_exit_status"
   fi
-  __chomp_current_command=""
+  __ebb_current_command=""
   # Inform that a new prompt is going to be printed.
   printf '\e]51;e;J\e\\'
   # Send the current working directory, for directory tracking.
@@ -24,60 +24,60 @@ __chomp_prompt_command () {
          "$(test $UID -eq 0 && echo '#' || echo '$')"
 }
 
-__chomp_preexec () {
+__ebb_preexec () {
   # Get the real command typed by the user from the history.
-  __chomp_current_command="$(history 1 | sed 's/ *[0-9]* *//')"
+  __ebb_current_command="$(history 1 | sed 's/ *[0-9]* *//')"
   # Send current command.
   printf '\e]51;e;F;%s\e\\' \
-         "$(printf "%s" "$__chomp_current_command" | base64)"
+         "$(printf "%s" "$__ebb_current_command" | base64)"
   # Send pre-exec sequence.
   printf '\e]51;e;G\e\\'
   # Update title to include the command running.
   printf '\e]2;%s@%s:%s%s %s\e\\' "$USER" "$HOSTNAME" \
          "${PWD/$HOME/'~'}" \
          "$(test $UID -eq 0 && echo '#' || echo '$')" \
-         "$__chomp_current_command"
+         "$__ebb_current_command"
 }
 
-__chomp_before_prompt_command ()
+__ebb_before_prompt_command ()
 {
-  __chomp_exit_status="$?"
-  __chomp_inhibit_preexec=yes
+  __ebb_exit_status="$?"
+  __ebb_inhibit_preexec=yes
 }
 
-__chomp_after_prompt_command ()
+__ebb_after_prompt_command ()
 {
-  __chomp_inhibit_preexec=no
+  __ebb_inhibit_preexec=no
 }
 
-__chomp_before_exec () {
-  if test $__chomp_inhibit_preexec = no \
-      && test "$BASH_COMMAND" != __chomp_before_prompt_command
+__ebb_before_exec () {
+  if test $__ebb_inhibit_preexec = no \
+      && test "$BASH_COMMAND" != __ebb_before_prompt_command
   then
-    __chomp_inhibit_preexec=yes
-    __chomp_preexec
+    __ebb_inhibit_preexec=yes
+    __ebb_preexec
   fi
 }
 
-__chomp_enable_integration ()
+__ebb_enable_integration ()
 {
-  __chomp_integration_enabled=yes
-  __chomp_current_command=""
-  __chomp_exit_status=0
-  __chomp_inhibit_preexec=yes
-  local __chomp_prompt_start='\e]51;e;B\e\\'
-  local __chomp_prompt_end='\e]51;e;C\e\\'
-  local __chomp_continuation_start='\e]51;e;D\e\\'
-  local __chomp_continuation_end='\e]51;e;E\e\\'
-  PS1="\[$__chomp_prompt_start\]$PS1\[$__chomp_prompt_end\]"
-  PS2="\[$__chomp_continuation_start\]$PS2\[$__chomp_continuation_end\]"
-  PROMPT_COMMAND+=(__chomp_prompt_command)
-  trap '__chomp_before_exec' DEBUG
-  PROMPT_COMMAND+=(__chomp_after_prompt_command)
-  PROMPT_COMMAND=(__chomp_before_prompt_command "${PROMPT_COMMAND[@]}")
+  __ebb_integration_enabled=yes
+  __ebb_current_command=""
+  __ebb_exit_status=0
+  __ebb_inhibit_preexec=yes
+  local __ebb_prompt_start='\e]51;e;B\e\\'
+  local __ebb_prompt_end='\e]51;e;C\e\\'
+  local __ebb_continuation_start='\e]51;e;D\e\\'
+  local __ebb_continuation_end='\e]51;e;E\e\\'
+  PS1="\[$__ebb_prompt_start\]$PS1\[$__ebb_prompt_end\]"
+  PS2="\[$__ebb_continuation_start\]$PS2\[$__ebb_continuation_end\]"
+  PROMPT_COMMAND+=(__ebb_prompt_command)
+  trap '__ebb_before_exec' DEBUG
+  PROMPT_COMMAND+=(__ebb_after_prompt_command)
+  PROMPT_COMMAND=(__ebb_before_prompt_command "${PROMPT_COMMAND[@]}")
 }
 
-_chomp_msg () {
+_ebb_msg () {
   local msg=$'\e]51;e;M'
   for _ in $(eval "echo {1..$#}")
   do
@@ -88,10 +88,10 @@ _chomp_msg () {
 }
 
 # Enable.
-if test -z "$__chomp_integration_enabled" && \
-    { test "${TERM:0:6}" = "chomp-" || test "${TERM:0:4}" = "eat-"; }
+if test -z "$__ebb_integration_enabled" && \
+    { test "${TERM:0:6}" = "ebb-" || test "${TERM:0:4}" = "eat-"; }
 then
-  __chomp_enable_integration
+  __ebb_enable_integration
 else
   true
 fi

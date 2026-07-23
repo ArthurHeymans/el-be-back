@@ -1,4 +1,4 @@
-;;; chomp.el --- Terminal emulator for Emacs -*- lexical-binding: t; -*-
+;;; ebb.el --- Terminal emulator for Emacs -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 ;; Author: Arthur
@@ -9,11 +9,11 @@
 
 ;;; Commentary:
 
-;; Chomp is a terminal emulator for Emacs.  It uses a separated screen
+;; Ebb is a terminal emulator for Emacs.  It uses a separated screen
 ;; model (pure data structure) and async I/O to ensure the main thread
 ;; never hangs.
 ;;
-;; Usage:  M-x chomp
+;; Usage:  M-x ebb
 
 ;;; Code:
 
@@ -22,35 +22,35 @@
 (require 'project)
 (require 'bookmark)
 (require 'face-remap)
-(require 'chomp-term)
-(require 'chomp-parse)
-(require 'chomp-render)
-(require 'chomp-input)
-(require 'chomp-io)
-(require 'chomp-shell)
+(require 'ebb-term)
+(require 'ebb-parse)
+(require 'ebb-render)
+(require 'ebb-input)
+(require 'ebb-io)
+(require 'ebb-shell)
 
 (declare-function notifications-notify "notifications")
 
 ;;;; ---- Customization --------------------------------------------------
 
-(defgroup chomp nil
+(defgroup ebb nil
   "Terminal emulator."
   :group 'processes
-  :prefix "chomp-")
+  :prefix "ebb-")
 
-(defcustom chomp-buffer-name "*chomp*"
-  "Default buffer name for chomp terminals."
+(defcustom ebb-buffer-name "*ebb*"
+  "Default buffer name for ebb terminals."
   :type 'string
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-default-shell nil
+(defcustom ebb-default-shell nil
   "Shell to run.  nil means use `$SHELL' or `shell-file-name'.
 For best shell integration, set this to your interactive shell
 \(e.g., \"/usr/bin/fish\") if it differs from `$SHELL'."
   :type '(choice (const nil) string)
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-tramp-shells
+(defcustom ebb-tramp-shells
   '(("ssh" login-shell)
     ("sshx" login-shell)
     ("scp" login-shell)
@@ -66,61 +66,61 @@ after FALLBACK are extra shell arguments; when none are given,
 recognized shells (bash, zsh, fish) start login+interactive
 \(`-l -i') so they source the user's rc/profile files."
   :type '(alist :key-type (choice string (const t)) :value-type sexp)
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-tramp-default-method nil
+(defcustom ebb-tramp-default-method nil
   "TRAMP method for remote paths built from OSC 7 directory reports.
 Used when the shell reports a non-local hostname and the buffer's
 `default-directory' has no existing remote prefix.  nil means use
 `tramp-default-method'."
   :type '(choice (const :tag "Use tramp-default-method" nil) string)
-  :group 'chomp)
+  :group 'ebb)
 
 (defvar tramp-default-method)
 
-(defcustom chomp-kill-buffer-on-exit t
+(defcustom ebb-kill-buffer-on-exit t
   "If non-nil, kill the buffer when the shell process exits.
-With the default of t, Ctrl-D / shell exit closes the chomp buffer."
+With the default of t, Ctrl-D / shell exit closes the ebb buffer."
   :type 'boolean
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-detect-password-prompts t
+(defcustom ebb-detect-password-prompts t
   "If non-nil, open `read-passwd' when the cursor row looks like a password prompt."
   :type 'boolean
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-password-prompt-regex comint-password-prompt-regexp
+(defcustom ebb-password-prompt-regex comint-password-prompt-regexp
   "Regex matched against the cursor row to detect a password prompt."
   :type 'regexp
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-password-prompt-debounce 0.2
+(defcustom ebb-password-prompt-debounce 0.2
   "Seconds to wait after detecting a password prompt before opening `read-passwd'."
   :type 'number
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-password-prompt-functions
-  '(chomp--default-password-source)
+(defcustom ebb-password-prompt-functions
+  '(ebb--default-password-source)
   "Sources tried in order when a password is needed.
 Each function receives the cursor-row text (or nil) and should return a
 password string or nil to try the next source."
   :type 'hook
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-query-before-kill 'auto
+(defcustom ebb-query-before-kill 'auto
   "Whether to query before killing a buffer with a running process.
 `auto' queries only if the process is running.  t always queries."
   :type '(choice (const :tag "Auto" auto)
                  (const :tag "Always" t)
                  (const :tag "Never" nil))
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-show-title t
+(defcustom ebb-show-title t
   "If non-nil, track OSC titles for buffer naming when using title mode."
   :type 'boolean
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-buffer-name-function #'chomp-buffer-name-by-directory
+(defcustom ebb-buffer-name-function #'ebb-buffer-name-by-directory
   "Function that maps OSC title + `default-directory' to a buffer name.
 Called with the latest OSC title string (may be nil).  Return a name, or
 nil to leave the buffer name alone.  Set to nil to disable auto-rename.
@@ -130,131 +130,131 @@ buffers show an abbreviated path without the hostname; remote paths keep
 the TRAMP host."
   :type '(choice (const :tag "Disabled" nil)
                  (function-item :tag "By directory"
-                                chomp-buffer-name-by-directory)
+                                ebb-buffer-name-by-directory)
                  (function-item :tag "By title"
-                                chomp-buffer-name-by-title)
+                                ebb-buffer-name-by-title)
                  function)
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-scrollback-lines 10000
+(defcustom ebb-scrollback-lines 10000
   "Maximum number of unwrapped logical scrollback lines."
   :type 'integer
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-default-input-mode 'semi-char
+(defcustom ebb-default-input-mode 'semi-char
   "Default input mode when opening a terminal.
 Options: `char', `semi-char', `emacs'."
   :type '(choice (const char) (const semi-char) (const emacs))
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-notification-function #'chomp--default-notification
+(defcustom ebb-notification-function #'ebb--default-notification
   "Function called asynchronously with notification TITLE and BODY."
   :type '(choice (const nil) function)
-  :group 'chomp)
+  :group 'ebb)
 
-(defcustom chomp-progress-function #'chomp--default-progress
+(defcustom ebb-progress-function #'ebb--default-progress
   "Function called with normalized progress STATE and PERCENT."
   :type '(choice (const nil) function)
-  :group 'chomp)
+  :group 'ebb)
 
 ;;;; ---- Buffer-local Variables -----------------------------------------
 
-(defvar-local chomp--io nil "The chomp-io instance for this buffer.")
-(defvar-local chomp--screen nil "The chomp-screen for this buffer.")
-(defvar-local chomp--parser nil "The chomp-parser for this buffer.")
-(defvar-local chomp--render nil "The chomp-render-state for this buffer.")
-(defvar-local chomp--input-mode nil "Current input mode symbol.")
-(defvar-local chomp--session-id nil "Stable identity of this terminal session.")
-(defvar-local chomp--progress nil "Current terminal progress mode-line string.")
-(defvar-local chomp--mouse-drag-transient-map-exit nil
+(defvar-local ebb--io nil "The ebb-io instance for this buffer.")
+(defvar-local ebb--screen nil "The ebb-screen for this buffer.")
+(defvar-local ebb--parser nil "The ebb-parser for this buffer.")
+(defvar-local ebb--render nil "The ebb-render-state for this buffer.")
+(defvar-local ebb--input-mode nil "Current input mode symbol.")
+(defvar-local ebb--session-id nil "Stable identity of this terminal session.")
+(defvar-local ebb--progress nil "Current terminal progress mode-line string.")
+(defvar-local ebb--mouse-drag-transient-map-exit nil
   "Function that exits the active mouse drag transient map.")
 
-(defvar-local chomp--password-mode-p nil
+(defvar-local ebb--password-mode-p nil
   "Non-nil while a password prompt is active.")
-(defvar-local chomp--password-handled-y nil
+(defvar-local ebb--password-handled-y nil
   "Display row of the last handled password prompt, or nil.")
-(defvar-local chomp--password-confirm-timer nil
+(defvar-local ebb--password-confirm-timer nil
   "Pending debounce timer for password prompt detection.")
-(defvar-local chomp--password-prompt-active nil
+(defvar-local ebb--password-prompt-active nil
   "Non-nil while the password source chain is running.")
-(defvar-local chomp--title nil
+(defvar-local ebb--title nil
   "Last OSC title string reported by the shell.")
-(defvar-local chomp--managed-buffer-name nil
-  "Last buffer name set by chomp auto-rename, or nil if unmanaged.")
+(defvar-local ebb--managed-buffer-name nil
+  "Last buffer name set by ebb auto-rename, or nil if unmanaged.")
 
-(defvar chomp--focus-change-installed nil
-  "Non-nil when `chomp--focus-change' is installed globally.")
+(defvar ebb--focus-change-installed nil
+  "Non-nil when `ebb--focus-change' is installed globally.")
 
 ;;;; ---- Minor Modes for Input ------------------------------------------
 
-(define-minor-mode chomp--semi-char-mode
+(define-minor-mode ebb--semi-char-mode
   "Minor mode for semi-char input."
   :lighter " Semi"
-  :keymap chomp-semi-char-mode-map)
+  :keymap ebb-semi-char-mode-map)
 
-(define-minor-mode chomp--char-mode
+(define-minor-mode ebb--char-mode
   "Minor mode for char input."
   :lighter " Char"
-  :keymap chomp-char-mode-map)
+  :keymap ebb-char-mode-map)
 
-(define-minor-mode chomp--mouse-mode
+(define-minor-mode ebb--mouse-mode
   "Minor mode for forwarding DEC mouse events to the terminal."
   :lighter nil
-  :keymap chomp-mouse-mode-map)
+  :keymap ebb-mouse-mode-map)
 
 ;;;; ---- Input Mode Switching -------------------------------------------
 
-(defun chomp--refresh-input-cursor ()
+(defun ebb--refresh-input-cursor ()
   "Update native and terminal cursor visibility after an input-mode change."
-  (when chomp--render
-    (chomp-render--update-cursor chomp--render)))
+  (when ebb--render
+    (ebb-render--update-cursor ebb--render)))
 
-(defun chomp-semi-char-mode ()
+(defun ebb-semi-char-mode ()
   "Switch to semi-char input mode."
   (interactive)
-  (chomp--char-mode -1)
-  (chomp--semi-char-mode 1)
-  (setq chomp--input-mode 'semi-char)
-  (chomp--refresh-input-cursor)
+  (ebb--char-mode -1)
+  (ebb--semi-char-mode 1)
+  (setq ebb--input-mode 'semi-char)
+  (ebb--refresh-input-cursor)
   (force-mode-line-update))
 
-(defun chomp-char-mode ()
+(defun ebb-char-mode ()
   "Switch to char input mode (all keys to terminal)."
   (interactive)
-  (chomp--semi-char-mode -1)
-  (chomp--char-mode 1)
-  (setq chomp--input-mode 'char)
-  (chomp--refresh-input-cursor)
+  (ebb--semi-char-mode -1)
+  (ebb--char-mode 1)
+  (setq ebb--input-mode 'char)
+  (ebb--refresh-input-cursor)
   (force-mode-line-update))
 
-(defun chomp-emacs-mode ()
+(defun ebb-emacs-mode ()
   "Switch to Emacs input mode (normal Emacs keys)."
   (interactive)
-  (chomp--semi-char-mode -1)
-  (chomp--char-mode -1)
-  (setq chomp--input-mode 'emacs)
-  (chomp--refresh-input-cursor)
+  (ebb--semi-char-mode -1)
+  (ebb--char-mode -1)
+  (setq ebb--input-mode 'emacs)
+  (ebb--refresh-input-cursor)
   (force-mode-line-update))
 
 ;;;; ---- Self-Input Command ---------------------------------------------
 
-(defun chomp--require-running-terminal ()
+(defun ebb--require-running-terminal ()
   "Return the current terminal I/O state or signal `user-error'."
-  (unless (or (eq major-mode 'chomp-mode)
-              (bound-and-true-p chomp-eshell--io))
-    (user-error "Not in a Chomp buffer"))
-  (let ((process (and chomp--io (chomp-io-process chomp--io))))
+  (unless (or (eq major-mode 'ebb-mode)
+              (bound-and-true-p ebb-eshell--io))
+    (user-error "Not in a Ebb buffer"))
+  (let ((process (and ebb--io (ebb-io-process ebb--io))))
     (unless (and process (process-live-p process))
       (user-error "Process not running")))
-  chomp--io)
+  ebb--io)
 
 ;;;###autoload
-(defun chomp-send-string (string)
+(defun ebb-send-string (string)
   "Send STRING unchanged to the current terminal."
   (interactive "sSend string: ")
-  (chomp-io-send (chomp--require-running-terminal) string))
+  (ebb-io-send (ebb--require-running-terminal) string))
 
-(defun chomp--key-event (key modifiers)
+(defun ebb--key-event (key modifiers)
   "Return an Emacs key event for KEY and comma-separated MODIFIERS."
   (let* ((basic (cond ((characterp key) key)
                       ((and (stringp key) (= (length key) 1)) (aref key 0))
@@ -275,30 +275,30 @@ Options: `char', `semi-char', `emacs'."
     (if mods (event-convert-list (append mods (list basic))) basic)))
 
 ;;;###autoload
-(defun chomp-send-key (key &optional modifiers)
+(defun ebb-send-key (key &optional modifiers)
   "Send named KEY with comma-separated MODIFIERS to the current terminal."
   (interactive (list (read-string "Key: ")
                      (read-string "Modifiers (comma-separated): ")))
-  (let* ((io (chomp--require-running-terminal))
-         (sequence (chomp-input-translate
-                    (chomp--key-event key modifiers) chomp--screen)))
+  (let* ((io (ebb--require-running-terminal))
+         (sequence (ebb-input-translate
+                    (ebb--key-event key modifiers) ebb--screen)))
     (unless sequence
       (user-error "Unsupported key: %s" key))
-    (chomp-io-send io sequence)))
+    (ebb-io-send io sequence)))
 
 ;;;###autoload
-(defun chomp-paste-string (string)
+(defun ebb-paste-string (string)
   "Paste STRING, using bracketed paste when terminal mode 2004 is active."
   (interactive "sPaste string: ")
-  (let ((io (chomp--require-running-terminal)))
-    (chomp-io-send
+  (let ((io (ebb--require-running-terminal)))
+    (ebb-io-send
      io
-     (if (and chomp--screen (chomp-screen-bracketed-paste chomp--screen))
-         (concat (chomp-input-bracketed-paste-start) string
-                 (chomp-input-bracketed-paste-end))
+     (if (and ebb--screen (ebb-screen-bracketed-paste ebb--screen))
+         (concat (ebb-input-bracketed-paste-start) string
+                 (ebb-input-bracketed-paste-end))
        string))))
 
-(defun chomp-self-input (n &optional e)
+(defun ebb-self-input (n &optional e)
   "Send the key event E to the terminal N times.
 N defaults to 1, E defaults to `last-command-event'."
   (interactive
@@ -317,292 +317,292 @@ N defaults to 1, E defaults to `last-command-event'."
                  (aref (kbd (format "M-<%S>" last-command-event)) 0))
                 (t last-command-event))
              last-command-event))))
-  (when chomp--io
-    (let ((seq (chomp-input-translate (or e last-command-event) chomp--screen)))
+  (when ebb--io
+    (let ((seq (ebb-input-translate (or e last-command-event) ebb--screen)))
       (when seq
         (dotimes (_ (or n 1))
-          (chomp-io-send chomp--io seq))))))
+          (ebb-io-send ebb--io seq))))))
 
-(defun chomp-quoted-input ()
+(defun ebb-quoted-input ()
   "Read the next key event literally and send it to the terminal."
   (interactive)
-  (when chomp--io
+  (when ebb--io
     (let* ((key (read-event "Send key: "))
-           (seq (chomp-input-translate key chomp--screen)))
+           (seq (ebb-input-translate key ebb--screen)))
       (when seq
-        (chomp-io-send chomp--io seq)))))
+        (ebb-io-send ebb--io seq)))))
 
-(defun chomp-yank ()
+(defun ebb-yank ()
   "Yank (paste) from the kill ring into the terminal.
 If bracketed paste mode is active, wraps in bracketed paste sequences."
   (interactive)
-  (when chomp--io
+  (when ebb--io
     (let ((text (current-kill 0)))
       (when text
-        (chomp-paste-string text)))))
+        (ebb-paste-string text)))))
 
-(defun chomp-yank-pop ()
+(defun ebb-yank-pop ()
   "Yank-pop: replace the last yank with the next kill ring entry."
   (interactive)
-  (when chomp--io
+  (when ebb--io
     (current-kill 1)
     (let ((text (current-kill 0)))
       (when text
-        (chomp-paste-string text)))))
+        (ebb-paste-string text)))))
 
-(defun chomp-send-password (&optional password)
+(defun ebb-send-password (&optional password)
   "Read PASSWORD from the minibuffer and send it to the terminal.
 Interactively, this uses `read-passwd' so password keystrokes do not go through
 normal terminal input handling or appear in `view-lossage'."
   (interactive)
-  (unless chomp--io
+  (unless ebb--io
     (user-error "Process not running"))
   (let ((password (or password (read-passwd "Password: "))))
     (when password
-      (chomp-io-send chomp--io password)
-      (chomp-io-send chomp--io "\r"))))
+      (ebb-io-send ebb--io password)
+      (ebb-io-send ebb--io "\r"))))
 
 ;;;; ---- Password prompt detection -------------------------------------
 
-(defun chomp--cursor-row-text ()
+(defun ebb--cursor-row-text ()
   "Return trimmed text of the terminal cursor row, or nil."
-  (when chomp--screen
-    (let* ((y (chomp-screen-cursor-y chomp--screen))
-           (line (chomp-screen-get-line chomp--screen y))
-           (width (chomp-screen-width chomp--screen))
-           (text (or (chomp-line-text line)
-                     (and (chomp-line-cells line)
-                          (let ((cells (chomp-line-cells line))
+  (when ebb--screen
+    (let* ((y (ebb-screen-cursor-y ebb--screen))
+           (line (ebb-screen-get-line ebb--screen y))
+           (width (ebb-screen-width ebb--screen))
+           (text (or (ebb-line-text line)
+                     (and (ebb-line-cells line)
+                          (let ((cells (ebb-line-cells line))
                                 (out (make-string width ?\s)))
                             (dotimes (i (min width (length cells)))
-                              (aset out i (chomp-cell-char (aref cells i))))
+                              (aset out i (ebb-cell-char (aref cells i))))
                             out)))))
       (when text
         (let ((row (string-trim-right text)))
           (and (not (string-empty-p row)) row))))))
 
-(defun chomp--password-prompt-detected-p ()
-  "Return non-nil if the cursor row matches `chomp-password-prompt-regex'."
-  (when-let* ((row (chomp--cursor-row-text))
+(defun ebb--password-prompt-detected-p ()
+  "Return non-nil if the cursor row matches `ebb-password-prompt-regex'."
+  (when-let* ((row (ebb--cursor-row-text))
               (case-fold-search t))
-    (string-match-p chomp-password-prompt-regex row)))
+    (string-match-p ebb-password-prompt-regex row)))
 
-(defun chomp--default-password-source (row)
+(defun ebb--default-password-source (row)
   "Prompt with `read-passwd', labeling with ROW when available."
   (read-passwd (concat (or row "Password:") " ")))
 
-(defun chomp--cancel-password-confirm-timer ()
+(defun ebb--cancel-password-confirm-timer ()
   "Cancel a pending password-prompt debounce timer."
-  (when chomp--password-confirm-timer
-    (cancel-timer chomp--password-confirm-timer)
-    (setq chomp--password-confirm-timer nil)))
+  (when ebb--password-confirm-timer
+    (cancel-timer ebb--password-confirm-timer)
+    (setq ebb--password-confirm-timer nil)))
 
-(defun chomp--confirm-and-prompt (buf)
+(defun ebb--confirm-and-prompt (buf)
   "Re-check password detection in BUF, then open the password minibuffer."
   (when (buffer-live-p buf)
     (with-current-buffer buf
-      (setq chomp--password-confirm-timer nil)
-      (when (and chomp--password-mode-p
-                 (chomp--password-prompt-detected-p))
-        (chomp--prompt-password)))))
+      (setq ebb--password-confirm-timer nil)
+      (when (and ebb--password-mode-p
+                 (ebb--password-prompt-detected-p))
+        (ebb--prompt-password)))))
 
-(defun chomp--prompt-password ()
-  "Run `chomp-password-prompt-functions' and send the result to the PTY."
+(defun ebb--prompt-password ()
+  "Run `ebb-password-prompt-functions' and send the result to the PTY."
   (let ((pwd nil)
-        (row (chomp--cursor-row-text))
-        (y (and chomp--screen (chomp-screen-cursor-y chomp--screen))))
-    (setq chomp--password-prompt-active t)
+        (row (ebb--cursor-row-text))
+        (y (and ebb--screen (ebb-screen-cursor-y ebb--screen))))
+    (setq ebb--password-prompt-active t)
     (unwind-protect
         (setq pwd (run-hook-with-args-until-success
-                   'chomp-password-prompt-functions row))
-      (setq chomp--password-prompt-active nil)
-      (when (and pwd chomp--io)
+                   'ebb-password-prompt-functions row))
+      (setq ebb--password-prompt-active nil)
+      (when (and pwd ebb--io)
         ;; Send before clear-string; process-send-string may keep the string.
-        (chomp-io-send chomp--io (concat pwd "\r"))
+        (ebb-io-send ebb--io (concat pwd "\r"))
         (clear-string pwd))
-      (setq chomp--password-handled-y y
-            chomp--password-mode-p nil)
+      (setq ebb--password-handled-y y
+            ebb--password-mode-p nil)
       (force-mode-line-update))))
 
-(defun chomp--detect-password-prompt ()
+(defun ebb--detect-password-prompt ()
   "Watch the cursor row and open `read-passwd' on a password prompt.
 Called after each render.  Debounced so short-lived matches don't flash."
-  (when (and chomp-detect-password-prompts chomp--screen chomp--io
-             (not (eq chomp--input-mode 'emacs))
-             (not chomp--password-prompt-active))
-    (let ((now (chomp--password-prompt-detected-p))
-          (y (chomp-screen-cursor-y chomp--screen)))
+  (when (and ebb-detect-password-prompts ebb--screen ebb--io
+             (not (eq ebb--input-mode 'emacs))
+             (not ebb--password-prompt-active))
+    (let ((now (ebb--password-prompt-detected-p))
+          (y (ebb-screen-cursor-y ebb--screen)))
       (cond
        ((not now)
-        (chomp--cancel-password-confirm-timer)
-        (when (or chomp--password-mode-p chomp--password-handled-y)
-          (setq chomp--password-mode-p nil
-                chomp--password-handled-y nil)
+        (ebb--cancel-password-confirm-timer)
+        (when (or ebb--password-mode-p ebb--password-handled-y)
+          (setq ebb--password-mode-p nil
+                ebb--password-handled-y nil)
           (force-mode-line-update)))
-       (chomp--password-mode-p nil)
-       ((and chomp--password-handled-y
-             (= y chomp--password-handled-y))
+       (ebb--password-mode-p nil)
+       ((and ebb--password-handled-y
+             (= y ebb--password-handled-y))
         nil)
        (t
-        (setq chomp--password-mode-p t
-              chomp--password-handled-y nil)
+        (setq ebb--password-mode-p t
+              ebb--password-handled-y nil)
         (force-mode-line-update)
-        (chomp--cancel-password-confirm-timer)
-        (setq chomp--password-confirm-timer
-              (run-at-time chomp-password-prompt-debounce nil
-                           #'chomp--confirm-and-prompt
+        (ebb--cancel-password-confirm-timer)
+        (setq ebb--password-confirm-timer
+              (run-at-time ebb-password-prompt-debounce nil
+                           #'ebb--confirm-and-prompt
                            (current-buffer))))))))
 
-(defun chomp-mouse-input (event)
+(defun ebb-mouse-input (event)
   "Send mouse EVENT to the terminal when DEC mouse tracking is active."
   (interactive "e")
   (when-let ((win (posn-window (event-start event))))
     (when (windowp win)
       (select-window win)))
-  (when (and chomp--io chomp--screen chomp--render
-             (chomp-screen-mouse-mode chomp--screen))
+  (when (and ebb--io ebb--screen ebb--render
+             (ebb-screen-mouse-mode ebb--screen))
     (when (and (memq 'down (event-modifiers event))
-               (not chomp--mouse-drag-transient-map-exit))
+               (not ebb--mouse-drag-transient-map-exit))
       (let ((old-track-mouse track-mouse)
             (buffer (current-buffer)))
         (setq track-mouse 'dragging)
-        (setq chomp--mouse-drag-transient-map-exit
+        (setq ebb--mouse-drag-transient-map-exit
               (set-transient-map
-               chomp-mouse-mode-map
+               ebb-mouse-mode-map
                #'always
                (lambda ()
                  (when (buffer-live-p buffer)
                    (with-current-buffer buffer
                      (setq track-mouse old-track-mouse)
-                     (setq chomp--mouse-drag-transient-map-exit nil))))))))
-    (when-let ((seq (chomp-input-encode-mouse
-                     event chomp--screen
+                     (setq ebb--mouse-drag-transient-map-exit nil))))))))
+    (when-let ((seq (ebb-input-encode-mouse
+                     event ebb--screen
                      (marker-position
-                      (chomp-render-state-display-begin chomp--render)))))
-      (chomp-io-send chomp--io seq))
-    (when (and chomp--mouse-drag-transient-map-exit
-               (chomp-input--mouse-release-p event))
-      (funcall chomp--mouse-drag-transient-map-exit)
-      (setq chomp--mouse-drag-transient-map-exit nil))))
+                      (ebb-render-state-display-begin ebb--render)))))
+      (ebb-io-send ebb--io seq))
+    (when (and ebb--mouse-drag-transient-map-exit
+               (ebb-input--mouse-release-p event))
+      (funcall ebb--mouse-drag-transient-map-exit)
+      (setq ebb--mouse-drag-transient-map-exit nil))))
 
 ;;;; ---- Display Commands -----------------------------------------------
 
-(defun chomp--scroll-rows (arg)
+(defun ebb--scroll-rows (arg)
   "Return the row count represented by scroll command ARG."
   (if arg
       (prefix-numeric-value arg)
     (max 1 (- (window-body-height) next-screen-context-lines))))
 
-(defun chomp-scroll-up (&optional arg)
+(defun ebb-scroll-up (&optional arg)
   "Scroll forward through virtual terminal history by ARG rows."
   (interactive "P")
-  (if chomp--render
-      (chomp-render-scroll-history chomp--render (chomp--scroll-rows arg))
+  (if ebb--render
+      (ebb-render-scroll-history ebb--render (ebb--scroll-rows arg))
     (scroll-up-command arg)))
 
-(defun chomp-scroll-down (&optional arg)
+(defun ebb-scroll-down (&optional arg)
   "Scroll backward through virtual terminal history by ARG rows."
   (interactive "P")
-  (if chomp--render
-      (chomp-render-scroll-history chomp--render (- (chomp--scroll-rows arg)))
+  (if ebb--render
+      (ebb-render-scroll-history ebb--render (- (ebb--scroll-rows arg)))
     (scroll-down-command arg)))
 
-(defun chomp--clear-screen (scrollback)
+(defun ebb--clear-screen (scrollback)
   "Clear the viewport, and history too when SCROLLBACK is non-nil."
-  (chomp--require-running-terminal)
-  (chomp-screen-cursor-goto chomp--screen 0 0)
-  (chomp-screen-erase-in-display chomp--screen 2)
+  (ebb--require-running-terminal)
+  (ebb-screen-cursor-goto ebb--screen 0 0)
+  (ebb-screen-erase-in-display ebb--screen 2)
   (when scrollback
-    (chomp-screen-erase-in-display chomp--screen 3))
-  (chomp-shell-cleanup)
-  (chomp-shell-setup-margins)
-  (when chomp--render
-    (chomp-render-refresh chomp--render))
-  (chomp-send-key "l" "control"))
+    (ebb-screen-erase-in-display ebb--screen 3))
+  (ebb-shell-cleanup)
+  (ebb-shell-setup-margins)
+  (when ebb--render
+    (ebb-render-refresh ebb--render))
+  (ebb-send-key "l" "control"))
 
 ;;;###autoload
-(defun chomp-clear ()
+(defun ebb-clear ()
   "Clear the viewport, retaining scrollback, and request a prompt redraw."
   (interactive)
-  (chomp--clear-screen nil))
+  (ebb--clear-screen nil))
 
 ;;;###autoload
-(defun chomp-clear-scrollback ()
+(defun ebb-clear-scrollback ()
   "Clear the viewport and scrollback, then request a prompt redraw."
   (interactive)
-  (chomp--clear-screen t))
+  (ebb--clear-screen t))
 
 ;;;###autoload
-(defun chomp-copy-all ()
+(defun ebb-copy-all ()
   "Copy all terminal scrollback and viewport text to the kill ring."
   (interactive)
-  (unless (and (eq major-mode 'chomp-mode) chomp--screen)
-    (user-error "Not in a Chomp buffer"))
-  (let ((text (chomp-screen-plain-text chomp--screen)))
+  (unless (and (eq major-mode 'ebb-mode) ebb--screen)
+    (user-error "Not in a Ebb buffer"))
+  (let ((text (ebb-screen-plain-text ebb--screen)))
     (kill-new text)
     text))
 
-(defun chomp-copy-region (_begin _end)
+(defun ebb-copy-region (_begin _end)
   "Copy the active virtual terminal region to the kill ring."
   (interactive "r")
-  (unless (and chomp--screen chomp--render mark-active (mark t))
+  (unless (and ebb--screen ebb--render mark-active (mark t))
     (user-error "No active terminal region"))
-  (let* ((point-location (chomp-render-buffer-location chomp--render (point)))
-         (saved-mark (chomp-render-state-virtual-mark chomp--render))
+  (let* ((point-location (ebb-render-buffer-location ebb--render (point)))
+         (saved-mark (ebb-render-state-virtual-mark ebb--render))
          (mark-location
           (if (and saved-mark
                    (= (mark t)
                       (marker-position
-                       (chomp-render-state-region-begin chomp--render))))
+                       (ebb-render-state-region-begin ebb--render))))
               saved-mark
-            (chomp-render-buffer-location chomp--render (mark t))))
-         (text (chomp-screen-text-range
-                chomp--screen point-location mark-location)))
+            (ebb-render-buffer-location ebb--render (mark t))))
+         (text (ebb-screen-text-range
+                ebb--screen point-location mark-location)))
     (kill-new text)
     (setq deactivate-mark t)
     text))
 
 ;;;; ---- Process Management Commands ------------------------------------
 
-(defun chomp-kill-process ()
+(defun ebb-kill-process ()
   "Kill the terminal process."
   (interactive)
-  (when-let ((proc (and chomp--io (chomp-io-process chomp--io))))
+  (when-let ((proc (and ebb--io (ebb-io-process ebb--io))))
     (when (process-live-p proc)
       (kill-process proc))))
 
-(defun chomp-reset ()
+(defun ebb-reset ()
   "Reset the terminal to its initial state."
   (interactive)
-  (when chomp--screen
-    (chomp-screen-reset chomp--screen)
-    (when chomp--render
-      (chomp-render-full-reset chomp--render))))
+  (when ebb--screen
+    (ebb-screen-reset ebb--screen)
+    (when ebb--render
+      (ebb-render-full-reset ebb--render))))
 
-(defun chomp-previous-prompt (&optional n)
+(defun ebb-previous-prompt (&optional n)
   "Enter Emacs mode and move to the Nth previous shell prompt."
   (interactive "p")
-  (unless (eq chomp--input-mode 'emacs)
-    (chomp-emacs-mode))
-  (chomp-shell-previous-prompt n))
+  (unless (eq ebb--input-mode 'emacs)
+    (ebb-emacs-mode))
+  (ebb-shell-previous-prompt n))
 
-(defun chomp-next-prompt (&optional n)
+(defun ebb-next-prompt (&optional n)
   "Enter Emacs mode and move to the Nth next shell prompt."
   (interactive "p")
-  (unless (eq chomp--input-mode 'emacs)
-    (chomp-emacs-mode))
-  (chomp-shell-next-prompt n))
+  (unless (eq ebb--input-mode 'emacs)
+    (ebb-emacs-mode))
+  (ebb-shell-next-prompt n))
 
 ;;;; ---- Notifications and Progress -------------------------------------
 
-(defun chomp--default-notification (title body)
+(defun ebb--default-notification (title body)
   "Display a desktop notification with TITLE and BODY."
   (require 'notifications)
   (notifications-notify :title (or title "Terminal") :body body))
 
-(defun chomp--default-progress (state percent)
+(defun ebb--default-progress (state percent)
   "Display normalized progress STATE and PERCENT in the mode line."
-  (setq chomp--progress
+  (setq ebb--progress
         (pcase state
           ('remove nil)
           ('set (format "[%d%%]" percent))
@@ -611,40 +611,40 @@ Called after each render.  Debounced so short-lived matches don't flash."
           ('pause (format "[Paused %d%%]" percent))))
   (force-mode-line-update))
 
-(defun chomp--run-callback (buffer function args)
+(defun ebb--run-callback (buffer function args)
   "Run FUNCTION with ARGS in BUFFER, isolating callback errors."
   (when (and (buffer-live-p buffer) function)
     (with-current-buffer buffer
       (condition-case error-data
           (apply function args)
         (error
-         (message "[chomp] Callback error: %S" error-data)
+         (message "[ebb] Callback error: %S" error-data)
          nil)))))
 
-(defun chomp--defer-callback (function &rest args)
+(defun ebb--defer-callback (function &rest args)
   "Run FUNCTION later in the current buffer with ARGS."
-  (run-at-time 0 nil #'chomp--run-callback
+  (run-at-time 0 nil #'ebb--run-callback
                (current-buffer) function args))
 
 ;;;; ---- Event Handler --------------------------------------------------
 
-(defun chomp--handle-event (type &rest args)
+(defun ebb--handle-event (type &rest args)
   "Handle events emitted by the parser."
   (pcase type
     ('bell (ding t))
     ('title
-     (when chomp-show-title
-       (chomp--set-title (car args))))
+     (when ebb-show-title
+       (ebb--set-title (car args))))
     ('cwd
-     (let ((path (chomp--cwd-to-path (car args) (cadr args))))
+     (let ((path (ebb--cwd-to-path (car args) (cadr args))))
        ;; Remote: trust the shell's report; a `file-directory-p' here
        ;; would open a synchronous TRAMP connection on every cd.
        (when (and path (if (file-remote-p path) t (file-directory-p path)))
          (setq default-directory (file-name-as-directory path)
                list-buffers-directory default-directory)
-         (when chomp-buffer-name-function
-           (chomp--rename-managed
-            (funcall chomp-buffer-name-function chomp--title))))))
+         (when ebb-buffer-name-function
+           (ebb--rename-managed
+            (funcall ebb-buffer-name-function ebb--title))))))
     ('cursor-style
      ;; Could update cursor display here
      nil)
@@ -653,12 +653,12 @@ Called after each render.  Debounced so short-lived matches don't flash."
        ;; Handle modes that need buffer-level action
        (pcase mode
          ((or 1000 1002 1003)
-          (chomp--mouse-mode (if (chomp-screen-mouse-mode chomp--screen) 1 -1))
-          (unless (chomp-screen-mouse-mode chomp--screen)
-            (setf (chomp-screen-mouse-pressed chomp--screen) nil)
-            (when chomp--mouse-drag-transient-map-exit
-              (funcall chomp--mouse-drag-transient-map-exit)
-              (setq chomp--mouse-drag-transient-map-exit nil))))
+          (ebb--mouse-mode (if (ebb-screen-mouse-mode ebb--screen) 1 -1))
+          (unless (ebb-screen-mouse-mode ebb--screen)
+            (setf (ebb-screen-mouse-pressed ebb--screen) nil)
+            (when ebb--mouse-drag-transient-map-exit
+              (funcall ebb--mouse-drag-transient-map-exit)
+              (setq ebb--mouse-drag-transient-map-exit nil))))
          (1004
           ;; Focus events -- could enable focus tracking here
           nil)
@@ -672,8 +672,8 @@ Called after each render.  Debounced so short-lived matches don't flash."
              (insert (format "\n\n[Process %s]\n"
                              (string-trim event))))
            ;; Switch to emacs mode
-           (chomp-emacs-mode)
-           (when chomp-kill-buffer-on-exit
+           (ebb-emacs-mode)
+           (when ebb-kill-buffer-on-exit
              (run-at-time 1 nil
                           (lambda (buf)
                             (when (buffer-live-p buf)
@@ -681,58 +681,58 @@ Called after each render.  Debounced so short-lived matches don't flash."
                           (current-buffer)))))))
     ('osc-51
      (let ((payload (car args)))
-       (chomp-shell-handle-osc51 payload chomp--screen)))
+       (ebb-shell-handle-osc51 payload ebb--screen)))
     ('notification
-     (when chomp-notification-function
-       (apply #'chomp--defer-callback chomp-notification-function args)))
+     (when ebb-notification-function
+       (apply #'ebb--defer-callback ebb-notification-function args)))
     ('progress
-     (chomp--run-callback (current-buffer) chomp-progress-function args))
+     (ebb--run-callback (current-buffer) ebb-progress-function args))
     ('reset nil)
     (_ nil)))
 
 ;;;; ---- Focus Events ---------------------------------------------------
 
-(defun chomp--focus-change ()
-  "Handle focus changes for chomp buffers."
+(defun ebb--focus-change ()
+  "Handle focus changes for ebb buffers."
   (dolist (frame (frame-list))
     (let ((focused (frame-focus-state frame)))
       (dolist (win (window-list frame 'no-minibuf))
         (let ((buf (window-buffer win)))
-          (when (buffer-local-value 'chomp--io buf)
+          (when (buffer-local-value 'ebb--io buf)
             (with-current-buffer buf
-              (when (and chomp--io chomp--screen
-                         (chomp-screen-focus-events chomp--screen))
-                (chomp-io-send chomp--io
+              (when (and ebb--io ebb--screen
+                         (ebb-screen-focus-events ebb--screen))
+                (ebb-io-send ebb--io
                                (if focused
-                                   (chomp-input-focus-in)
-                                 (chomp-input-focus-out)))))))))))
+                                   (ebb-input-focus-in)
+                                 (ebb-input-focus-out)))))))))))
 
-(defun chomp--ensure-focus-change-hook ()
+(defun ebb--ensure-focus-change-hook ()
   "Install global focus tracking once."
-  (unless chomp--focus-change-installed
-    (add-function :after after-focus-change-function #'chomp--focus-change)
-    (setq chomp--focus-change-installed t)))
+  (unless ebb--focus-change-installed
+    (add-function :after after-focus-change-function #'ebb--focus-change)
+    (setq ebb--focus-change-installed t)))
 
-(defun chomp--maybe-remove-focus-change-hook ()
-  "Remove global focus tracking when no other chomp buffers remain."
-  (when (and chomp--focus-change-installed
+(defun ebb--maybe-remove-focus-change-hook ()
+  "Remove global focus tracking when no other ebb buffers remain."
+  (when (and ebb--focus-change-installed
              (not (cl-some (lambda (buf)
                              (and (not (eq buf (current-buffer)))
                                   (buffer-live-p buf)
                                   (eq (buffer-local-value 'major-mode buf)
-                                      'chomp-mode)))
+                                      'ebb-mode)))
                            (buffer-list))))
-    (remove-function after-focus-change-function #'chomp--focus-change)
-    (setq chomp--focus-change-installed nil)))
+    (remove-function after-focus-change-function #'ebb--focus-change)
+    (setq ebb--focus-change-installed nil)))
 
 ;;;; ---- Resize Hook ----------------------------------------------------
 
-(defun chomp--window-size-change (window)
-  "Handle a size change for WINDOW showing a Chomp buffer."
+(defun ebb--window-size-change (window)
+  "Handle a size change for WINDOW showing a Ebb buffer."
   (let ((buffer (window-buffer window)))
-    (when (buffer-local-value 'chomp--io buffer)
+    (when (buffer-local-value 'ebb--io buffer)
       (with-current-buffer buffer
-        (let* ((process (chomp-io-process chomp--io))
+        (let* ((process (ebb-io-process ebb--io))
                (windows (get-buffer-window-list buffer nil t))
                (size (and process windows
                           (funcall window-adjust-process-window-size-function
@@ -742,12 +742,12 @@ Called after each render.  Debounced so short-lived matches don't flash."
                (new-height (or (cdr-safe size)
                                (window-body-height window))))
           (when (and (> new-width 0) (> new-height 0))
-            (chomp-io-handle-resize chomp--io new-width new-height)))))))
+            (ebb-io-handle-resize ebb--io new-width new-height)))))))
 
 ;;;; ---- Major Mode -----------------------------------------------------
 
-(define-derived-mode chomp-mode fundamental-mode "Chomp"
-  "Major mode for the chomp terminal emulator."
+(define-derived-mode ebb-mode fundamental-mode "Ebb"
+  "Major mode for the ebb terminal emulator."
   (setq-local buffer-read-only t)
   (setq-local buffer-undo-list t)
   (setq-local truncate-lines t)
@@ -757,7 +757,7 @@ Called after each render.  Debounced so short-lived matches don't flash."
   (setq-local auto-hscroll-mode nil)
   (setq-local hscroll-margin 0)
   ;; Disable features that conflict with terminal display.
-  ;; Chomp supplies its own text properties; deferred fontification makes
+  ;; Ebb supplies its own text properties; deferred fontification makes
   ;; redisplay scan the entire scrollback when revisiting a terminal.
   (font-lock-mode -1)
   (when (fboundp 'emojify-mode)
@@ -765,58 +765,58 @@ Called after each render.  Debounced so short-lived matches don't flash."
   (setq-local bidi-paragraph-direction 'left-to-right)
   (setq-local show-trailing-whitespace nil)
   (setq-local display-line-numbers nil)
-  (face-remap-add-relative 'default 'chomp-default)
-  (setq-local bookmark-make-record-function #'chomp-bookmark-make-record)
-  (setq-local imenu-create-index-function #'chomp-shell-imenu-create-index)
-  (setq-local imenu-default-goto-function #'chomp-shell-imenu-goto)
+  (face-remap-add-relative 'default 'ebb-default)
+  (setq-local bookmark-make-record-function #'ebb-bookmark-make-record)
+  (setq-local imenu-create-index-function #'ebb-shell-imenu-create-index)
+  (setq-local imenu-default-goto-function #'ebb-shell-imenu-goto)
   (setq-local mode-line-process
-              '(" " (:eval (chomp--mode-line-input-mode))))
+              '(" " (:eval (ebb--mode-line-input-mode))))
   ;; Set up shell integration margins
-  (chomp-shell-setup-margins)
+  (ebb-shell-setup-margins)
   ;; Buffer-local window-size-change hooks receive a window, not a frame.
-  (add-hook 'window-size-change-functions #'chomp--window-size-change nil t)
+  (add-hook 'window-size-change-functions #'ebb--window-size-change nil t)
   ;; Add focus tracking
-  (chomp--ensure-focus-change-hook)
+  (ebb--ensure-focus-change-hook)
   ;; Clean up shell state on kill
-  (add-hook 'kill-buffer-hook #'chomp-shell-cleanup nil t)
+  (add-hook 'kill-buffer-hook #'ebb-shell-cleanup nil t)
   ;; Kill the (possibly remote) shell process with the buffer; the
   ;; process has no buffer of its own, so Emacs won't reap it.
   (add-hook 'kill-buffer-hook
-            (lambda () (when chomp--io (chomp-io-stop chomp--io)))
+            (lambda () (when ebb--io (ebb-io-stop ebb--io)))
             nil t)
-  (add-hook 'kill-buffer-hook #'chomp--maybe-remove-focus-change-hook nil t)
+  (add-hook 'kill-buffer-hook #'ebb--maybe-remove-focus-change-hook nil t)
   ;; Query before kill
-  (when chomp-query-before-kill
-    (add-hook 'kill-buffer-query-functions #'chomp--kill-buffer-query nil t)))
+  (when ebb-query-before-kill
+    (add-hook 'kill-buffer-query-functions #'ebb--kill-buffer-query nil t)))
 
-(defun chomp--kill-buffer-query ()
-  "Query before killing a chomp buffer with a live process."
-  (or (not chomp--io)
-      (not (chomp-io-process chomp--io))
-      (not (process-live-p (chomp-io-process chomp--io)))
+(defun ebb--kill-buffer-query ()
+  "Query before killing a ebb buffer with a live process."
+  (or (not ebb--io)
+      (not (ebb-io-process ebb--io))
+      (not (process-live-p (ebb-io-process ebb--io)))
       (yes-or-no-p "Terminal process is running.  Kill buffer? ")))
 
 ;;;; ---- Entry Points ---------------------------------------------------
 
-(defun chomp--buffers ()
-  "Return live Chomp buffers sorted by name."
+(defun ebb--buffers ()
+  "Return live Ebb buffers sorted by name."
   (sort (seq-filter (lambda (buffer)
-                      (eq (buffer-local-value 'major-mode buffer) 'chomp-mode))
+                      (eq (buffer-local-value 'major-mode buffer) 'ebb-mode))
                     (buffer-list))
         (lambda (a b) (string< (buffer-name a) (buffer-name b)))))
 
-(defun chomp--find-session (identity)
-  "Return the Chomp buffer with stable IDENTITY, if any."
+(defun ebb--find-session (identity)
+  "Return the Ebb buffer with stable IDENTITY, if any."
   (seq-find (lambda (buffer)
               (equal identity
-                     (buffer-local-value 'chomp--session-id buffer)))
-            (chomp--buffers)))
+                     (buffer-local-value 'ebb--session-id buffer)))
+            (ebb--buffers)))
 
-(defun chomp--cycle (step)
-  "Switch STEP places through the sorted Chomp buffer list, wrapping."
-  (let ((buffers (chomp--buffers)))
+(defun ebb--cycle (step)
+  "Switch STEP places through the sorted Ebb buffer list, wrapping."
+  (let ((buffers (ebb--buffers)))
     (unless buffers
-      (user-error "No Chomp sessions"))
+      (user-error "No Ebb sessions"))
     (let* ((position (cl-position (current-buffer) buffers))
            (target (if position
                        (nth (mod (+ position step) (length buffers)) buffers)
@@ -825,55 +825,55 @@ Called after each render.  Debounced so short-lived matches don't flash."
       target)))
 
 ;;;###autoload
-(defun chomp-next ()
-  "Switch to the next Chomp session, wrapping at the end."
+(defun ebb-next ()
+  "Switch to the next Ebb session, wrapping at the end."
   (interactive)
-  (chomp--cycle 1))
+  (ebb--cycle 1))
 
 ;;;###autoload
-(defun chomp-previous ()
-  "Switch to the previous Chomp session, wrapping at the beginning."
+(defun ebb-previous ()
+  "Switch to the previous Ebb session, wrapping at the beginning."
   (interactive)
-  (chomp--cycle -1))
+  (ebb--cycle -1))
 
 ;;;###autoload
-(defun chomp-list-buffers ()
-  "Choose a Chomp session, defaulting to the next one."
+(defun ebb-list-buffers ()
+  "Choose a Ebb session, defaulting to the next one."
   (interactive)
-  (let* ((buffers (chomp--buffers))
+  (let* ((buffers (ebb--buffers))
          (next (and buffers
                     (nth (mod (1+ (or (cl-position (current-buffer) buffers) -1))
                               (length buffers))
                          buffers))))
     (unless buffers
-      (user-error "No Chomp sessions"))
+      (user-error "No Ebb sessions"))
     (pop-to-buffer-same-window
      (get-buffer
-      (completing-read "Chomp session: "
+      (completing-read "Ebb session: "
                        (mapcar #'buffer-name buffers) nil t nil nil
                        (buffer-name next))))))
 
 ;;;###autoload
-(defun chomp-other (&optional program)
-  "Switch to another Chomp session, or create one with PROGRAM."
+(defun ebb-other (&optional program)
+  "Switch to another Ebb session, or create one with PROGRAM."
   (interactive)
   (if-let ((other (seq-find (lambda (buffer) (not (eq buffer (current-buffer))))
-                            (chomp--buffers))))
+                            (ebb--buffers))))
       (pop-to-buffer-same-window other)
-    (chomp program)))
+    (ebb program)))
 
-(defun chomp--cwd-to-path (dir host)
+(defun ebb--cwd-to-path (dir host)
   "Return OSC 7 report DIR as a usable path, given the reporting HOST.
 Reports from a non-local HOST become TRAMP paths.  The buffer's remote
 prefix is reused when it targets the reported host (preserves method,
 user, multi-hop); a different host means the user ssh'd onward from
 this buffer's host, so a fresh path is built via
-`chomp-tramp-default-method'.  A local-looking HOST (or none) in a
+`ebb-tramp-default-method'.  A local-looking HOST (or none) in a
 remote buffer is the remote shell reporting on itself."
   (when (and dir (not (string-empty-p dir)))
     (let ((prefix (file-remote-p default-directory)))
       (cond
-       ((not (chomp--local-host-p host))
+       ((not (ebb--local-host-p host))
         (if (and prefix
                  (equal (downcase host)
                         (downcase (or (file-remote-p default-directory 'host)
@@ -882,12 +882,12 @@ remote buffer is the remote shell reporting on itself."
           (progn
             (require 'tramp)
             (format "/%s:%s:%s"
-                    (or chomp-tramp-default-method tramp-default-method)
+                    (or ebb-tramp-default-method tramp-default-method)
                     host dir))))
        (prefix (concat prefix dir))
        (t dir)))))
 
-(defun chomp--remote-login-shell ()
+(defun ebb--remote-login-shell ()
   "Return the remote user's login shell via `getent passwd', or nil.
 Runs on the host of `default-directory' through TRAMP."
   (with-temp-buffer
@@ -900,35 +900,35 @@ Runs on the host of `default-directory' through TRAMP."
         (let ((shell (nth 6 (split-string (string-trim (buffer-string)) ":"))))
           (and shell (not (string-empty-p shell)) shell))))))
 
-(defun chomp--remote-shell ()
+(defun ebb--remote-shell ()
   "Return the shell argv list to run for a remote `default-directory'.
-Resolves per TRAMP method via `chomp-tramp-shells'; falls back to
+Resolves per TRAMP method via `ebb-tramp-shells'; falls back to
 /bin/sh when nothing resolves."
   (let* ((method (file-remote-p default-directory 'method))
-         (spec (cdr (or (assoc method chomp-tramp-shells)
-                        (assoc t chomp-tramp-shells))))
+         (spec (cdr (or (assoc method ebb-tramp-shells)
+                        (assoc t ebb-tramp-shells))))
          (program (or (if (eq (car spec) 'login-shell)
-                          (or (chomp--remote-login-shell) (cadr spec))
+                          (or (ebb--remote-login-shell) (cadr spec))
                         (car spec))
                       "/bin/sh"))
          (args (or (cddr spec)
-                   (and (memq (chomp-io--detect-shell program)
+                   (and (memq (ebb-io--detect-shell program)
                               '(bash zsh fish))
                         '("-l" "-i")))))
     (cons program args)))
 
 ;;;###autoload
-(defun chomp (&optional program)
+(defun ebb (&optional program)
   "Start a terminal emulator.
-With a numeric prefix argument N, switch to the Nth existing chomp
+With a numeric prefix argument N, switch to the Nth existing ebb
 session (creating it if needed).  With \\[universal-argument] \\[universal-argument],
-prompt for the program to run.  PROGRAM defaults to `chomp-default-shell'
+prompt for the program to run.  PROGRAM defaults to `ebb-default-shell'
 or `$SHELL'.
 
 When `default-directory' is remote, spawns the remote shell via TRAMP
-(see `chomp-tramp-shells').  Shell integration is not deployed to the
+(see `ebb-tramp-shells').  Shell integration is not deployed to the
 remote host: cwd tracking there requires the remote rc files to emit
-OSC 7/51 themselves (e.g. by sourcing the scripts in chomp's
+OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
 `integration/' directory)."
   (interactive
    (list
@@ -937,7 +937,7 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in chomp's
      ((equal current-prefix-arg '(16))
       (let ((command
              (read-shell-command "Run program: "
-                                 (or chomp-default-shell
+                                 (or ebb-default-shell
                                      (getenv "SHELL")
                                      shell-file-name))))
         (let ((argv (split-string-shell-command command)))
@@ -945,156 +945,156 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in chomp's
             (user-error "Program cannot be empty"))
           argv)))
      (t nil))))
-  ;; With numeric prefix: switch to Nth chomp buffer
+  ;; With numeric prefix: switch to Nth ebb buffer
   (when (and (numberp current-prefix-arg) (not program))
     (let* ((n current-prefix-arg)
-           (chomp-bufs (chomp--buffers))
-           (existing (nth (1- n) chomp-bufs)))
+           (ebb-bufs (ebb--buffers))
+           (existing (nth (1- n) ebb-bufs)))
       (when existing
         (pop-to-buffer-same-window existing)
-        (cl-return-from chomp existing))))
+        (cl-return-from ebb existing))))
   (let* ((shell (or program
                     (and (file-remote-p default-directory)
-                         (chomp--remote-shell))
-                    chomp-default-shell
+                         (ebb--remote-shell))
+                    ebb-default-shell
                     (getenv "SHELL")
                     shell-file-name
                     "/bin/sh"))
-         (buf (generate-new-buffer chomp-buffer-name)))
+         (buf (generate-new-buffer ebb-buffer-name)))
     ;; Set up mode first
     (with-current-buffer buf
-      (chomp-mode)
-      (setq chomp--session-id (buffer-name buf))
+      (ebb-mode)
+      (setq ebb--session-id (buffer-name buf))
       ;; Determine initial size from a window
       (let* ((win (or (get-buffer-window buf)
                       (selected-window)))
              (width (max (window-max-chars-per-line win) 10))
              (height (max (window-body-height win) 3)))
         ;; Create screen model
-        (setq chomp--screen (chomp-screen-create width height))
-        (setf (chomp-screen-scrollback-max chomp--screen) chomp-scrollback-lines)
+        (setq ebb--screen (ebb-screen-create width height))
+        (setf (ebb-screen-scrollback-max ebb--screen) ebb-scrollback-lines)
         ;; Create renderer
-        (setq chomp--render (chomp-render-create chomp--screen buf))
+        (setq ebb--render (ebb-render-create ebb--screen buf))
         ;; Create parser
-        (setq chomp--parser (chomp-parse-create chomp--screen nil
-                                                #'chomp--handle-event))
+        (setq ebb--parser (ebb-parse-create ebb--screen nil
+                                                #'ebb--handle-event))
         ;; Create I/O
-        (setq chomp--io (make-chomp-io
-                         :screen chomp--screen
-                         :parser chomp--parser
-                         :render chomp--render
+        (setq ebb--io (make-ebb-io
+                         :screen ebb--screen
+                         :parser ebb--parser
+                         :render ebb--render
                          :buffer buf
-                         :chunk-size chomp-chunk-size
-                         :min-latency chomp-minimum-latency
-                         :max-latency chomp-maximum-latency))
+                         :chunk-size ebb-chunk-size
+                         :min-latency ebb-minimum-latency
+                         :max-latency ebb-maximum-latency))
         ;; Start process with shell integration env vars
-        (chomp-io-start chomp--io shell buf
-                        (chomp-shell-env-vars))
+        (ebb-io-start ebb--io shell buf
+                        (ebb-shell-env-vars))
         ;; Initial directory-based name (before any OSC title).
         ;; Leave custom/project buffer names alone until OSC updates.
-        (when (and chomp-buffer-name-function
-                   (or (equal (buffer-name) "*chomp*")
-                       (string-match-p "\\`\\*chomp\\*<[0-9]+>\\'"
+        (when (and ebb-buffer-name-function
+                   (or (equal (buffer-name) "*ebb*")
+                       (string-match-p "\\`\\*ebb\\*<[0-9]+>\\'"
                                        (buffer-name))))
-          (chomp--rename-managed
-           (funcall chomp-buffer-name-function nil)))
+          (ebb--rename-managed
+           (funcall ebb-buffer-name-function nil)))
         ;; Set default input mode
-        (pcase chomp-default-input-mode
-          ('char (chomp-char-mode))
-          ('emacs (chomp-emacs-mode))
-          (_ (chomp-semi-char-mode)))))
+        (pcase ebb-default-input-mode
+          ('char (ebb-char-mode))
+          ('emacs (ebb-emacs-mode))
+          (_ (ebb-semi-char-mode)))))
     ;; Display buffer
     (pop-to-buffer-same-window buf)
     ;; Resize to match actual window
-    (when chomp--io
+    (when ebb--io
       (let ((win (get-buffer-window buf)))
         (when win
-          (chomp-io-handle-resize
-           chomp--io
+          (ebb-io-handle-resize
+           ebb--io
            (window-max-chars-per-line win)
            (window-body-height win)))))
     buf))
 
 ;;;###autoload
-(defun chomp-other-window (&optional program)
+(defun ebb-other-window (&optional program)
   "Start a terminal in another window."
   (interactive)
-  (let ((buf (chomp program)))
+  (let ((buf (ebb program)))
     (when buf
       (switch-to-buffer-other-window buf))))
 
 ;;;###autoload
-(defun chomp-project ()
+(defun ebb-project ()
   "Switch to or start a terminal in the current project root."
   (interactive)
   (let* ((project (project-current))
          (root (and project (file-truename (project-root project))))
-         (existing (and root (chomp--find-session root))))
+         (existing (and root (ebb--find-session root))))
     (if existing
         (pop-to-buffer-same-window existing)
       (let ((default-directory (or root default-directory))
-            (chomp-buffer-name (if project
-                                   (project-prefixed-buffer-name "chomp")
-                                 chomp-buffer-name)))
-        (let ((buffer (chomp)))
+            (ebb-buffer-name (if project
+                                   (project-prefixed-buffer-name "ebb")
+                                 ebb-buffer-name)))
+        (let ((buffer (ebb)))
           (when root
             (with-current-buffer buffer
-              (setq chomp--session-id root)))
+              (setq ebb--session-id root)))
           buffer)))))
 
 ;;;###autoload
-(defun chomp-project-other-window ()
+(defun ebb-project-other-window ()
   "Start a terminal in the current project root in another window."
   (interactive)
   (let ((default-directory
          (or (when-let ((proj (project-current)))
                (project-root proj))
              default-directory)))
-    (chomp-other-window)))
+    (ebb-other-window)))
 
 ;;;; ---- Bookmarks ------------------------------------------------------
 
-(defun chomp-bookmark-make-record ()
+(defun ebb-bookmark-make-record ()
   "Return a bookmark record for the current local terminal session."
   (when (file-remote-p default-directory)
-    (user-error "Remote Chomp bookmarks are unsupported"))
+    (user-error "Remote Ebb bookmarks are unsupported"))
   (cons (buffer-name)
-        `((handler . chomp-bookmark-jump)
-          (chomp-directory . ,default-directory)
-          (chomp-display-name . ,(buffer-name))
-          (chomp-session-id . ,chomp--session-id))))
+        `((handler . ebb-bookmark-jump)
+          (ebb-directory . ,default-directory)
+          (ebb-display-name . ,(buffer-name))
+          (ebb-session-id . ,ebb--session-id))))
 
-(defun chomp--bookmark-property (record property)
+(defun ebb--bookmark-property (record property)
   "Return custom PROPERTY from bookmark RECORD."
   (alist-get property (if (stringp (car-safe record)) (cdr record) record)))
 
 ;;;###autoload
-(defun chomp-bookmark-jump (record)
+(defun ebb-bookmark-jump (record)
   "Jump to the terminal session described by bookmark RECORD."
-  (let* ((directory (chomp--bookmark-property record 'chomp-directory))
-         (display-name (chomp--bookmark-property record 'chomp-display-name))
-         (identity (chomp--bookmark-property record 'chomp-session-id)))
+  (let* ((directory (ebb--bookmark-property record 'ebb-directory))
+         (display-name (ebb--bookmark-property record 'ebb-display-name))
+         (identity (ebb--bookmark-property record 'ebb-session-id)))
     (when (or (null directory) (file-remote-p directory))
-      (user-error "Remote Chomp bookmarks are unsupported"))
-    (let ((buffer (chomp--find-session identity)))
+      (user-error "Remote Ebb bookmarks are unsupported"))
+    (let ((buffer (ebb--find-session identity)))
       (if buffer
           (with-current-buffer buffer
             (unless (file-equal-p default-directory directory)
-              (chomp-send-string
+              (ebb-send-string
                (concat "cd "
                        (shell-quote-argument (directory-file-name directory))))
-              (chomp-send-key "return")))
+              (ebb-send-key "return")))
         (let ((default-directory directory)
-              (chomp-buffer-name (or display-name chomp-buffer-name)))
-          (setq buffer (chomp))
+              (ebb-buffer-name (or display-name ebb-buffer-name)))
+          (setq buffer (ebb))
           (with-current-buffer buffer
-            (setq chomp--session-id identity))))
+            (setq ebb--session-id identity))))
       (pop-to-buffer-same-window buffer)
       buffer)))
 
 ;;;; ---- Buffer naming --------------------------------------------------
 
-(defun chomp--local-host-p (host)
+(defun ebb--local-host-p (host)
   "Return non-nil if HOST is this machine or empty/localhost."
   (or (null host)
       (string-empty-p host)
@@ -1104,7 +1104,7 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in chomp's
                              (car (split-string (system-name) "\\."))
                              nil nil t))))
 
-(defun chomp--format-title-for-buffer (title)
+(defun ebb--format-title-for-buffer (title)
   "Return TITLE with local user@host: stripped; keep remote host."
   (when (and title (not (string-empty-p title)))
     (let* ((trimmed (if (> (length title) 60)
@@ -1124,54 +1124,54 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in chomp's
                    return (substring trimmed (match-end 0)))
           trimmed))))
 
-(defun chomp-buffer-name-by-title (title)
-  "Return \"*chomp: TITLE*\", stripping local user@host from TITLE."
-  (when-let ((pretty (chomp--format-title-for-buffer title)))
-    (format "*chomp: %s*" pretty)))
+(defun ebb-buffer-name-by-title (title)
+  "Return \"*ebb: TITLE*\", stripping local user@host from TITLE."
+  (when-let ((pretty (ebb--format-title-for-buffer title)))
+    (format "*ebb: %s*" pretty)))
 
-(defun chomp-buffer-name-by-directory (&optional _title)
-  "Return \"*chomp: DIR*\" from abbreviated `default-directory'.
+(defun ebb-buffer-name-by-directory (&optional _title)
+  "Return \"*ebb: DIR*\" from abbreviated `default-directory'.
 Local paths omit the hostname; remote TRAMP paths keep the host."
-  (format "*chomp: %s*"
+  (format "*ebb: %s*"
           (abbreviate-file-name
            (directory-file-name default-directory))))
 
-(defun chomp--rename-managed (new-name)
+(defun ebb--rename-managed (new-name)
   "Rename buffer to NEW-NAME unless the user renamed it manually."
   (when (and new-name
-             (or (null chomp--managed-buffer-name)
-                 (equal (buffer-name) chomp--managed-buffer-name))
+             (or (null ebb--managed-buffer-name)
+                 (equal (buffer-name) ebb--managed-buffer-name))
              (not (equal new-name (buffer-name))))
     (rename-buffer new-name t)
-    (setq chomp--managed-buffer-name (buffer-name))))
+    (setq ebb--managed-buffer-name (buffer-name))))
 
-(defun chomp--set-title (title)
-  "Record OSC TITLE and rename via `chomp-buffer-name-function'."
-  (setq chomp--title title)
-  (when chomp-buffer-name-function
-    (chomp--rename-managed
-     (funcall chomp-buffer-name-function title))))
+(defun ebb--set-title (title)
+  "Record OSC TITLE and rename via `ebb-buffer-name-function'."
+  (setq ebb--title title)
+  (when ebb-buffer-name-function
+    (ebb--rename-managed
+     (funcall ebb-buffer-name-function title))))
 
 ;;;; ---- Mode Line ------------------------------------------------------
 
-(defun chomp--mode-line-input-mode ()
+(defun ebb--mode-line-input-mode ()
   "Return mode-line string for current input mode and terminal progress."
   (string-join
    (delq nil
-         (list (pcase chomp--input-mode
+         (list (pcase ebb--input-mode
                  ('char "[Char]")
                  ('semi-char "[Semi]")
                  ('emacs "[Emacs]")
                  (_ nil))
-               (and chomp--password-mode-p
+               (and ebb--password-mode-p
                     (propertize "🔒Password" 'face 'warning))
-               chomp--progress))
+               ebb--progress))
    " "))
 
 ;; Add to mode-line
-(put 'chomp--input-mode 'risky-local-variable t)
+(put 'ebb--input-mode 'risky-local-variable t)
 
-(require 'chomp-eshell)
+(require 'ebb-eshell)
 
-(provide 'chomp)
-;;; chomp.el ends here
+(provide 'ebb)
+;;; ebb.el ends here
