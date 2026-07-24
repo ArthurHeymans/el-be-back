@@ -127,6 +127,15 @@ Binds `screen' and `parser' in BODY."
     (should (equal "Hi" (ebb-test-display-line screen 0)))
     (should (equal '(2 . 0) (ebb-test-cursor screen)))))
 
+(ert-deftest ebb-test-write-char-replaces-internal-raw-byte ()
+  "The screen model never stores Emacs internal raw-byte characters."
+  (ebb-test-with-screen (:width 3 :height 1)
+    (ebb-screen-write-char screen #x3fffab)
+    (should (equal "�" (ebb-test-display-line screen 0)))
+    (should (string-prefix-p
+             "�" (ebb-render--line-to-string
+                   (ebb-screen-get-line screen 0) 3)))))
+
 (ert-deftest ebb-test-combining-mark-preserved ()
   "Combining marks decorate the prior cell without moving the cursor."
   (ebb-test-with-screen (:width 5 :height 1)
@@ -164,6 +173,15 @@ Binds `screen' and `parser' in BODY."
     (should (equal "fg" (ebb-test-display-line screen 1)))
     (should (ebb-line-wrapped (ebb-screen-get-line screen 0)))
     (should (equal '(2 . 1) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-auto-wrap-lazy-ascii-before-unicode ()
+  "Unicode after a lazy ASCII row wraps without accessing nil cells."
+  (ebb-test-with-screen (:width 5 :height 2)
+    (ebb-test-output parser "abcdeλ")
+    (should (equal "abcde" (ebb-test-display-line screen 0)))
+    (should (equal "λ" (ebb-test-display-line screen 1)))
+    (should (ebb-line-wrapped (ebb-screen-get-line screen 0)))
+    (should (equal '(1 . 1) (ebb-test-cursor screen)))))
 
 (ert-deftest ebb-test-cursor-move-clamp ()
   "Cursor movement clamps to screen bounds."
@@ -584,6 +602,34 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "Hello")
     (should (equal "Hello" (ebb-test-display-line screen 0)))
     (should (equal '(5 . 0) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-parse-malformed-utf8-as-replacement-character ()
+  "Parser replaces Emacs internal eight-bit characters before rendering."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output
+     parser (concat "ô" (decode-coding-string
+                         (unibyte-string #xff) 'utf-8-unix)))
+    (let ((line (ebb-screen-get-line screen 0)))
+      (should (equal "ô�" (ebb-test-display-line screen 0)))
+      (should (string-prefix-p "ô�"
+                               (ebb-render--line-to-string line 20)))
+      (should (string-prefix-p "ô�"
+                               (ebb-render--line-to-string-scrollback
+                                line 20))))
+    (should (equal '(2 . 0) (ebb-test-cursor screen)))
+    ;; Existing sessions may still contain a raw byte cached before this input
+    ;; was normalized.  Rendering repairs that stale cache in place.
+    (let* ((raw (decode-coding-string (unibyte-string #xab) 'utf-8-unix))
+           (line (make-ebb-line :text (concat raw "  ") :cells-valid nil)))
+      (should (equal "�  " (ebb-render--line-to-string line 3)))
+      (should (equal "�  " (ebb-line-text line))))))
+
+(ert-deftest ebb-test-parse-ignores-unsupported-c1-controls ()
+  "Unsupported C1 controls do not enter the screen model as text."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser (string ?A #x8a ?B))
+    (should (equal "AB" (ebb-test-display-line screen 0)))
+    (should (equal '(2 . 0) (ebb-test-cursor screen)))))
 
 (ert-deftest ebb-test-parse-crlf ()
   "Parser handles CR LF."
@@ -1349,6 +1395,35 @@ Binds `screen' and `parser' in BODY."
       (ebb-io-send io "λ"))
     (should (equal (encode-coding-string "λ" 'utf-8 t) (car sent)))
     (should (equal (unibyte-string 0 255 ?x) (cadr sent)))))
+
+(ert-deftest ebb-test-io-interrupt-discards-stale-output ()
+  "C-c clears queued output and incomplete parser state before sending."
+  (let* ((screen (ebb-screen-create 10 3))
+         (parser (ebb-parse-create screen))
+         (chunks (list "stale output"))
+         (io (make-ebb-io :process 'fake
+                          :parser parser
+                          :pending-chunks chunks
+                          :pending-tail chunks
+                          :pending-offset 4
+                          :first-chunk-time (current-time)
+                          :throughput-bytes 2000000
+                          :binary-flood t))
+         sent)
+    (setf (ebb-parser-state parser) :osc-string
+          (ebb-parser-osc-string parser) "partial")
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+              ((symbol-function 'process-send-string)
+               (lambda (_process string) (setq sent string))))
+      (ebb-io-send io "\C-c"))
+    (should (equal "\C-c" sent))
+    (should-not (ebb-io-pending-chunks io))
+    (should-not (ebb-io-pending-tail io))
+    (should (zerop (ebb-io-pending-offset io)))
+    (should-not (ebb-io-first-chunk-time io))
+    (should-not (ebb-io-binary-flood io))
+    (should (eq :ground (ebb-parser-state parser)))
+    (should (string-empty-p (ebb-parser-osc-string parser)))))
 
 (ert-deftest ebb-test-io-process-uses-binary-writes ()
   "PTY output is decoded as UTF-8 while input remains byte-preserving."

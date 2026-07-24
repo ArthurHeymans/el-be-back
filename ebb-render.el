@@ -559,6 +559,9 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
 
 (defun ebb-render--line-to-string-scrollback (line width)
   "Convert LINE for scrollback rendering."
+  (when (ebb-line-text line)
+    (setf (ebb-line-text line)
+          (ebb-render--safe-string (ebb-line-text line))))
   (cond
    ((and (ebb-line-text line)
          (ebb-line-attr-runs line)
@@ -580,7 +583,7 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
 (defun ebb-render--cells-to-string-scrollback-fast (cells width)
   "Return unstyled CELLS as visible scrollback text, or nil if styled."
   (catch 'styled
-    (let ((s (make-string width ?\s))
+    (let ((s (make-string width ?\s t))
           (i 0)
           (pos 0)
           (cols 0))
@@ -594,7 +597,7 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
            ((zerop cw)
             (cl-incf i))
            (t
-            (aset s pos (ebb-cell-char cell))
+            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
             (cl-incf pos)
             (cl-incf cols cw)
             (cl-incf i cw)))))
@@ -602,6 +605,9 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
 
 (defun ebb-render--line-to-string (line width)
   "Convert LINE to a string of WIDTH terminal columns."
+  (when (ebb-line-text line)
+    (setf (ebb-line-text line)
+          (ebb-render--safe-string (ebb-line-text line))))
   (cond
    ((and (ebb-line-text line)
          (ebb-line-attr-runs line)
@@ -693,6 +699,23 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
 
 ;;;; ---- Cell-to-String Conversion --------------------------------------
 
+(defun ebb-render--safe-char (char)
+  "Return a renderable Unicode version of CHAR."
+  (ebb--normalize-display-char char))
+
+(defun ebb-render--safe-string (string)
+  "Return STRING as multibyte Unicode with internal raw bytes replaced."
+  (let ((length (length string))
+        (index 0))
+    (while (and (< index length) (<= (aref string index) #x10ffff))
+      (cl-incf index))
+    (if (= index length)
+        (if (multibyte-string-p string) string (string-to-multibyte string))
+      (let ((result (make-string length ?\s t)))
+        (dotimes (position length result)
+          (aset result position
+                (ebb-render--safe-char (aref string position))))))))
+
 (defun ebb-render--cells-to-string (cells width)
   "Convert a vector of ebb-cells to a propertized string.
 Handles double-width characters by inserting invisible spacers."
@@ -717,7 +740,7 @@ Handles double-width characters by inserting invisible spacers."
 Handles both single-width and wide characters without consing per-cell run
 lists; falls back only when a styled cell is present."
   (catch 'styled
-    (let ((s (make-string width ?\s))
+    (let ((s (make-string width ?\s t))
           (i 0)
           (pos 0))
       (while (< i width)
@@ -730,7 +753,7 @@ lists; falls back only when a styled cell is present."
            ((zerop cw)
             (cl-incf i))
            ((> cw 1)
-            (aset s pos (ebb-cell-char cell))
+            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
             (let ((end (min width (+ pos cw))))
               (when (< (1+ pos) end)
                 (put-text-property (1+ pos) end 'invisible t s)
@@ -738,7 +761,7 @@ lists; falls back only when a styled cell is present."
             (cl-incf pos cw)
             (cl-incf i cw))
            (t
-            (aset s pos (ebb-cell-char cell))
+            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
             (cl-incf pos)
             (cl-incf i)))))
       s)))
@@ -756,9 +779,10 @@ lists; falls back only when a styled cell is present."
                              (equal (ebb-cell-attr cell) attr)))))
         (cl-incf i))
       (when (= i width)
-        (let ((s (make-string width ?\s)))
+        (let ((s (make-string width ?\s t)))
           (dotimes (j width)
-            (aset s j (ebb-cell-char (aref cells j))))
+            (aset s j (ebb-render--safe-char
+                       (ebb-cell-char (aref cells j)))))
           (ebb-render--apply-attr-properties s attr)
           s)))))
 
@@ -776,9 +800,11 @@ lists; falls back only when a styled cell is present."
           (cl-incf i))
          ;; Double-width character: emit char + invisible spacer
          ((> cw 1)
-          (let* ((ch (ebb-cell-char cell))
+          (let* ((ch (ebb-render--safe-char (ebb-cell-char cell)))
                  (attr (ebb-cell-attr cell))
-                 (s (concat (string ch) (ebb-cell-combining cell)))
+                 (s (concat (string ch)
+                            (ebb-render--safe-string
+                             (or (ebb-cell-combining cell) ""))))
                  ;; Invisible spacers for the extra columns
                  (spacer (propertize (make-string (1- cw) ?\s)
                                      'invisible t
@@ -793,8 +819,11 @@ lists; falls back only when a styled cell is present."
          (t
           (let ((attr (ebb-cell-attr cell)))
             (if (ebb-cell-combining cell)
-                (let ((s (concat (string (ebb-cell-char cell))
-                                 (ebb-cell-combining cell)))
+                (let ((s (concat
+                          (string (ebb-render--safe-char
+                                   (ebb-cell-char cell)))
+                          (ebb-render--safe-string
+                           (ebb-cell-combining cell))))
                       (run-attr attr))
                   (ebb-render--apply-attr-properties s run-attr)
                   (push s parts)
@@ -805,7 +834,9 @@ lists; falls back only when a styled cell is present."
                               (and (= (ebb-cell-width c) 1)
                                    (not (ebb-cell-combining c))
                                    (equal (ebb-cell-attr c) attr))))
-                  (push (ebb-cell-char (aref cells i)) chars)
+                  (push (ebb-render--safe-char
+                         (ebb-cell-char (aref cells i)))
+                        chars)
                   (cl-incf i))
                 (when chars
                   (let ((s (apply #'string (nreverse chars))))

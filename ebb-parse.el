@@ -148,6 +148,19 @@ If the parameter is a sub-parameter list, return the first element."
    :write-fn write-fn
    :emit-fn emit-fn))
 
+(defun ebb-parse-cancel-sequence (parser)
+  "Return PARSER to ground state, discarding an incomplete sequence."
+  (setf (ebb-parser-state parser) :ground
+        (ebb-parser-param-string parser) ""
+        (ebb-parser-private parser) nil
+        (ebb-parser-intermediates parser) ""
+        (ebb-parser-osc-string parser) ""
+        (ebb-parser-dcs-string parser) ""
+        (ebb-parser-dcs-params parser) ""
+        (ebb-parser-dcs-final parser) 0
+        (ebb-parser-string-state parser) nil
+        (ebb-parser-charset-slot parser) 0))
+
 ;;;; ---- Entry Point ----------------------------------------------------
 
 (defun ebb-parse-bytes (parser string &optional start end)
@@ -158,38 +171,54 @@ Returns the number of characters consumed."
         (screen (ebb-parser-screen parser)))
     (while (< i e)
       (let ((ch (aref string i)))
-        ;; The common case for terminal output is a run of printable text while
-        ;; the parser is in ground state.  Dispatch that whole run to the
-        ;; screen model at once instead of re-entering the parser for each byte.
-        (if (and (eq (ebb-parser-state parser) :ground)
-                 (= ch ?\e)
-                 (< (+ i 2) e)
-                 (= (aref string (1+ i)) ?\[))
-            (let ((next (ebb-parse--fast-csi-at parser string (+ i 2) e)))
-              (if next
-                  (setq i next)
-                (ebb-parse--process-char parser ch)
-                (cl-incf i)))
+        ;; Emacs preserves malformed decoded bytes as internal eight-bit
+        ;; characters.  They cannot be stored in normal multibyte render
+        ;; strings, so display them as the Unicode replacement character.
+        (cond
+         ((>= ch #x3fff80)
+          (ebb-parse--process-char parser #xfffd)
+          (cl-incf i))
+         ;; C1 bytes are controls, not printable characters.  The parser does
+         ;; not currently implement their 8-bit forms, so ignore them just as
+         ;; it ignores unsupported C0 controls.
+         ((and (>= ch #x80) (<= ch #x9f))
+          (cl-incf i))
+         (t
+          ;; The common case for terminal output is a run of printable text while
+          ;; the parser is in ground state.  Dispatch that whole run to the
+          ;; screen model at once instead of re-entering the parser for each byte.
           (if (and (eq (ebb-parser-state parser) :ground)
-                   (>= ch ?\s)
-                   (/= ch ?\x7f))
-            (let ((run-start i))
-              (while (and (< i e)
-                          (let ((c (aref string i)))
-                            (and (>= c ?\s) (/= c ?\x7f))))
-                (cl-incf i))
-              (ebb-screen-write-string screen string run-start i)
-              ;; Bulk command output commonly arrives as printable text followed
-              ;; by CRLF.  Handle that pair inline in ground state to avoid two
-              ;; full parser dispatches per line.
-              (when (and (< (1+ i) e)
-                         (= (aref string i) ?\r)
-                         (= (aref string (1+ i)) ?\n))
-                (ebb-screen-carriage-return screen)
-                (ebb-screen-index screen)
-                (cl-incf i 2)))
-            (ebb-parse--process-char parser ch)
-            (cl-incf i)))))
+                   (= ch ?\e)
+                   (< (+ i 2) e)
+                   (= (aref string (1+ i)) ?\[))
+              (let ((next (ebb-parse--fast-csi-at parser string (+ i 2) e)))
+                (if next
+                    (setq i next)
+                  (ebb-parse--process-char parser ch)
+                  (cl-incf i)))
+            (if (and (eq (ebb-parser-state parser) :ground)
+                     (>= ch ?\s)
+                     (/= ch ?\x7f))
+                (let ((run-start i))
+                  (while (and (< i e)
+                              (let ((c (aref string i)))
+                                (and (< c #x3fff80)
+                                     (not (and (>= c #x80) (<= c #x9f)))
+                                     (>= c ?\s)
+                                     (/= c ?\x7f))))
+                    (cl-incf i))
+                  (ebb-screen-write-string screen string run-start i)
+                  ;; Bulk command output commonly arrives as printable text followed
+                  ;; by CRLF.  Handle that pair inline in ground state to avoid two
+                  ;; full parser dispatches per line.
+                  (when (and (< (1+ i) e)
+                             (= (aref string i) ?\r)
+                             (= (aref string (1+ i)) ?\n))
+                    (ebb-screen-carriage-return screen)
+                    (ebb-screen-index screen)
+                    (cl-incf i 2)))
+              (ebb-parse--process-char parser ch)
+              (cl-incf i)))))))
     (- i (or start 0))))
 
 (defun ebb-parse--fast-csi-at (parser string start end)

@@ -204,7 +204,7 @@ Cells are materialized lazily from the plain text cache; this keeps scrolling
 from allocating a full vector of cell structs for every blank bottom row."
   (make-ebb-line :cells nil
                    :cells-valid nil
-                   :text (make-string width ?\s)
+                   :text (make-string width ?\s t)
                    :dirty t))
 
 (defsubst ebb--line-index (screen row)
@@ -230,7 +230,7 @@ from allocating a full vector of cell structs for every blank bottom row."
               (cl-replace resized cells :end2 (min width (length cells))))
             (setq cells resized)
             (setf (ebb-line-cells line) cells))
-        (let ((text (or (ebb-line-text line) (make-string width ?\s))))
+        (let ((text (or (ebb-line-text line) (make-string width ?\s t))))
           (unless (and cells (= (length cells) width))
             (setq cells (ebb--make-empty-cells width))
             (setf (ebb-line-cells line) cells))
@@ -338,6 +338,10 @@ immutable attr object instead of allocating a copy per cell."
         (make-ebb-cell :char ?\s :width 1
                          :attr (make-ebb-attr :bg bg))
       (make-ebb-cell))))
+
+(defsubst ebb--normalize-display-char (char)
+  "Return CHAR when it is Unicode, or a replacement for Emacs raw bytes."
+  (if (> char #x10ffff) #xfffd char))
 
 (defsubst ebb--char-display-width (char)
   "Return the display width of CHAR (1 for normal, 2 for CJK, 0 for zero-width)."
@@ -754,7 +758,7 @@ ordered oldest first."
       (if-let ((plain (ebb-history-line-text logical)))
           (apply #'make-ebb-line
                  :text (concat (substring plain offset end)
-                               (make-string (- width (- end offset)) ?\s))
+                               (make-string (- width (- end offset)) ?\s t))
                  :cells-valid nil
                  common)
         (let* ((cells (ebb-history-line-cells logical))
@@ -912,6 +916,7 @@ only join with a line that was auto-wrapped."
          (line (ebb--line-at screen y)))
     (cond
      ((ebb-screen-pending-wrap screen)
+      (ebb--line-ensure-cells line width)
       (cons line x))
      ((> x 0)
       (let* ((cells (ebb--line-ensure-cells line width))
@@ -959,7 +964,8 @@ only join with a line that was auto-wrapped."
 (defun ebb-screen-write-char (screen char)
   "Write CHAR at the current cursor position.
 Handles double-width (CJK) characters by occupying two cells."
-  (let* ((scrn-width (ebb-screen-width screen))
+  (let* ((char (ebb--normalize-display-char char))
+         (scrn-width (ebb-screen-width screen))
          (char-w (ebb--char-display-width char)))
     (catch 'ebb-screen-write-char
       (when (zerop char-w)
@@ -1389,7 +1395,7 @@ Handles LF, VT, FF."
        (setf (ebb-line-prompt-ends line) nil)
        (if (null (ebb-cell-attr ecell))
            (progn
-             (setf (ebb-line-text line) (make-string width ?\s))
+             (setf (ebb-line-text line) (make-string width ?\s t))
              (setf (ebb-line-uniform-attr line) nil))
          (setf (ebb-line-text line) nil)
          (setf (ebb-line-uniform-attr line) nil))))
@@ -1406,7 +1412,7 @@ Handles LF, VT, FF."
              do (aset cells i (copy-ebb-cell ecell)))
     (if (null (ebb-cell-attr ecell))
         (progn
-          (setf (ebb-line-text line) (make-string width ?\s))
+          (setf (ebb-line-text line) (make-string width ?\s t))
           (setf (ebb-line-uniform-attr line) nil))
       (setf (ebb-line-text line) nil)
       (setf (ebb-line-uniform-attr line) nil))

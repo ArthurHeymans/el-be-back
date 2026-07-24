@@ -446,12 +446,30 @@ Ebb through `ebb-io--filter'."
 
 ;;;; ---- Send to Process ------------------------------------------------
 
+(defun ebb-io--prepare-interrupt (io)
+  "Discard stale queued output and parser fragments before interrupting IO."
+  (when (ebb-io-render-timer io)
+    (cancel-timer (ebb-io-render-timer io)))
+  (setf (ebb-io-render-timer io) nil
+        (ebb-io-pending-chunks io) nil
+        (ebb-io-pending-tail io) nil
+        (ebb-io-pending-offset io) 0
+        (ebb-io-first-chunk-time io) nil
+        (ebb-io-throughput-time io) nil
+        (ebb-io-throughput-bytes io) 0
+        (ebb-io-binary-flood io) nil)
+  (when (ebb-io-parser io)
+    (ebb-parse-cancel-sequence (ebb-io-parser io))))
+
 (defun ebb-io-send (io string)
   "Send STRING to the terminal process.
 Multibyte text is encoded with `ebb-io-input-coding-system'.
-Unibyte strings are always sent unchanged."
+Unibyte strings are always sent unchanged.  Sending an interrupt discards
+queued output so the interrupted program's prompt is not stuck behind it."
   (when-let ((proc (ebb-io-process io)))
     (when (process-live-p proc)
+      (when (string-search "\C-c" string)
+        (ebb-io--prepare-interrupt io))
       (let ((coding (ebb-io-input-coding-system io)))
         (process-send-string
          proc
