@@ -704,17 +704,23 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
   (ebb--normalize-display-char char))
 
 (defun ebb-render--safe-string (string)
-  "Return STRING as multibyte Unicode with internal raw bytes replaced."
+  "Return STRING with internal raw bytes replaced by Unicode characters.
+Clean unibyte ASCII is returned unchanged."
   (let ((length (length string))
         (index 0))
     (while (and (< index length) (<= (aref string index) #x10ffff))
       (cl-incf index))
     (if (= index length)
-        (if (multibyte-string-p string) string (string-to-multibyte string))
-      (let ((result (make-string length ?\s t)))
-        (dotimes (position length result)
+        ;; Keep clean ASCII strings unibyte.  The model writes them far more
+        ;; often than the bounded renderer inserts them into an Emacs buffer.
+        string
+      (let ((result (make-string length ?\s t))
+            (position 0))
+        (while (< position length)
           (aset result position
-                (ebb-render--safe-char (aref string position))))))))
+                (ebb-render--safe-char (aref string position)))
+          (cl-incf position))
+        result))))
 
 (defun ebb-render--cells-to-string (cells width)
   "Convert a vector of ebb-cells to a propertized string.

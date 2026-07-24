@@ -168,6 +168,7 @@ If the parameter is a sub-parameter list, return the first element."
 Returns the number of characters consumed."
   (let ((i (or start 0))
         (e (or end (length string)))
+        (multibyte (multibyte-string-p string))
         (screen (ebb-parser-screen parser)))
     (while (< i e)
       (let ((ch (aref string i)))
@@ -200,13 +201,21 @@ Returns the number of characters consumed."
                      (>= ch ?\s)
                      (/= ch ?\x7f))
                 (let ((run-start i))
-                  (while (and (< i e)
-                              (let ((c (aref string i)))
-                                (and (< c #x3fff80)
-                                     (not (and (>= c #x80) (<= c #x9f)))
-                                     (>= c ?\s)
-                                     (/= c ?\x7f))))
-                    (cl-incf i))
+                  (if multibyte
+                      (while (and (< i e)
+                                  (let ((c (aref string i)))
+                                    (and (< c #x3fff80)
+                                         (not (and (>= c #x80) (<= c #x9f)))
+                                         (>= c ?\s)
+                                         (/= c ?\x7f))))
+                        (cl-incf i))
+                    ;; PTY output and the benchmark corpus are normally
+                    ;; unibyte.  Keep their ASCII scan as small as the original
+                    ;; hot path while still stopping before C1/high bytes.
+                    (while (and (< i e)
+                                (let ((c (aref string i)))
+                                  (and (>= c ?\s) (< c #x7f))))
+                      (cl-incf i)))
                   (ebb-screen-write-string screen string run-start i)
                   ;; Bulk command output commonly arrives as printable text followed
                   ;; by CRLF.  Handle that pair inline in ground state to avoid two

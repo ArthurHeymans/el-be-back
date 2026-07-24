@@ -600,6 +600,8 @@ Binds `screen' and `parser' in BODY."
   "Parser handles plain text."
   (ebb-test-with-screen (:width 20 :height 6)
     (ebb-test-output parser "Hello")
+    (should-not (multibyte-string-p
+                 (ebb-line-text (ebb--line-at screen 0))))
     (should (equal "Hello" (ebb-test-display-line screen 0)))
     (should (equal '(5 . 0) (ebb-test-cursor screen)))))
 

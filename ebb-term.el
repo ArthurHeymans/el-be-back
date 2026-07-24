@@ -204,7 +204,7 @@ Cells are materialized lazily from the plain text cache; this keeps scrolling
 from allocating a full vector of cell structs for every blank bottom row."
   (make-ebb-line :cells nil
                    :cells-valid nil
-                   :text (make-string width ?\s t)
+                   :text (make-string width ?\s)
                    :dirty t))
 
 (defsubst ebb--line-index (screen row)
@@ -230,7 +230,7 @@ from allocating a full vector of cell structs for every blank bottom row."
               (cl-replace resized cells :end2 (min width (length cells))))
             (setq cells resized)
             (setf (ebb-line-cells line) cells))
-        (let ((text (or (ebb-line-text line) (make-string width ?\s t))))
+        (let ((text (or (ebb-line-text line) (make-string width ?\s))))
           (unless (and cells (= (length cells) width))
             (setq cells (ebb--make-empty-cells width))
             (setf (ebb-line-cells line) cells))
@@ -758,7 +758,7 @@ ordered oldest first."
       (if-let ((plain (ebb-history-line-text logical)))
           (apply #'make-ebb-line
                  :text (concat (substring plain offset end)
-                               (make-string (- width (- end offset)) ?\s t))
+                               (make-string (- width (- end offset)) ?\s))
                  :cells-valid nil
                  common)
         (let* ((cells (ebb-history-line-cells logical))
@@ -1010,6 +1010,7 @@ Handles double-width (CJK) characters by occupying two cells."
             (setf (ebb-cell-attr cell) attr)
             (let ((uniform (ebb-line-uniform-attr line)))
               (if (and (ebb-line-text line)
+                       (< translated 128)
                        (null (ebb-line-attr-runs line))
                        (or (and (null attr) (null uniform))
                            (and attr uniform
@@ -1395,7 +1396,7 @@ Handles LF, VT, FF."
        (setf (ebb-line-prompt-ends line) nil)
        (if (null (ebb-cell-attr ecell))
            (progn
-             (setf (ebb-line-text line) (make-string width ?\s t))
+             (setf (ebb-line-text line) (make-string width ?\s))
              (setf (ebb-line-uniform-attr line) nil))
          (setf (ebb-line-text line) nil)
          (setf (ebb-line-uniform-attr line) nil))))
@@ -1412,7 +1413,7 @@ Handles LF, VT, FF."
              do (aset cells i (copy-ebb-cell ecell)))
     (if (null (ebb-cell-attr ecell))
         (progn
-          (setf (ebb-line-text line) (make-string width ?\s t))
+          (setf (ebb-line-text line) (make-string width ?\s))
           (setf (ebb-line-uniform-attr line) nil))
       (setf (ebb-line-text line) nil)
       (setf (ebb-line-uniform-attr line) nil))
