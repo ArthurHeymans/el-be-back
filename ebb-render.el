@@ -18,6 +18,8 @@
 (require 'cl-lib)
 (require 'ebb-term)
 
+(defvar ebb-link-map)
+
 ;;;; ---- Color Tables ---------------------------------------------------
 
 (defconst ebb-render--ansi-colors
@@ -64,6 +66,9 @@
 
 (defconst ebb-render--attr-face-cache-limit 4096
   "Maximum number of cached attribute face specs before clearing the cache.")
+
+(defvar ebb-render-after-refresh-hook nil
+  "Hook run after refreshing an Ebb buffer, with the render state.")
 
 ;; Palette 0-15 inherit Emacs ansi-color faces (theme-aware), like eat/ghostel.
 (defconst ebb-render--ansi-face-names
@@ -262,7 +267,8 @@ state are reconciled independently so metadata-only updates are visible."
             (when (window-live-p saved-window)
               (save-excursion
                 (ebb-render-goto-anchor render saved-window-start t)
-                (set-window-start saved-window (point) t))))))
+                (set-window-start saved-window (point) t))))
+          (run-hook-with-args 'ebb-render-after-refresh-hook render)))
       (ebb-screen-clear-dirty screen))))
 
 ;;;; ---- Scrollback Rendering -------------------------------------------
@@ -563,10 +569,8 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
          (= (length (ebb-line-text line)) width))
     (setf (ebb-line-dirty line) nil)
     (if-let ((attr (ebb-line-uniform-attr line)))
-        (let ((s (copy-sequence (ebb-line-text line)))
-              (face (ebb-render--attr-to-face attr)))
-          (when face
-            (put-text-property 0 width 'face face s))
+        (let ((s (copy-sequence (ebb-line-text line))))
+          (ebb-render--apply-attr-properties s attr)
           s)
       (ebb-line-text line)))
    ((ebb-render--cells-to-string-scrollback-fast (ebb-line-cells line) width))
@@ -609,10 +613,8 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
    ((and (ebb-line-text line)
          (ebb-line-uniform-attr line)
          (= (length (ebb-line-text line)) width))
-    (let ((s (copy-sequence (ebb-line-text line)))
-          (face (ebb-render--attr-to-face (ebb-line-uniform-attr line))))
-      (when face
-        (put-text-property 0 width 'face face s))
+    (let ((s (copy-sequence (ebb-line-text line))))
+      (ebb-render--apply-attr-properties s (ebb-line-uniform-attr line))
       (setf (ebb-line-rendered line) s)
       (setf (ebb-line-dirty line) nil)
       s))
@@ -634,9 +636,11 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
   "Render LINE's text plus attribute runs into a propertized string."
   (let ((s (copy-sequence (ebb-line-text line))))
     (dolist (run (ebb-line-attr-runs line))
-      (let ((face (ebb-render--attr-to-face (nth 2 run))))
-        (when face
-          (put-text-property (nth 0 run) (min width (nth 1 run)) 'face face s))))
+      (let* ((begin (nth 0 run))
+             (end (min width (nth 1 run)))
+             (part (substring s begin end)))
+        (ebb-render--apply-attr-properties part (nth 2 run))
+        (setf (substring s begin end) part)))
     s))
 
 (defun ebb-render--apply-line-metadata (line string width)
@@ -696,6 +700,18 @@ Handles double-width characters by inserting invisible spacers."
       (ebb-render--cells-to-string-uniform cells width)
       (ebb-render--cells-to-string-general cells width)))
 
+(defun ebb-render--apply-attr-properties (string attr)
+  "Apply face and hyperlink properties from ATTR to STRING."
+  (when-let ((face (ebb-render--attr-to-face attr)))
+    (put-text-property 0 (length string) 'face face string))
+  (when-let ((uri (and attr (ebb-attr-hyperlink attr))))
+    (put-text-property 0 (length string) 'help-echo uri string)
+    (put-text-property 0 (length string) 'mouse-face 'highlight string)
+    (put-text-property 0 (length string) 'keymap ebb-link-map string)
+    (put-text-property 0 (length string) 'ebb-link-id
+                       (ebb-attr-hyperlink-id attr) string))
+  string)
+
 (defun ebb-render--cells-to-string-fast (cells width)
   "Fast path for default-attribute CELLS, or nil if styled.
 Handles both single-width and wide characters without consing per-cell run
@@ -740,12 +756,10 @@ lists; falls back only when a styled cell is present."
                              (equal (ebb-cell-attr cell) attr)))))
         (cl-incf i))
       (when (= i width)
-        (let ((s (make-string width ?\s))
-              (face (ebb-render--attr-to-face attr)))
+        (let ((s (make-string width ?\s)))
           (dotimes (j width)
             (aset s j (ebb-cell-char (aref cells j))))
-          (when face
-            (put-text-property 0 width 'face face s))
+          (ebb-render--apply-attr-properties s attr)
           s)))))
 
 (defun ebb-render--cells-to-string-general (cells width)
@@ -764,15 +778,13 @@ lists; falls back only when a styled cell is present."
          ((> cw 1)
           (let* ((ch (ebb-cell-char cell))
                  (attr (ebb-cell-attr cell))
-                 (face (ebb-render--attr-to-face attr))
                  (s (concat (string ch) (ebb-cell-combining cell)))
                  ;; Invisible spacers for the extra columns
                  (spacer (propertize (make-string (1- cw) ?\s)
                                      'invisible t
                                      'ebb-wide-spacer t)))
-            (when face
-              (put-text-property 0 (length s) 'face face s)
-              (put-text-property 0 (length spacer) 'face face spacer))
+            (ebb-render--apply-attr-properties s attr)
+            (ebb-render--apply-attr-properties spacer attr)
             (push s parts)
             (push spacer parts))
           ;; Skip the char cell and its continuation cells
@@ -783,9 +795,8 @@ lists; falls back only when a styled cell is present."
             (if (ebb-cell-combining cell)
                 (let ((s (concat (string (ebb-cell-char cell))
                                  (ebb-cell-combining cell)))
-                      (face (ebb-render--attr-to-face attr)))
-                  (when face
-                    (put-text-property 0 (length s) 'face face s))
+                      (run-attr attr))
+                  (ebb-render--apply-attr-properties s run-attr)
                   (push s parts)
                   (cl-incf i))
               (let ((chars nil))
@@ -797,10 +808,8 @@ lists; falls back only when a styled cell is present."
                   (push (ebb-cell-char (aref cells i)) chars)
                   (cl-incf i))
                 (when chars
-                  (let ((s (apply #'string (nreverse chars)))
-                        (face (ebb-render--attr-to-face attr)))
-                    (when face
-                      (put-text-property 0 (length s) 'face face s))
+                  (let ((s (apply #'string (nreverse chars))))
+                    (ebb-render--apply-attr-properties s attr)
                     (push s parts))))))))))
     ;; Build result and ensure it is exactly width display columns
     (let ((result (apply #'concat (nreverse parts))))

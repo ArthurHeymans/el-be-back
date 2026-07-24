@@ -706,6 +706,41 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e]2;My Title\e\\")
     (should (equal "My Title" (ebb-screen-title screen)))))
 
+(ert-deftest ebb-test-osc8-hyperlink-rendering ()
+  "OSC 8 URIs and ids become clickable text properties."
+  (ebb-test-with-screen (:width 30 :height 2)
+    (ebb-test-output parser
+                     "\e]8;id=docs;https://example.com\e\\click\e]8;;\e\\ plain")
+    (let* ((buffer (generate-new-buffer " *ebb-osc8-test*"))
+           (render (ebb-render-create screen buffer)))
+      (unwind-protect
+          (with-current-buffer buffer
+            (ebb-render-refresh render)
+            (should (equal "https://example.com"
+                           (get-text-property 1 'help-echo)))
+            (should (equal "docs" (get-text-property 1 'ebb-link-id)))
+            (should (eq ebb-link-map (get-text-property 1 'keymap)))
+            (should-not (get-text-property 7 'help-echo)))
+        (kill-buffer buffer)))))
+
+(ert-deftest ebb-test-plain-url-and-file-detection ()
+  "Plain URLs and existing file references become clickable."
+  (let ((file (locate-library "ebb")))
+    (with-temp-buffer
+      (setq default-directory (file-name-directory file))
+      (insert (format "See https://example.com and ./%s:42:3\n"
+                      (file-name-nondirectory file)))
+      (let ((ebb--render nil) (ebb--screen nil))
+        (ebb--detect-plain-links nil))
+      (goto-char (point-min))
+      (let ((url-pos (progn (search-forward "https://") (- (point) 8))))
+        (should (equal "https://example.com"
+                       (get-text-property url-pos 'help-echo))))
+      (let ((file-pos (progn (search-forward "./") (- (point) 2))))
+        (let ((uri (get-text-property file-pos 'help-echo)))
+          (should (string-prefix-p "fileref:" uri))
+          (should (string-suffix-p ":42:3" uri)))))))
+
 (ert-deftest ebb-test-parse-osc-notifications ()
   "OSC 9 and 777 emit only valid normalized notifications."
   (ebb-test-with-screen (:width 20 :height 6)

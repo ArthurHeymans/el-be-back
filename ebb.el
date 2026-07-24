@@ -22,6 +22,7 @@
 (require 'project)
 (require 'bookmark)
 (require 'face-remap)
+(require 'browse-url)
 (require 'ebb-term)
 (require 'ebb-parse)
 (require 'ebb-render)
@@ -156,6 +157,22 @@ Options: `char', `semi-char', `emacs'."
 (defcustom ebb-progress-function #'ebb--default-progress
   "Function called with normalized progress STATE and PERCENT."
   :type '(choice (const nil) function)
+  :group 'ebb)
+
+(defcustom ebb-enable-url-detection t
+  "Automatically make plain HTTP and HTTPS URLs clickable."
+  :type 'boolean
+  :group 'ebb)
+
+(defcustom ebb-enable-file-detection t
+  "Automatically make existing file paths and file:line references clickable."
+  :type 'boolean
+  :group 'ebb)
+
+(defcustom ebb-file-detection-path-regex
+  "[~[:alnum:]_.-]*/[^] \t\n\r:\"<>(){}[`']+"
+  "Regexp matching paths considered for plain-text link detection."
+  :type 'regexp
   :group 'ebb)
 
 ;;;; ---- Buffer-local Variables -----------------------------------------
@@ -747,6 +764,130 @@ Called after each render.  Debounced so short-lived matches don't flash."
 
 ;;;; ---- Major Mode -----------------------------------------------------
 
+(defvar-keymap ebb-link-map
+  :doc "Keymap for OSC 8 and automatically detected links."
+  "<mouse-1>" #'ebb-open-link-at-click
+  "<mouse-2>" #'ebb-open-link-at-click)
+
+(defun ebb--link-at (position)
+  "Return the link URI at POSITION, or nil."
+  (let ((uri (get-text-property position 'help-echo)))
+    (and (stringp uri) uri)))
+
+(defun ebb--open-link (uri)
+  "Open URI, including Ebb's internal fileref links."
+  (when (stringp uri)
+    (cond
+     ((string-match
+       "\\`fileref:\\(.*?\\)\\(?::\\([0-9]+\\)\\(?::\\([0-9]+\\)\\)?\\)?\\'"
+       uri)
+      (let ((file (match-string 1 uri))
+            (line (and (match-string 2 uri)
+                       (string-to-number (match-string 2 uri))))
+            (column (and (match-string 3 uri)
+                         (string-to-number (match-string 3 uri)))))
+        (when (file-exists-p file)
+          (find-file-other-window file)
+          (when line
+            (goto-char (point-min))
+            (forward-line (1- (max 1 line)))
+            (when column (move-to-column (1- (max 1 column))))))))
+     ((string-match "\\`file://\\(?:localhost\\)?\\(/.*\\)" uri)
+      (find-file (url-unhex-string (match-string 1 uri))))
+     (t (browse-url uri)))))
+
+(defun ebb-open-link-at-click (event)
+  "Open the hyperlink at mouse EVENT."
+  (interactive "e")
+  (ebb--open-link (ebb--link-at (posn-point (event-start event)))))
+
+(defun ebb-open-link-at-point ()
+  "Open the hyperlink at point."
+  (interactive)
+  (ebb--open-link (ebb--link-at (point))))
+
+(defun ebb--linkify (begin end uri)
+  "Make BEGIN through END a clickable URI."
+  (add-text-properties begin end
+                       `(help-echo ,uri mouse-face highlight
+                         keymap ,ebb-link-map)))
+
+(defun ebb--detect-plain-links (_render)
+  "Detect plain URLs and file references after a terminal refresh."
+  (let* ((inhibit-read-only t)
+         (inhibit-modification-hooks t)
+         (cursor (and ebb--render ebb--screen
+                      (save-excursion
+                        (goto-char (ebb-render-state-display-begin ebb--render))
+                        (forward-line (ebb-screen-cursor-y ebb--screen))
+                        (cons (line-beginning-position) (line-end-position))))))
+    (save-excursion
+      (when ebb-enable-url-detection
+        (goto-char (point-min))
+        (while (re-search-forward
+                "https?://[^ \t\n\r\"<>]*[^ \t\n\r\"<>.,;:!?)>]"
+                nil t)
+          (let ((begin (match-beginning 0)) (end (match-end 0)))
+            (unless (or (get-text-property begin 'help-echo)
+                        (and cursor (<= (car cursor) begin (cdr cursor))))
+              (ebb--linkify begin end (match-string-no-properties 0))))))
+      (when (and ebb-enable-file-detection
+                 (not (file-remote-p default-directory)))
+        (goto-char (point-min))
+        (let ((regexp (concat "\\(?:^\\|[^[:alnum:]_./~-]\\)\\("
+                              ebb-file-detection-path-regex
+                              "\\)\\(\\(?::[0-9]+\\(?::[0-9]+\\)?\\)?\\)"))
+              (seen (make-hash-table :test #'equal)))
+          (while (re-search-forward regexp nil t)
+            (let ((begin (match-beginning 1)) (end (match-end 2)))
+              (unless (or (get-text-property begin 'help-echo)
+                          (and cursor (<= (car cursor) begin (cdr cursor))))
+                (let* ((path (match-string-no-properties 1))
+                       (location (match-string-no-properties 2))
+                       (file (expand-file-name path))
+                       (cached (gethash file seen 'unknown))
+                       (exists (if (eq cached 'unknown)
+                                   (puthash file (file-exists-p file) seen)
+                                 cached)))
+                  (when exists
+                    (ebb--linkify begin end
+                                  (concat "fileref:" file location))))))))))))
+
+(defun ebb--find-hyperlink (direction position)
+  "Find a hyperlink from POSITION in DIRECTION."
+  (let ((search (if (eq direction 'next)
+                    #'text-property-search-forward
+                  #'text-property-search-backward))
+        (skip-id (get-text-property position 'ebb-link-id)))
+    (save-excursion
+      (goto-char position)
+      (catch 'found
+        (while-let ((match (funcall search 'help-echo nil
+                                    (lambda (_ value) value) t)))
+          (let ((at (prop-match-beginning match)))
+            (unless (and skip-id
+                         (equal skip-id (get-text-property at 'ebb-link-id)))
+              (throw 'found at))))))))
+
+(defun ebb--goto-hyperlink (direction)
+  "Move to a hyperlink in DIRECTION, wrapping at buffer boundaries."
+  (let* ((edge (if (eq direction 'next) (point-min) (point-max)))
+         (target (or (ebb--find-hyperlink direction (point))
+                     (ebb--find-hyperlink direction edge))))
+    (if target (goto-char target) (user-error "No hyperlinks in buffer"))))
+
+(defun ebb-next-hyperlink (&optional count)
+  "Move to the COUNTth next hyperlink."
+  (interactive "p")
+  (ebb-emacs-mode)
+  (dotimes (_ (or count 1)) (ebb--goto-hyperlink 'next)))
+
+(defun ebb-previous-hyperlink (&optional count)
+  "Move to the COUNTth previous hyperlink."
+  (interactive "p")
+  (ebb-emacs-mode)
+  (dotimes (_ (or count 1)) (ebb--goto-hyperlink 'previous)))
+
 (define-derived-mode ebb-mode fundamental-mode "Ebb"
   "Major mode for the ebb terminal emulator."
   (setq-local buffer-read-only t)
@@ -772,6 +913,7 @@ Called after each render.  Debounced so short-lived matches don't flash."
   (setq-local imenu-default-goto-function #'ebb-shell-imenu-goto)
   (setq-local mode-line-process
               '(" " (:eval (ebb--mode-line-input-mode))))
+  (add-hook 'ebb-render-after-refresh-hook #'ebb--detect-plain-links nil t)
   ;; Set up shell integration margins
   (ebb-shell-setup-margins)
   ;; Buffer-local window-size-change hooks receive a window, not a frame.

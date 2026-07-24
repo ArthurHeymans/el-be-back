@@ -38,7 +38,9 @@
   (inverse nil)
   (conceal nil)
   (crossed nil)
-  (font 0))
+  (font 0)
+  (hyperlink nil)
+  (hyperlink-id nil))
 
 (cl-defstruct (ebb-line (:copier nil))
   "A single line in the terminal."
@@ -316,7 +318,8 @@ from allocating a full vector of cell structs for every blank bottom row."
            (ebb-attr-italic attr) (ebb-attr-underline attr)
            (ebb-attr-blink attr) (ebb-attr-inverse attr)
            (ebb-attr-conceal attr) (ebb-attr-crossed attr)
-           (/= 0 (ebb-attr-font attr)))))
+           (/= 0 (ebb-attr-font attr))
+           (ebb-attr-hyperlink attr))))
 
 (defsubst ebb--cell-attr-for-write (screen)
   "Return attr to store on a new cell, or nil for default.
@@ -1222,7 +1225,18 @@ Handles LF, VT, FF."
 
 (defun ebb-screen-reset-attr (screen)
   "Reset all attributes to defaults."
-  (setf (ebb-screen-current-attr screen) (make-ebb-attr)))
+  (let ((old (ebb-screen-current-attr screen)))
+    (setf (ebb-screen-current-attr screen)
+          (make-ebb-attr :hyperlink (ebb-attr-hyperlink old)
+                         :hyperlink-id (ebb-attr-hyperlink-id old)))))
+
+(defun ebb-screen-set-hyperlink (screen uri &optional id)
+  "Set SCREEN's active OSC 8 hyperlink to URI and ID."
+  (let* ((active (and uri (not (string-empty-p uri))))
+         (attr (ebb-attr-copy (ebb-screen-current-attr screen))))
+    (setf (ebb-attr-hyperlink attr) (and active uri)
+          (ebb-attr-hyperlink-id attr) (and active (or id (gensym "ebb-link-")))
+          (ebb-screen-current-attr screen) attr)))
 
 ;;;; ---- Erasing --------------------------------------------------------
 

@@ -1245,6 +1245,15 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
                    ;; HOST lets the handler build a TRAMP path when the
                    ;; report comes from a remote shell.
                    (ebb-parse--emit parser 'cwd cwd host)))
+                ;; OSC 8 ; params ; URI.  An empty URI ends the link.
+                (8
+                 (when (string-match "\\`\\([^;]*\\);\\(.*\\)\\'" payload)
+                   (let* ((params (match-string 1 payload))
+                          (uri (match-string 2 payload))
+                          (id (and (string-match
+                                    "\\(?:\\`\\|:\\)id=\\([^:]*\\)" params)
+                                   (match-string 1 params))))
+                     (ebb-screen-set-hyperlink screen uri id))))
                 ;; Query palette entries
                 (4
                  (ebb-parse--handle-osc-4 parser payload))

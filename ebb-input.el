@@ -25,6 +25,9 @@
 (declare-function ebb-kill-process "ebb")
 (declare-function ebb-previous-prompt "ebb")
 (declare-function ebb-next-prompt "ebb")
+(declare-function ebb-next-hyperlink "ebb")
+(declare-function ebb-previous-hyperlink "ebb")
+(declare-function ebb-open-link-at-point "ebb")
 (declare-function ebb-scroll-up "ebb")
 (declare-function ebb-scroll-down "ebb")
 (declare-function ebb-copy-region "ebb")
@@ -548,6 +551,9 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
     ;; Prompt navigation
     (define-key map (kbd "C-c C-p") #'ebb-previous-prompt)
     (define-key map (kbd "C-c C-n") #'ebb-next-prompt)
+    ;; Hyperlink navigation
+    (define-key map (kbd "C-c M-p") #'ebb-previous-hyperlink)
+    (define-key map (kbd "C-c M-n") #'ebb-next-hyperlink)
     ;; The history buffer is a bounded materialized slab.
     (define-key map [remap scroll-up-command] #'ebb-scroll-up)
     (define-key map [remap scroll-down-command] #'ebb-scroll-down)
@@ -559,7 +565,9 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
 
 (defvar ebb-emacs-mode-map
   (let ((map (make-sparse-keymap)))
-    ;; Normal Emacs keys; only RET and a few overrides go to terminal.
+    ;; In copy/Emacs mode RET follows a link at point.
+    (define-key map (kbd "RET") #'ebb-open-link-at-point)
+    (define-key map (kbd "<return>") #'ebb-open-link-at-point)
     map)
   "Keymap for emacs mode.")
 
