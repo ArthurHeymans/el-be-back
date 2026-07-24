@@ -447,7 +447,7 @@ values accepted by `serial-process-configure'."
 (defun ebb-serial--process-arguments ()
   "Return keyword arguments for `make-serial-process'."
   (append (list :name (format "ebb-serial-%s" ebb-serial--port)
-                :buffer nil
+                :buffer (current-buffer)
                 :port ebb-serial--port
                 :speed ebb-serial--speed
                 :coding 'no-conversion
@@ -464,7 +464,7 @@ values accepted by `serial-process-configure'."
 (defun ebb-serial--remote-process-arguments ()
   "Return keyword arguments for a remote socat serial process."
   (list :name (format "ebb-serial-%s" ebb-serial--port)
-        :buffer nil
+        :buffer (current-buffer)
         :command (ebb-serial--socat-command)
         :connection-type 'pipe
         :coding 'no-conversion

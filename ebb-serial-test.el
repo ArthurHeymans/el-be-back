@@ -241,6 +241,13 @@
                     "/ssh:host:/dev/ttyUSB0")
                    "/ssh:host:/")))
 
+(ert-deftest ebb-serial-process-arguments-use-terminal-buffer ()
+  (ebb-serial-tests--require-ebb-serial)
+  (with-temp-buffer
+    (setq ebb-serial--port "/dev/ttyUSB0")
+    (should (eq (plist-get (ebb-serial--process-arguments) :buffer)
+                (current-buffer)))))
+
 (ert-deftest ebb-serial-remote-open-uses-socat-process ()
   (ebb-serial-tests--require-ebb-serial)
   (let* ((buffer (generate-new-buffer " *ebb-serial-remote-open*"))
@@ -272,6 +279,7 @@
           (should (eq (process-get process 'ebb-serial-backend) 'socat))
           (should (equal captured-default "/ssh:host:/"))
           (should (eq (plist-get captured-args :file-handler) t))
+          (should (eq (plist-get captured-args :buffer) buffer))
           (should (equal (plist-get captured-args :command)
                          '("socat" "-"
                            "OPEN:/dev/ttyUSB0,raw,echo=0,b57600,cs8,parenb=0,cstopb=0,crtscts=0,ixon=0,ixoff=0"))))
