@@ -590,6 +590,40 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "a\r\nb\r\n")
     (should (equal '(0 1) (ebb-screen-get-dirty screen)))))
 
+(ert-deftest ebb-test-plain-crlf-batch-joins-wrapped-logical-line ()
+  "Fallback batching does not split the final row of an open wrapped line."
+  (ebb-test-with-screen (:width 4 :height 2)
+    (ebb-test-output parser "abcdef\r\nxx\r\n")
+    (let ((oldest (car (last (ebb-screen-scrollback screen)))))
+      (should (ebb-history-line-p oldest))
+      (should (equal "abcdef" (ebb-history-line-text oldest)))
+      (should-not (ebb-history-line-open oldest)))))
+
+(ert-deftest ebb-test-plain-crlf-block-keeps-correct-surviving-prefix ()
+  "Bulk scrolling copies only existing rows that were not sent to history."
+  (let* ((screen (ebb-screen-create 8 24))
+         (parser (ebb-parse-create screen)))
+    (dotimes (row 20)
+      (ebb--set-line-at
+       screen row
+       (make-ebb-line
+        :text (format "old%02d%s" row (make-string 3 ?\s))
+        :cells-valid nil)))
+    (ebb-screen-cursor-goto screen 20 0)
+    (ebb-test-output parser
+                     (mapconcat (lambda (char) (format "%c\r\n" char))
+                                (number-sequence ?a ?j) ""))
+    (should (= 7 (ebb-screen-scrollback-length screen)))
+    (should (equal "old00   "
+                   (ebb-line-text
+                    (ebb-screen-history-render-row screen 0))))
+    (let ((display (ebb-test-display-text screen)))
+      (should (equal "old07" (nth 0 display)))
+      (should (equal "old19" (nth 12 display)))
+      (should (equal "a" (nth 13 display)))
+      (should (equal "j" (nth 22 display)))
+      (should (equal "" (nth 23 display))))))
+
 (ert-deftest ebb-test-plain-history-chunk-reflows-and-preserves-anchors ()
   "Chunk row maps rebuild on resize without expanding logical line objects."
   (ebb-test-with-screen (:width 4 :height 2)
@@ -642,14 +676,93 @@ Binds `screen' and `parser' in BODY."
                      (ebb-line-text
                       (ebb-screen-history-render-row screen 1)))))))
 
-(ert-deftest ebb-test-styled-crlf-history-keeps-cell-fallback ()
-  "Styled CRLF blocks retain ordinary cell-backed logical history."
+(ert-deftest ebb-test-styled-crlf-history-stays-text-backed ()
+  "Single-width styled history retains compact text and attribute runs."
   (ebb-test-with-screen (:width 4 :height 2)
     (ebb-test-output parser "\e[31maa\r\nbb\r\n")
+    (let* ((logical (car (ebb-screen-scrollback screen)))
+           (rendered (ebb-screen-history-render-row screen 0))
+           (run (car (ebb-history-line-attr-runs logical))))
+      (should (ebb-history-line-p logical))
+      (should (equal "aa  " (ebb-history-line-text logical)))
+      (should (= 2 (ebb-history-line-text-length logical)))
+      (should (zerop (length (ebb-history-line-cells logical))))
+      (should (equal '(0 2) (cl-subseq run 0 2)))
+      (should (= 1 (ebb-attr-fg (nth 2 run))))
+      (should (equal '(0 2)
+                     (cl-subseq (car (ebb-line-attr-runs rendered)) 0 2))))))
+
+(ert-deftest ebb-test-styled-history-preserves-styled-trailing-space ()
+  "A styled blank remains logical history content while padding is trimmed."
+  (ebb-test-with-screen (:width 4 :height 1)
+    (ebb-test-output parser "\e[31ma \e[0m\r\n")
+    (let ((logical (car (ebb-screen-scrollback screen))))
+      (should (= 2 (ebb-history-line-text-length logical)))
+      (ebb-screen-resize screen 1 1)
+      (should (= 2 (ebb-screen-history-row-count screen)))
+      (let* ((rendered (ebb-screen-history-render-row screen 1))
+             (run (car (ebb-line-attr-runs rendered))))
+        (should (equal " " (ebb-line-text rendered)))
+        (should (equal '(0 1) (cl-subseq run 0 2)))
+        (should (= 1 (ebb-attr-fg (nth 2 run))))))))
+
+(ert-deftest ebb-test-wrapped-styled-history-merges-text-runs ()
+  "Styled wrapped rows join lazily without materializing cells."
+  (ebb-test-with-screen (:width 4 :height 1)
+    (ebb-test-output parser "\e[31mabcdef\r\n")
+    (let* ((logical (car (ebb-screen-scrollback screen)))
+           (run (car (ebb-history-line-attr-runs logical))))
+      (should (equal "abcdef" (ebb-history-line-text logical)))
+      (should (= 6 (ebb-history-line-text-length logical)))
+      (should (zerop (length (ebb-history-line-cells logical))))
+      (should (equal '(0 6) (cl-subseq run 0 2)))
+      (should (= 1 (ebb-attr-fg (nth 2 run)))))))
+
+(ert-deftest ebb-test-wide-styled-history-keeps-cell-fallback ()
+  "Styled wide characters retain the cell-backed history path."
+  (ebb-test-with-screen (:width 4 :height 1)
+    (ebb-test-output parser "\e[31m界\r\n")
     (let ((logical (car (ebb-screen-scrollback screen))))
       (should (ebb-history-line-p logical))
       (should-not (ebb-history-line-text logical))
       (should (> (length (ebb-history-line-cells logical)) 0)))))
+
+(ert-deftest ebb-test-uniform-styled-history-keeps-cell-fallback ()
+  "Uniform text styling uses cells until its cache semantics are supported."
+  (let* ((screen (ebb-screen-create 4 1))
+         (attr (make-ebb-attr :bg 1))
+         (line (make-ebb-line :text "    " :cells-valid nil
+                              :uniform-attr attr)))
+    (ebb--history-push-row screen line 4)
+    (let ((logical (car (ebb-screen-scrollback screen))))
+      (should-not (ebb-history-line-text logical))
+      (should (eq attr (ebb-cell-attr (aref (ebb-history-line-cells logical) 0)))))))
+
+(ert-deftest ebb-test-erase-removes-stale-text-attribute-runs ()
+  "Erasing styled text removes cached runs from rendering and history."
+  (ebb-test-with-screen (:width 4 :height 1)
+    (ebb-test-output parser "\e[31mabc\r\e[0m\e[K")
+    (let ((line (ebb--line-at screen 0)))
+      (should-not (ebb-line-attr-runs line))
+      (should (equal "    " (ebb-line-text line))))
+    (ebb-test-output parser "\r\n")
+    (let ((logical (car (ebb-screen-scrollback screen))))
+      (should (zerop (ebb-history-line-text-length logical)))
+      (should-not (ebb-history-line-attr-runs logical)))))
+
+(ert-deftest ebb-test-history-prompt-end-stays-on-boundary-row ()
+  "Prompt ends at a wrap boundary agree with their rendered row."
+  (let ((screen (ebb-screen-create 4 1)))
+    (setf (ebb-screen-scrollback screen)
+          (list (make-ebb-history-line
+                 :id 0 :text "abcdef" :text-length 6 :prompt-ends '(4)))
+          (ebb-screen-scrollback-length screen) 1
+          (ebb-screen-history-next-id screen) 1
+          (ebb-screen-history-logical-p screen) t)
+    (should (equal '((0 . 4)) (ebb-screen-prompt-end-locations screen)))
+    (should (equal '(4)
+                   (ebb-line-prompt-ends
+                    (ebb-screen-history-render-row screen 0))))))
 
 (ert-deftest ebb-test-logical-history-appends-row-map-in-place ()
   "Steady output extends the width map without rescanning old history."

@@ -59,8 +59,9 @@
   "One unwrapped main-screen history line."
   (id 0)
   (cells [])
-  (text nil)          ; lazy single-width plain text, instead of CELLS
+  (text nil)          ; lazy single-width text, instead of CELLS
   (text-length 0)     ; logical prefix of TEXT, excluding trailing blanks
+  (attr-runs nil)     ; logical (START END ATTR) ranges over TEXT
   (prompt-begins nil)
   (prompt-ends nil)
   (open nil)
@@ -662,6 +663,47 @@ TEXT is transferred directly to history without copying."
                     i))))
       (cons text end))))
 
+(defun ebb--history-text-row-info (line width wrapped)
+  "Return lazy single-width history metadata for LINE, or nil.
+The result is (TEXT LENGTH ATTR-RUNS).  Styled trailing blanks remain logical
+content; unstyled presentation padding is excluded."
+  (when (and (ebb-line-text line)
+             (= (length (ebb-line-text line)) width)
+             (null (ebb-line-uniform-attr line)))
+    (let* ((text (ebb-line-text line))
+           (runs (ebb-line-attr-runs line))
+           (end
+            (if wrapped
+                width
+              (let ((i width))
+                (while (and (> i 0) (= (aref text (1- i)) ?\s))
+                  (cl-decf i))
+                (dolist (run runs)
+                  (setq i (max i (min width (nth 1 run)))))
+                i))))
+      (list text end
+            (cl-loop for run in runs
+                     for start = (nth 0 run)
+                     for finish = (min end (nth 1 run))
+                     when (< start finish)
+                     collect (list start finish (nth 2 run)))))))
+
+(defun ebb--shift-attr-runs (runs offset)
+  "Return copies of RUNS shifted right by OFFSET columns."
+  (mapcar (lambda (run)
+            (list (+ offset (nth 0 run))
+                  (+ offset (nth 1 run))
+                  (nth 2 run)))
+          runs))
+
+(defun ebb--slice-attr-runs (runs start end)
+  "Project RUNS intersecting [START, END) into slice-local columns."
+  (cl-loop for run in runs
+           for begin = (max start (nth 0 run))
+           for finish = (min end (nth 1 run))
+           when (< begin finish)
+           collect (list (- begin start) (- finish start) (nth 2 run))))
+
 (defun ebb--history-flush-batch ()
   "Flush dynamically collected plain rows as one history chunk."
   (when ebb--history-batch-rows
@@ -715,24 +757,34 @@ that actually scrolled off the display."
       (cl-incf (ebb-screen-scrollback-length screen) count)
       (ebb--history-changed screen 'append chunk))))
 
-(defun ebb--plain-text-to-cells (text)
-  "Return single-width default cells for plain TEXT."
+(defun ebb--text-to-cells (text &optional attr-runs)
+  "Return single-width cells for TEXT with ATTR-RUNS."
   (let* ((length (length text))
          (cells (make-vector length nil))
          (i 0))
     (while (< i length)
       (aset cells i (make-ebb-cell :char (aref text i)))
       (cl-incf i))
+    (dolist (run attr-runs)
+      (setq i (nth 0 run))
+      (let ((end (min length (nth 1 run)))
+            (attr (nth 2 run)))
+        (while (< i end)
+          (setf (ebb-cell-attr (aref cells i)) attr)
+          (cl-incf i))))
     cells))
 
 (defun ebb--history-line-ensure-cells (line)
-  "Return LINE's cells, materializing its lazy plain text once."
+  "Return LINE's cells, materializing its lazy text and attributes once."
   (if-let ((text (ebb-history-line-text line)))
-      (let ((cells (ebb--plain-text-to-cells
-                    (substring text 0 (ebb-history-line-text-length line)))))
+      (let ((cells
+             (ebb--text-to-cells
+              (substring text 0 (ebb-history-line-text-length line))
+              (ebb-history-line-attr-runs line))))
         (setf (ebb-history-line-cells line) cells
               (ebb-history-line-text line) nil
-              (ebb-history-line-text-length line) 0)
+              (ebb-history-line-text-length line) 0
+              (ebb-history-line-attr-runs line) nil)
         cells)
     (ebb-history-line-cells line)))
 
@@ -753,9 +805,11 @@ that actually scrolled off the display."
   (setf (ebb-screen-history-logical-p screen) t)
   (let* ((wrapped (ebb-line-wrapped line))
          (plain-info (ebb--history-plain-row-text line width wrapped))
-         (plain (car-safe plain-info))
-         (plain-length (cdr-safe plain-info))
-         (cells (unless plain-info
+         (text-info (ebb--history-text-row-info line width wrapped))
+         (text (nth 0 text-info))
+         (text-length (or (nth 1 text-info) 0))
+         (attr-runs (nth 2 text-info))
+         (cells (unless text-info
                   (let ((row-cells (ebb--line-ensure-cells line width)))
                     (if wrapped
                         (vconcat row-cells)
@@ -765,6 +819,9 @@ that actually scrolled off the display."
     (if (and (eq screen ebb--history-batch-screen)
              plain-info
              (not wrapped)
+             (not (and current
+                       (ebb-history-line-p current)
+                       (ebb-history-line-open current)))
              (null (ebb-line-prompt-begins line))
              (null (ebb-line-prompt-ends line)))
         (push plain-info ebb--history-batch-rows)
@@ -775,20 +832,27 @@ that actually scrolled off the display."
       (if (and current (ebb-history-line-p current)
                (ebb-history-line-open current))
           (let ((offset (ebb--history-line-length current)))
-            (if (and plain-info (ebb-history-line-text current))
+            (if (and text-info (ebb-history-line-text current))
                 (let ((current-length
                        (ebb-history-line-text-length current)))
                   (setf (ebb-history-line-text current)
                         (concat (substring (ebb-history-line-text current)
                                            0 current-length)
-                                (substring plain 0 plain-length))
+                                (substring text 0 text-length))
                         (ebb-history-line-text-length current)
-                        (+ current-length plain-length)))
+                        (+ current-length text-length)
+                        (ebb-history-line-attr-runs current)
+                        (ebb--merge-attr-runs
+                         (append
+                          (ebb-history-line-attr-runs current)
+                          (ebb--shift-attr-runs
+                           attr-runs current-length)))))
               (setf (ebb-history-line-cells current)
                     (vconcat (ebb--history-line-ensure-cells current)
                              (or cells
-                                 (ebb--plain-text-to-cells
-                                  (substring plain 0 plain-length))))))
+                                 (ebb--text-to-cells
+                                  (substring text 0 text-length)
+                                  attr-runs)))))
             (setf (ebb-history-line-prompt-begins current)
                   (append (ebb-history-line-prompt-begins current)
                           (mapcar (lambda (column) (+ offset column))
@@ -806,9 +870,10 @@ that actually scrolled off the display."
                (make-ebb-history-line
                 :id (prog1 (ebb-screen-history-next-id screen)
                       (cl-incf (ebb-screen-history-next-id screen)))
-                :cells (if plain-info [] (vconcat cells))
-                :text plain
-                :text-length (or plain-length 0)
+                :cells (if text-info [] (vconcat cells))
+                :text text
+                :text-length text-length
+                :attr-runs attr-runs
                 :prompt-begins (copy-sequence (ebb-line-prompt-begins line))
                 :prompt-ends (copy-sequence (ebb-line-prompt-ends line))
                 :open wrapped)))
@@ -960,6 +1025,9 @@ ordered oldest first.  A plain chunk may represent many logical lines."
                  :text (concat (substring plain offset end)
                                (make-string (- width (- end offset)) ?\s))
                  :cells-valid nil
+                 :attr-runs
+                 (ebb--slice-attr-runs
+                  (ebb-history-line-attr-runs logical) offset end)
                  common)
         (let* ((cells (ebb-history-line-cells logical))
                (row-cells (if (= offset end) []
@@ -988,6 +1056,14 @@ ordered oldest first.  A plain chunk may represent many logical lines."
           (cl-incf row))
         (cons row (min width (- length start)))))))
 
+(defun ebb-history-line-end-offset-position (line width offset)
+  "Return the physical position immediately after OFFSET cells in LINE."
+  (if (zerop offset)
+      '(0 . 0)
+    (let ((position
+           (ebb-history-line-offset-position line width (1- offset))))
+      (cons (car position) (1+ (cdr position))))))
+
 (defun ebb-screen-prompt-end-locations (screen)
   "Return ordered (ROW . COLUMN) prompt-end locations for SCREEN."
   (ebb--history-normalize screen)
@@ -999,7 +1075,7 @@ ordered oldest first.  A plain chunk may represent many logical lines."
         (dolist (offset (sort (copy-sequence
                                (ebb-history-line-prompt-ends entry)) #'<))
           (let ((position
-                 (ebb-history-line-offset-position entry width offset)))
+                 (ebb-history-line-end-offset-position entry width offset)))
             (push (cons (+ row-base (car position)) (cdr position)) locations))))
       (cl-incf row-base (ebb--history-entry-row-count entry width)))
     (dotimes (row (ebb-screen-height screen))
@@ -1500,6 +1576,7 @@ for wide/non-ASCII/insert-mode cases."
     (ebb--history-add-input-chunk
      screen string starts history-lengths 0 input-history)
     ;; Existing prefix rows that survived scrolling retain their metadata.
+    (setq i existing-history)
     (while (< i cursor-y)
       (aset new-lines destination (ebb--line-at screen i))
       (cl-incf destination)
@@ -1752,20 +1829,26 @@ Handles LF, VT, FF."
        (if (and (null (ebb-cell-attr ecell))
                 (ebb-line-text line)
                 (null (ebb-line-uniform-attr line)))
-           (cl-loop for i from cx below width
-                    do (aset (ebb-line-text line) i ?\s))
-         (setf (ebb-line-text line) nil)
-         (setf (ebb-line-uniform-attr line) nil)))
+           (progn
+             (cl-loop for i from cx below width
+                      do (aset (ebb-line-text line) i ?\s))
+             (ebb--line-set-attr-run line cx width nil))
+         (setf (ebb-line-text line) nil
+               (ebb-line-attr-runs line) nil
+               (ebb-line-uniform-attr line) nil)))
       (1 ;; start to cursor
        (cl-loop for i from 0 to cx
                 do (aset cells i (copy-ebb-cell ecell)))
        (if (and (null (ebb-cell-attr ecell))
                 (ebb-line-text line)
                 (null (ebb-line-uniform-attr line)))
-           (cl-loop for i from 0 to cx
-                    do (aset (ebb-line-text line) i ?\s))
-         (setf (ebb-line-text line) nil)
-         (setf (ebb-line-uniform-attr line) nil)))
+           (progn
+             (cl-loop for i from 0 to cx
+                      do (aset (ebb-line-text line) i ?\s))
+             (ebb--line-set-attr-run line 0 (1+ cx) nil))
+         (setf (ebb-line-text line) nil
+               (ebb-line-attr-runs line) nil
+               (ebb-line-uniform-attr line) nil)))
       (2 ;; whole line
        (cl-loop for i from 0 below width
                 do (aset cells i (copy-ebb-cell ecell)))
@@ -1776,7 +1859,8 @@ Handles LF, VT, FF."
              (setf (ebb-line-text line) (make-string width ?\s))
              (setf (ebb-line-uniform-attr line) nil))
          (setf (ebb-line-text line) nil)
-         (setf (ebb-line-uniform-attr line) nil))))
+         (setf (ebb-line-uniform-attr line) nil))
+       (setf (ebb-line-attr-runs line) nil)))
     (setf (ebb-line-dirty line) t)
     (ebb--mark-dirty screen cy)))
 
@@ -1794,6 +1878,7 @@ Handles LF, VT, FF."
           (setf (ebb-line-uniform-attr line) nil))
       (setf (ebb-line-text line) nil)
       (setf (ebb-line-uniform-attr line) nil))
+    (setf (ebb-line-attr-runs line) nil)
     (setf (ebb-line-prompt-begins line) nil)
     (setf (ebb-line-prompt-ends line) nil)
     (setf (ebb-line-wrapped line) nil)
@@ -1814,10 +1899,13 @@ Handles LF, VT, FF."
     (if (and (null (ebb-cell-attr ecell))
              (ebb-line-text line)
              (null (ebb-line-uniform-attr line)))
-        (cl-loop for i from cx below end
-                 do (aset (ebb-line-text line) i ?\s))
-      (setf (ebb-line-text line) nil)
-      (setf (ebb-line-uniform-attr line) nil))
+        (progn
+          (cl-loop for i from cx below end
+                   do (aset (ebb-line-text line) i ?\s))
+          (ebb--line-set-attr-run line cx end nil))
+      (setf (ebb-line-text line) nil
+            (ebb-line-attr-runs line) nil
+            (ebb-line-uniform-attr line) nil))
     (setf (ebb-line-dirty line) t)
     (ebb--mark-dirty screen cy)))
 
@@ -1878,8 +1966,9 @@ Handles LF, VT, FF."
          (line (ebb--line-at screen cy))
          (cells (ebb--line-ensure-cells line (ebb-screen-width screen)))
          (n (min count (- width cx))))
-    (setf (ebb-line-text line) nil)
-        (setf (ebb-line-uniform-attr line) nil)
+    (setf (ebb-line-text line) nil
+          (ebb-line-attr-runs line) nil
+          (ebb-line-uniform-attr line) nil)
     ;; Shift right
     (cl-loop for i from (1- width) downto (+ cx n)
              do (aset cells i (aref cells (- i n))))
@@ -1897,8 +1986,9 @@ Handles LF, VT, FF."
          (line (ebb--line-at screen cy))
          (cells (ebb--line-ensure-cells line (ebb-screen-width screen)))
          (n (min count (- width cx))))
-    (setf (ebb-line-text line) nil)
-        (setf (ebb-line-uniform-attr line) nil)
+    (setf (ebb-line-text line) nil
+          (ebb-line-attr-runs line) nil
+          (ebb-line-uniform-attr line) nil)
     ;; Shift left
     (cl-loop for i from cx below (- width n)
              do (aset cells i (aref cells (+ i n))))

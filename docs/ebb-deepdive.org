@@ -115,9 +115,9 @@ Ghostel module 0.45.0, the current implementation measured approximately:
 
 | Case | Ebb | Eat | Ghostel |
 |---+---:|---:|---:|
-| Plain output | 3.64 MiB/s | 1.33 MiB/s | 428.59 MiB/s |
-| SGR/color output | 0.08 MiB/s | 0.26 MiB/s | 35.02 MiB/s |
-| TUI updates | 1.48 MiB/s | 0.84 MiB/s | 557.04 MiB/s |
+| Plain output | 3.62 MiB/s | 1.31 MiB/s | 418.96 MiB/s |
+| SGR/color output | 0.28 MiB/s | 0.26 MiB/s | 34.63 MiB/s |
+| TUI updates | 1.44 MiB/s | 0.83 MiB/s | 519.16 MiB/s |
 
 The first benchmark exposed a plain-output throughput of only 0.33 MiB/s.
 The first optimization stopped materializing every plain scrollback row as a
@@ -132,13 +132,15 @@ cumulative row map, so resize still reflows logical lines while visible-row
 lookup remains logarithmic.  Only rows requested by the bounded renderer are
 materialized as =ebb-history-line= and =ebb-line= objects.
 
-Styled, wide, combining, wrapped, prompted, and otherwise complex rows retain
-the ordinary cell-backed logical-line path.  This keeps the optimization from
-weakening terminal semantics or lazy history behavior.
+Single-width styled rows now use the same lazy text-backed history principle,
+with compact attribute runs retained beside the logical text.  Styled trailing
+blanks remain content, and the renderer projects only the requested run slices.
+Wide, combining, uniformly styled, and otherwise complex rows retain the
+ordinary cell-backed logical-line fallback.
 
-The result is roughly 2.7 times Eat's throughput for this synthetic plain
+The result is roughly 2.8 times Eat's throughput for the synthetic plain
 scrolling workload while preserving bounded rendering, resize reflow, buffer
-switching, and logical anchors.  SGR output still follows the expensive
-cell/attribute fallback and remains the next obvious optimization target.  TUI
-output continues to favor Ebb's dirty-row tracking and identical-row
-suppression.
+switching, and logical anchors.  Avoiding per-column cell materialization raises
+SGR throughput from 0.08 MiB/s to 0.28 MiB/s, slightly ahead of Eat for this
+workload.  TUI output continues to favor Ebb's dirty-row tracking and
+identical-row suppression.
