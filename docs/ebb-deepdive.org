@@ -115,26 +115,30 @@ Ghostel module 0.45.0, the current implementation measured approximately:
 
 | Case | Ebb | Eat | Ghostel |
 |---+---:|---:|---:|
-| Plain output | 1.14 MiB/s | 1.31 MiB/s | 308.35 MiB/s |
-| SGR/color output | 0.08 MiB/s | 0.25 MiB/s | 32.20 MiB/s |
-| TUI updates | 1.43 MiB/s | 0.81 MiB/s | 374.48 MiB/s |
+| Plain output | 3.64 MiB/s | 1.33 MiB/s | 428.59 MiB/s |
+| SGR/color output | 0.08 MiB/s | 0.26 MiB/s | 35.02 MiB/s |
+| TUI updates | 1.48 MiB/s | 0.84 MiB/s | 557.04 MiB/s |
 
 The first benchmark exposed a plain-output throughput of only 0.33 MiB/s.
-Every row entering scrollback was materialized into a vector of cell structs,
-even when the display row was still represented by lazy plain text.  Ebb now
-transfers that text directly into a text-backed =ebb-history-line=, records its
-logical length separately from terminal padding, and materializes cells only
-if later styled or wide content requires them.  Plain history rendering and
-width-dependent row maps operate directly on this lazy representation.
+The first optimization stopped materializing every plain scrollback row as a
+vector of cell structs and raised throughput to approximately 1.14 MiB/s.
 
-That change made plain output roughly 3.5 times faster, bringing it close to
-Eat while retaining resize reflow and bounded history rendering.  Eat remains
-about 15 percent faster in this synthetic scrolling case because it inserts
-output directly into its authoritative buffer representation.  SGR output
-still follows the cell/attribute fallback and is the next obvious optimization
-target.  TUI output continues to favor Ebb's dirty-row tracking and
-identical-row suppression.
+The plain CRLF path now goes further.  The parser recognizes complete blocks,
+the screen applies simple full-width scrolling in one operation, and closed
+plain lines share an =ebb-history-chunk= containing source text plus compact
+line offsets and logical lengths.  History generation and top-level row-map
+metadata change once per block.  Each chunk caches its own width-dependent
+cumulative row map, so resize still reflows logical lines while visible-row
+lookup remains logarithmic.  Only rows requested by the bounded renderer are
+materialized as =ebb-history-line= and =ebb-line= objects.
 
-The old “faster than Eat” result was therefore likely from a parser/model,
-alternate-screen, or repaint-heavy benchmark.  The current model-plus-render
-benchmark also charges Ebb for main-screen history projection.
+Styled, wide, combining, wrapped, prompted, and otherwise complex rows retain
+the ordinary cell-backed logical-line path.  This keeps the optimization from
+weakening terminal semantics or lazy history behavior.
+
+The result is roughly 2.7 times Eat's throughput for this synthetic plain
+scrolling workload while preserving bounded rendering, resize reflow, buffer
+switching, and logical anchors.  SGR output still follows the expensive
+cell/attribute fallback and remains the next obvious optimization target.  TUI
+output continues to favor Ebb's dirty-row tracking and identical-row
+suppression.

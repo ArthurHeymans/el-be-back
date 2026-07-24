@@ -209,23 +209,28 @@ Returns the number of characters consumed."
                                          (>= c ?\s)
                                          (/= c ?\x7f))))
                         (cl-incf i))
-                    ;; PTY output and the benchmark corpus are normally
-                    ;; unibyte.  Keep their ASCII scan as small as the original
-                    ;; hot path while still stopping before C1/high bytes.
                     (while (and (< i e)
                                 (let ((c (aref string i)))
                                   (and (>= c ?\s) (< c #x7f))))
                       (cl-incf i)))
-                  (ebb-screen-write-string screen string run-start i)
-                  ;; Bulk command output commonly arrives as printable text followed
-                  ;; by CRLF.  Handle that pair inline in ground state to avoid two
-                  ;; full parser dispatches per line.
-                  (when (and (< (1+ i) e)
-                             (= (aref string i) ?\r)
-                             (= (aref string (1+ i)) ?\n))
-                    (ebb-screen-carriage-return screen)
-                    (ebb-screen-index screen)
-                    (cl-incf i 2)))
+                  (let ((crlf (and (< (1+ i) e)
+                                   (= (aref string i) ?\r)
+                                   (= (aref string (1+ i)) ?\n)))
+                        block-end)
+                    ;; Only probe for a block after the ordinary hot-path scan
+                    ;; has already found a CRLF.  TUI and escape-heavy runs do
+                    ;; not pay for a second failed printable scan.
+                    (when (and crlf (not multibyte))
+                      (setq block-end
+                            (ebb-screen-write-crlf-block
+                             screen string run-start e)))
+                    (if block-end
+                        (setq i block-end)
+                      (ebb-screen-write-string screen string run-start i)
+                      (when crlf
+                        (ebb-screen-carriage-return screen)
+                        (ebb-screen-index screen)
+                        (cl-incf i 2)))))
               (ebb-parse--process-char parser ch)
               (cl-incf i)))))))
     (- i (or start 0))))
