@@ -1,0 +1,140 @@
+#+TITLE: Ebb deep dive: Eat's model and Ebb's rendering
+
+This document explains the design question behind Ebb: why retain Eat's
+terminal interface while putting the terminal state somewhere other than the
+Emacs buffer.
+
+* What Eat does
+
+Eat is a complete VT terminal emulator implemented in Emacs Lisp.  A process
+filter receives PTY output, puts it through a timer-backed output queue, and
+then calls =eat-term-process-output=.  The terminal handler interprets control
+sequences and updates a terminal object whose display is a region of the
+Emacs buffer.  =eat-term-redisplay= joins long lines, truncates old scrollback,
+and prepares the changed display for redisplay.
+
+In Eat, the buffer is both the screen model and the presentation.  Characters,
+line boundaries, cursor positions, and attributes are represented by buffer
+text, markers, and text properties.  That is a pragmatic and capable design:
+ordinary Emacs operations, copying, markers, faces, and scrollback naturally
+operate on the same data.  It also explains several trade-offs:
+
+- terminal updates are buffer mutations, not a separate commit step;
+- parsing, screen updates, and buffer maintenance are closely interleaved;
+- point, undo, markers, narrowing, and other buffer users share the terminal's
+  mutable representation;
+- a large output burst remains work on the Emacs main thread, even though the
+  queue can coalesce redraws.
+
+Eat's approach is not simply wrong.  It has matured around this representation
+and provides a broad feature surface, including Sixel support and an
+embeddable =eat-term-= API.  Its buffer-as-model design is part of why those
+APIs integrate well with Emacs.
+
+* Ebb's split model
+
+Ebb makes the split explicit:
+
+1. =ebb-term= owns a screen structure: vectors of lines and cells, cursor and
+   modes, attributes, alternate-screen state, and logical scrollback.
+2. =ebb-parse= consumes output and mutates only that screen structure.  The
+   parser can therefore be tested with no buffer and no process.
+3. =ebb-render= projects the model into a buffer.  It updates dirty viewport
+   rows, keeps cursor state in an overlay, and materializes only a bounded
+   scrollback slab near the windows that need it.
+4. =ebb-io= queues process-filter output, parses bounded chunks, and runs a
+   render pass between chunks.
+
+The distinction matters even though both implementations are pure Elisp.  A
+terminal operation such as cursor movement can change the model without
+requiring a buffer edit.  Several parser operations can be accumulated and
+then displayed in one controlled pass.  Tests can assert screen state without
+having to reconstruct it from text properties.
+
+* Why rendering is different
+
+** Dirty lines instead of repainting the buffer
+
+Each screen line is marked dirty when its cells change.  A refresh obtains the
+sorted dirty rows and calls the renderer only for those rows.  Cursor movement,
+visibility, and scrollback metadata are reconciled separately, because those
+can change without changing row contents.
+
+A line also has fast paths for plain text and uniform attributes.  Styled lines
+are converted to strings with Emacs text properties, using cached face
+specifications.  This keeps the expensive property construction out of the
+common plain-output path.
+
+** A bounded view of unbounded history
+
+The model retains logical main-screen history and builds a width-dependent row
+map when wrapped rows are needed.  The buffer does not have to contain every
+historical row.  =ebb-render= inserts a slab around the visible windows and
+uses model anchors (history line id plus offset, or a viewport coordinate) to
+restore point and window positions when the slab is rebuilt.
+
+This is why Ebb can reflow main-screen scrollback on resize without treating
+its buffer text as authoritative.  The alternate screen is intentionally not
+reflowed: full-screen programs own that grid and normally repaint after the
+resize signal.
+
+** Chunked I/O and batched rendering
+
+The Ebb process filter only appends output to a queue.  The scheduler parses up
+to =ebb-chunk-size= bytes per turn, then yields.  Rendering is coalesced between
+=ebb-minimum-latency= and =ebb-maximum-latency=.  This does not make Elisp
+parsing free; it bounds how long one callback can monopolize Emacs and reduces
+repeated buffer work during output floods.
+
+The trade-off is a little more pipeline state and possible display latency.
+The benefit is a clean place to add back-pressure, tracing, or alternate
+transports without making the parser know about buffers.
+
+* Consequences
+
+Ebb's architecture favors isolation, predictable mutation, and responsiveness
+under hostile output.  Eat favors maturity, direct Emacs integration, and a
+large compatibility surface.  Ebb's renderer is consequently more elaborate:
+it has to project, cache, anchor, and virtualize information that Eat gets for
+free from its buffer representation.
+
+The benchmark in [[file:../bench/ebb-bench.el]] measures the model-plus-render
+path separately from the full interactive process lifecycle.  Compare
+results only when Ebb and Eat are native-compiled; otherwise the comparison is
+primarily a comparison of Emacs Lisp compilation modes rather than terminal
+designs.
+
+* Current throughput result
+
+With 1 MiB of output, 80x24, three iterations, native-compiled Elisp, and
+Ghostel module 0.45.0, the current implementation measured approximately:
+
+#+begin_src sh
+./bench/run-bench.sh --size 1048576 --iterations 3
+#+end_src
+
+| Case | Ebb | Eat | Ghostel |
+|---+---:|---:|---:|
+| Plain output | 1.14 MiB/s | 1.31 MiB/s | 308.35 MiB/s |
+| SGR/color output | 0.08 MiB/s | 0.25 MiB/s | 32.20 MiB/s |
+| TUI updates | 1.43 MiB/s | 0.81 MiB/s | 374.48 MiB/s |
+
+The first benchmark exposed a plain-output throughput of only 0.33 MiB/s.
+Every row entering scrollback was materialized into a vector of cell structs,
+even when the display row was still represented by lazy plain text.  Ebb now
+transfers that text directly into a text-backed =ebb-history-line=, records its
+logical length separately from terminal padding, and materializes cells only
+if later styled or wide content requires them.  Plain history rendering and
+width-dependent row maps operate directly on this lazy representation.
+
+That change made plain output roughly 3.5 times faster, bringing it close to
+Eat while retaining resize reflow and bounded history rendering.  Eat remains
+about 15 percent faster in this synthetic scrolling case because it inserts
+output directly into its authoritative buffer representation.  SGR output
+still follows the cell/attribute fallback and is the next obvious optimization
+target.  TUI output continues to favor Ebb's dirty-row tracking and
+identical-row suppression.
+
+The old “faster than Eat” result was therefore likely from a parser/model,
+alternate-screen, or repaint-heavy benchmark.  The current model-plus-render
+benchmark also charges Ebb for main-screen history projection.

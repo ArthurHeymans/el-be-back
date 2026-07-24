@@ -414,12 +414,27 @@ Binds `screen' and `parser' in BODY."
           (ebb-screen-scrollback-length screen) 2)
     (should (= 2 (ebb-screen-history-row-count screen)))
     (should (= 1 (ebb-screen-scrollback-length screen)))
-    (should (= 6 (length (ebb-history-line-cells
-                          (car (ebb-screen-scrollback screen))))))
+    (let ((logical (car (ebb-screen-scrollback screen))))
+      (should (equal "abcdef" (ebb-history-line-text logical)))
+      (should (zerop (length (ebb-history-line-cells logical)))))
     (ebb-screen-resize screen 2 2)
     (should (= 3 (ebb-screen-history-row-count screen)))
-    (should (= 6 (length (ebb-history-line-cells
-                          (car (ebb-screen-scrollback screen))))))))
+    (let ((logical (car (ebb-screen-scrollback screen))))
+      (should (equal "abcdef" (ebb-history-line-text logical)))
+      (should (zerop (length (ebb-history-line-cells logical)))))))
+
+(ert-deftest ebb-test-logical-history-plain-render-stays-lazy ()
+  "Rendering plain history does not materialize cell structs."
+  (let ((screen (ebb-screen-create 4 2)))
+    (ebb--history-push-row
+     screen (make-ebb-line :text "abc " :cells-valid nil) 4)
+    (let* ((logical (car (ebb-screen-scrollback screen)))
+           (rendered (ebb-screen-history-render-row screen 0)))
+      (should (equal "abc " (ebb-history-line-text logical)))
+      (should (= 3 (ebb-history-line-text-length logical)))
+      (should (zerop (length (ebb-history-line-cells logical))))
+      (should (equal "abc " (ebb-line-text rendered)))
+      (should-not (ebb-line-cells-valid rendered)))))
 
 (ert-deftest ebb-test-logical-history-appends-row-map-in-place ()
   "Steady output extends the width map without rescanning old history."

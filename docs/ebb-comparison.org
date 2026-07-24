@@ -1,0 +1,29 @@
+#+TITLE: Ebb, Eat, and Ghostel
+
+The three projects make different trade-offs.  This table describes the
+architectures, not a claim that one is universally best.
+
+| Area                 | Ebb                                                                             | Eat                                                                                                     | Ghostel                                                                             |
+|----------------------+---------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------|
+| VT engine            | Pure Elisp, Ebb's split parser and screen model                                 | Pure Elisp, mature integrated terminal implementation                                                   | libghostty-vt in a Zig dynamic module                                               |
+| Screen state         | Structs and cell vectors in =ebb-term=                                            | Terminal state represented by buffer text, markers, and properties                                      | Native terminal/grid state behind the module boundary                               |
+| Buffer rendering     | Explicit projection; dirty rows and bounded scrollback slab                     | Terminal updates mutate the display buffer directly; redisplay preparation is part of the terminal path | Native renderer applies terminal state to the Emacs buffer; Elisp schedules redraws |
+| Process output       | Queue, bounded parse chunks, coalesced render                                   | Timer-backed output queue, then synchronous terminal handling                                           | Native PTY is available; Emacs-owned process path also exists                       |
+| Scrollback           | Logical lines in the model; width-dependent rows materialized near the viewport | Buffer text is the scrollback representation                                                            | Native scrollback/grid with native-to-buffer rendering                              |
+| Resize               | Reflows main history; alternate screen keeps its grid for application repaint   | Buffer/display-oriented resize and reflow                                                               | Native terminal resize and renderer                                                 |
+| Native dependency    | None                                                                            | None                                                                                                    | Required for the native module; Zig is needed when building from source             |
+| Emacs Lisp API       | Screen/parser/render pieces are independently testable                          | =eat-term-make= and related embeddable terminal API                                                       | Elisp command and integration API around the native terminal                        |
+| Input modes          | semi-char, char, emacs                                                          | semi-char, char, emacs                                                                                  | Eat-style modes plus line/copy modes                                                |
+| Shell / Eshell       | Shell integration and visual commands                                           | Shell and Eshell integration                                                                            | Shell, Eshell, project, and other integrations                                      |
+| Graphics / protocols | Smaller feature surface; no Sixel parity with Eat                               | Sixel and broad compatibility work                                                                      | Kitty graphics/keyboard and modern libghostty protocols                             |
+| Main advantage       | Inspectable model and controlled rendering without a native module              | Mature, capable, deeply integrated pure-Elisp terminal                                                  | Native speed and modern VT coverage                                                 |
+| Main cost            | More projection, caching, and model/render synchronization code                 | Buffer mutation couples terminal state to Emacs buffer behavior                                         | Native binary/toolchain/platform and module boundary                                |
+
+* Reading the comparison
+
+Ebb is closest to Eat in deployment and user-facing intent, but not in where
+state lives.  Ghostel is the performance and protocol counterpoint: its
+terminal engine and renderer are native, so its benchmark numbers should not be
+read as a pure language comparison.  The benchmark launcher therefore refuses
+to run without native compilation for the Elisp implementations and checks for
+Ghostel's native module.

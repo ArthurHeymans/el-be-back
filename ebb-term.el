@@ -59,6 +59,8 @@
   "One unwrapped main-screen history line."
   (id 0)
   (cells [])
+  (text nil)          ; lazy single-width plain text, instead of CELLS
+  (text-length 0)     ; logical prefix of TEXT, excluding trailing blanks
   (prompt-begins nil)
   (prompt-ends nil)
   (open nil)
@@ -494,11 +496,14 @@ KIND may be `append' for LINE or `last' for an extended newest line."
         (setf (ebb-screen-history-row-map-generation screen)
               (ebb-screen-history-generation screen))))
      (t
-      (setf (ebb-screen-history-row-ends screen) nil
-            (ebb-screen-history-lines-vector screen) nil
-            (ebb-screen-history-map-count screen) 0
-            (ebb-screen-history-row-map-width screen) nil
-            (ebb-screen-history-row-map-generation screen) nil)))))
+      ;; Once invalid, leave the map fields alone while bulk output continues.
+      ;; Re-clearing five slots for every scrolled row is pure hot-path cost.
+      (when (ebb-screen-history-row-ends screen)
+        (setf (ebb-screen-history-row-ends screen) nil
+              (ebb-screen-history-lines-vector screen) nil
+              (ebb-screen-history-map-count screen) 0
+              (ebb-screen-history-row-map-width screen) nil
+              (ebb-screen-history-row-map-generation screen) nil))))))
 
 (defun ebb--history-clear (screen)
   "Clear SCREEN's logical history."
@@ -521,22 +526,87 @@ KIND may be `append' for LINE or `last' for an extended newest line."
             (ebb--history-push-row screen row (ebb-screen-width screen)))
           (setf (ebb-screen-scrollback-dirty screen) t))))))
 
+(defun ebb--history-plain-row-text (line width wrapped)
+  "Return (TEXT . LENGTH) for a lazy plain LINE, or nil.
+Preserve all columns when WRAPPED; otherwise LENGTH omits trailing blanks.
+TEXT is transferred directly to history without copying."
+  (when (and (ebb-line-text line)
+             (= (length (ebb-line-text line)) width)
+             (null (ebb-line-attr-runs line))
+             (null (ebb-line-uniform-attr line)))
+    (let* ((text (ebb-line-text line))
+           (end (if wrapped width
+                  (let ((i width))
+                    (while (and (> i 0) (= (aref text (1- i)) ?\s))
+                      (cl-decf i))
+                    i))))
+      (cons text end))))
+
+(defun ebb--plain-text-to-cells (text)
+  "Return single-width default cells for plain TEXT."
+  (let* ((length (length text))
+         (cells (make-vector length nil))
+         (i 0))
+    (while (< i length)
+      (aset cells i (make-ebb-cell :char (aref text i)))
+      (cl-incf i))
+    cells))
+
+(defun ebb--history-line-ensure-cells (line)
+  "Return LINE's cells, materializing its lazy plain text once."
+  (if-let ((text (ebb-history-line-text line)))
+      (let ((cells (ebb--plain-text-to-cells
+                    (substring text 0 (ebb-history-line-text-length line)))))
+        (setf (ebb-history-line-cells line) cells
+              (ebb-history-line-text line) nil
+              (ebb-history-line-text-length line) 0)
+        cells)
+    (ebb-history-line-cells line)))
+
+(defsubst ebb--history-line-length (line)
+  "Return LINE's logical cell length without forcing lazy text."
+  (if (ebb-history-line-text line)
+      (ebb-history-line-text-length line)
+    (length (ebb-history-line-cells line))))
+
+(defsubst ebb--history-line-wrap-end (line offset width)
+  "Return LINE's wrap end after OFFSET at WIDTH."
+  (if (ebb-history-line-text line)
+      (min (ebb-history-line-text-length line) (+ offset width))
+    (ebb--wrap-end (ebb-history-line-cells line) offset width)))
+
 (defun ebb--history-push-row (screen line width)
   "Append physical LINE of WIDTH columns to SCREEN's logical history."
   (setf (ebb-screen-history-logical-p screen) t)
   (let* ((wrapped (ebb-line-wrapped line))
-         (row-cells (ebb--line-ensure-cells line width))
-         (cells (if wrapped
-                    (vconcat row-cells)
-                  (ebb--trim-trailing-blank-cells row-cells)))
+         (plain-info (ebb--history-plain-row-text line width wrapped))
+         (plain (car-safe plain-info))
+         (plain-length (cdr-safe plain-info))
+         (cells (unless plain-info
+                  (let ((row-cells (ebb--line-ensure-cells line width)))
+                    (if wrapped
+                        (vconcat row-cells)
+                      (ebb--trim-trailing-blank-cells row-cells)))))
          (history (ebb-screen-scrollback screen))
          (current (car history)))
     (if (and current (ebb-history-line-p current)
              (ebb-history-line-open current))
-        (let ((offset (length (ebb-history-line-cells current))))
-          (setf (ebb-history-line-cells current)
-                (vconcat (ebb-history-line-cells current) cells)
-                (ebb-history-line-prompt-begins current)
+        (let ((offset (ebb--history-line-length current)))
+          (if (and plain-info (ebb-history-line-text current))
+              (let ((current-length
+                     (ebb-history-line-text-length current)))
+                (setf (ebb-history-line-text current)
+                      (concat (substring (ebb-history-line-text current)
+                                         0 current-length)
+                              (substring plain 0 plain-length))
+                      (ebb-history-line-text-length current)
+                      (+ current-length plain-length)))
+            (setf (ebb-history-line-cells current)
+                  (vconcat (ebb--history-line-ensure-cells current)
+                           (or cells
+                               (ebb--plain-text-to-cells
+                                (substring plain 0 plain-length))))))
+          (setf (ebb-history-line-prompt-begins current)
                 (append (ebb-history-line-prompt-begins current)
                         (mapcar (lambda (column) (+ offset column))
                                 (ebb-line-prompt-begins line)))
@@ -553,7 +623,9 @@ KIND may be `append' for LINE or `last' for an extended newest line."
              (make-ebb-history-line
               :id (prog1 (ebb-screen-history-next-id screen)
                     (cl-incf (ebb-screen-history-next-id screen)))
-              :cells (vconcat cells)
+              :cells (if plain-info [] (vconcat cells))
+              :text plain
+              :text-length (or plain-length 0)
               :prompt-begins (copy-sequence (ebb-line-prompt-begins line))
               :prompt-ends (copy-sequence (ebb-line-prompt-ends line))
               :open wrapped)))
@@ -563,13 +635,12 @@ KIND may be `append' for LINE or `last' for an extended newest line."
 
 (defun ebb-history-line-row-count (line width)
   "Return the number of WIDTH-column rows needed for logical history LINE."
-  (let ((length (length (ebb-history-line-cells line))))
+  (let ((length (ebb--history-line-length line)))
     (if (zerop length) 1
       (let ((offset 0)
             (rows 0))
         (while (< offset length)
-          (setq offset (ebb--wrap-end
-                        (ebb-history-line-cells line) offset width))
+          (setq offset (ebb--history-line-wrap-end line offset width))
           (cl-incf rows))
         rows))))
 
@@ -630,9 +701,8 @@ ordered oldest first."
                (offset 0)
                (remaining (- row line-start)))
           (while (> remaining 0)
-            (setq offset (ebb--wrap-end
-                          (ebb-history-line-cells line)
-                          offset (ebb-screen-width screen)))
+            (setq offset (ebb--history-line-wrap-end
+                          line offset (ebb-screen-width screen)))
             (cl-decf remaining))
           (cons line offset))))))
 
@@ -663,45 +733,56 @@ ordered oldest first."
   (when-let* ((location (ebb-screen-history-row-location screen row))
               (logical (car location)))
     (let* ((width (ebb-screen-width screen))
-           (cells (ebb-history-line-cells logical))
+           (length (ebb--history-line-length logical))
            (offset (cdr location))
-           (end (if (< offset (length cells))
-                    (ebb--wrap-end cells offset width)
+           (end (if (< offset length)
+                    (ebb--history-line-wrap-end logical offset width)
                   offset))
-           (last (>= end (length cells)))
-           (row-cells (if (= offset end) [] (cl-subseq cells offset end))))
-      (make-ebb-line
-       :cells (ebb--pad-cells row-cells width)
-       :prompt-begins
-       (cl-loop for column in (ebb-history-line-prompt-begins logical)
-                when (and (>= column offset) (< column end))
-                collect (- column offset))
-       :prompt-ends
-       (cl-loop for column in (ebb-history-line-prompt-ends logical)
-                when (and (> column offset) (<= column end))
-                collect (- column offset))
-       :wrapped (not last)
-       :dirty t))))
+           (last (>= end length))
+           (common
+            (list
+             :prompt-begins
+             (cl-loop for column in (ebb-history-line-prompt-begins logical)
+                      when (and (>= column offset) (< column end))
+                      collect (- column offset))
+             :prompt-ends
+             (cl-loop for column in (ebb-history-line-prompt-ends logical)
+                      when (and (> column offset) (<= column end))
+                      collect (- column offset))
+             :wrapped (not last)
+             :dirty t)))
+      (if-let ((plain (ebb-history-line-text logical)))
+          (apply #'make-ebb-line
+                 :text (concat (substring plain offset end)
+                               (make-string (- width (- end offset)) ?\s))
+                 :cells-valid nil
+                 common)
+        (let* ((cells (ebb-history-line-cells logical))
+               (row-cells (if (= offset end) []
+                            (cl-subseq cells offset end))))
+          (apply #'make-ebb-line
+                 :cells (ebb--pad-cells row-cells width)
+                 common))))))
 
 (defun ebb-history-line-offset-position (line width offset)
   "Return LINE's physical (ROW . COLUMN) for cell OFFSET at WIDTH."
-  (let ((cells (ebb-history-line-cells line))
+  (let ((length (ebb--history-line-length line))
         (start 0)
         (row 0)
         end)
-    (if (zerop (length cells))
+    (if (zerop length)
         '(0 . 0)
       (catch 'position
-        (while (< start (length cells))
-          (setq end (ebb--wrap-end cells start width))
+        (while (< start length)
+          (setq end (ebb--history-line-wrap-end line start width))
           ;; A boundary offset belongs to the following row, except at the
           ;; logical end where the previous row's end is the only position.
           (when (or (< offset end)
-                    (and (= end (length cells)) (= offset end)))
+                    (and (= end length) (= offset end)))
             (throw 'position (cons row (- offset start))))
           (setq start end)
           (cl-incf row))
-        (cons row (- (length cells) start))))))
+        (cons row (- length start))))))
 
 (defun ebb-screen-prompt-end-locations (screen)
   "Return ordered (ROW . COLUMN) prompt-end locations for SCREEN."
@@ -1999,7 +2080,11 @@ Locations are (ROW . COLUMN) pairs."
   (let ((count (ebb-screen-history-row-count screen))
         rows)
     (dotimes (row count)
-      (push (ebb-screen-history-render-row screen row) rows))
+      (let ((line (ebb-screen-history-render-row screen row)))
+        ;; This compatibility query promises physical cell-backed rows; the
+        ;; renderer itself consumes lazy text directly.
+        (ebb--line-ensure-cells line (ebb-screen-width screen))
+        (push line rows)))
     (nreverse rows)))
 
 (defun ebb-screen-scrollback-lines (screen)
