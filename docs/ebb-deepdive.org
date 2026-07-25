@@ -113,11 +113,11 @@ Ghostel module 0.45.0, the current implementation measured approximately:
 ./bench/run-bench.sh --size 1048576 --iterations 3
 #+end_src
 
-| Case | Ebb | Eat | Ghostel |
-|---+---:|---:|---:|
-| Plain output | 3.62 MiB/s | 1.31 MiB/s | 418.96 MiB/s |
-| SGR/color output | 0.28 MiB/s | 0.26 MiB/s | 34.63 MiB/s |
-| TUI updates | 1.44 MiB/s | 0.83 MiB/s | 519.16 MiB/s |
+| Case             | Ebb        | Eat        | Ghostel      |
+|------------------+------------+------------+--------------|
+| Plain output     | 3.62 MiB/s | 1.31 MiB/s | 418.96 MiB/s |
+| SGR/color output | 0.28 MiB/s | 0.26 MiB/s | 34.63 MiB/s  |
+| TUI updates      | 1.44 MiB/s | 0.83 MiB/s | 519.16 MiB/s |
 
 The first benchmark exposed a plain-output throughput of only 0.33 MiB/s.
 The first optimization stopped materializing every plain scrollback row as a
