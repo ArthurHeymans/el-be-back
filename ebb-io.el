@@ -359,6 +359,15 @@ on startup.  We create a symlink there pointing to our integration script."
 
 ;;;; ---- Process Lifecycle ----------------------------------------------
 
+(defun ebb-io--pty-process-p (process)
+  "Return non-nil when PROCESS talks to a PTY that can be resized.
+`process-type' answers `real'/`network'/`serial'/`pipe' and never `pty',
+so the connection is detected through the allocated terminal instead."
+  (and (processp process)
+       (eq (process-type process) 'real)
+       (process-tty-name process)
+       t))
+
 (defun ebb-io-start (io shell-command buffer &optional extra-env)
   "Start a terminal process running SHELL-COMMAND in BUFFER.
 EXTRA-ENV is an optional list of \"VAR=VALUE\" strings to add to
@@ -409,7 +418,7 @@ local paths), and TERM is chosen by an on-remote probe; see
                 :sentinel (lambda (proc event)
                             (ebb-io--sentinel io proc event)))))
     ;; Set initial PTY size.
-    (when (and (processp proc) (eq (process-type proc) 'pty))
+    (when (ebb-io--pty-process-p proc)
       (set-process-window-size proc h w))
     ;; Wire up response writing
     (setf (ebb-parser-write-fn (ebb-io-parser io))
@@ -490,11 +499,12 @@ queued output so the interrupted program's prompt is not stuck behind it."
         (ebb-io--process-pending io t))
       ;; Step 1: Resize screen model
       (ebb-screen-resize screen new-width new-height)
-      ;; Step 2: Notify PTY
+      ;; Step 2: Notify PTY.  Without this the child keeps its startup size
+      ;; and never gets SIGWINCH, so shells and TUIs format for the old
+      ;; width and their output wraps in the middle of a row.
       (when-let ((proc (ebb-io-process io)))
         (when (and (process-live-p proc)
-                   (processp proc)
-                   (eq (process-type proc) 'pty))
+                   (ebb-io--pty-process-p proc))
           (set-process-window-size proc new-height new-width)))
       ;; Step 3: A minibuffer only changes height.  Rebuild its viewport,
       ;; not thousands of unchanged scrollback rows.

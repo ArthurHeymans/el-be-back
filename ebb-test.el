@@ -1766,6 +1766,53 @@ Binds `screen' and `parser' in BODY."
       (ebb-io-handle-resize io 20 3))
     (should (equal '(20 10) events))))
 
+(ert-deftest ebb-test-io-resize-notifies-pty ()
+  "A resize propagates to the PTY, so the child is told about the new size."
+  (let* ((screen (ebb-screen-create 10 3))
+         (proc (make-process :name "ebb-test-pty" :buffer nil
+                             :command '("cat") :connection-type 'pty
+                             :noquery t))
+         (io (make-ebb-io :screen screen :process proc))
+         sizes)
+    (unwind-protect
+        (progn
+          ;; `process-type' answers `real' for a PTY subprocess, never `pty'.
+          (should (ebb-io--pty-process-p proc))
+          (cl-letf (((symbol-function 'set-process-window-size)
+                     (lambda (_proc height width) (push (cons width height) sizes)))
+                    ((symbol-function 'ebb-screen-resize) #'ignore))
+            (ebb-io-handle-resize io 20 5))
+          (should (equal '((20 . 5)) sizes)))
+      (delete-process proc))))
+
+(ert-deftest ebb-test-io-resize-reaches-child ()
+  "The child shell reports the resized dimensions, not its startup size."
+  (skip-unless (file-executable-p "/bin/sh"))
+  (let ((buffer (generate-new-buffer " *ebb-resize*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (let* ((screen (ebb-screen-create 120 24))
+                 (parser (ebb-parse-create screen))
+                 (io (make-ebb-io :screen screen :parser parser
+                                  :render (ebb-render-create screen buffer)
+                                  :buffer buffer :min-latency 0
+                                  :max-latency 0.01))
+                 (ebb-enable-shell-integration nil))
+            (unwind-protect
+                (progn
+                  (ebb-io-start io "/bin/sh" buffer)
+                  (dotimes (_ 10) (accept-process-output nil 0.05))
+                  (ebb-io-handle-resize io 40 12)
+                  (ebb-io-send io "stty size\n")
+                  (let ((deadline (+ (float-time) 5)))
+                    (while (and (< (float-time) deadline)
+                                (not (string-match-p
+                                      "12 40" (ebb-screen-plain-text screen))))
+                      (accept-process-output nil 0.05)))
+                  (should (string-match-p "12 40" (ebb-screen-plain-text screen))))
+              (ebb-io-stop io))))
+      (kill-buffer buffer))))
+
 (ert-deftest ebb-test-io-list-command-keeps-shell-integration ()
   "Shell argv from the program prompt retains startup integration."
   (let* ((dir (make-temp-file "ebb-integration-" t))
