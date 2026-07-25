@@ -3011,5 +3011,96 @@ Binds `screen' and `parser' in BODY."
         (ebb-test-output parser "\e]7;file://box/home/u/my%20dir%C3%A9\e\\")
         (should (equal '("/home/u/my diré" "box") got))))))
 
+;;;; ---- Glyph Fitting --------------------------------------------------
+
+(defmacro ebb-test-with-glyph-metrics (metrics &rest body)
+  "Run BODY with glyph measurement stubbed by METRICS.
+METRICS is an alist of (CHAR . (WIDTH . HEIGHT)) pixel sizes; a space
+cell is 9x18 unless overridden."
+  (declare (indent 1))
+  `(let ((ebb-render--glyph-cache (make-hash-table :test #'eql))
+         (ebb-render--glyph-stamp nil)
+         (ebb-render--cell-pixel-width 0)
+         (ebb-render--cell-pixel-height 0)
+         (ebb-fit-glyphs t))
+     (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+               ((symbol-function 'ebb-render--string-pixel-size)
+                (lambda (string)
+                  (or (cdr (assq (aref string 0) ,metrics)) '(9 . 18)))))
+       ,@body)))
+
+(ert-deftest ebb-test-fit-glyphs-constrains-overwide-glyph ()
+  "A Nerd Font icon wider than its cell is pinned and scaled down."
+  (ebb-test-with-glyph-metrics '((?\N{U+F15B} . (15 . 18)))
+    (let* ((line (concat "a" (string ?\N{U+F15B}) "b"))
+           (fitted (ebb-render--fit-glyphs line))
+           (spec (get-text-property 1 'display fitted)))
+      ;; The original string is left untouched.
+      (should-not (get-text-property 1 'display line))
+      (should (equal '(min-width (1)) (nth 0 spec)))
+      (should (< (nth 1 (nth 1 spec)) 1.0))
+      ;; ASCII neighbours stay untouched.
+      (should-not (get-text-property 0 'display fitted))
+      (should-not (get-text-property 2 'display fitted)))))
+
+(ert-deftest ebb-test-fit-glyphs-ignores-fitting-glyphs ()
+  "Characters that already fill their cell exactly are left alone."
+  (ebb-test-with-glyph-metrics '((?é . (9 . 18)))
+    (let ((fitted (ebb-render--fit-glyphs "aéb")))
+      (should-not (get-text-property 1 'display fitted))
+      ;; No adjustment means no copy is made.
+      (should-not (text-properties-at 1 fitted)))))
+
+(ert-deftest ebb-test-fit-glyphs-uses-cell-width-of-wide-chars ()
+  "Wide cells are measured against two columns, via spacer or cell width."
+  (ebb-test-with-glyph-metrics '((?\N{U+1F310} . (19 . 18)))
+    ;; Viewport rows mark the extra column with an invisible spacer.
+    (let* ((line (concat (string ?\N{U+1F310})
+                         (propertize " " 'invisible t 'ebb-wide-spacer t)))
+           (spec (get-text-property 0 'display (ebb-render--fit-glyphs line))))
+      (should (equal '(min-width (2)) (nth 0 spec))))
+    ;; Trimmed scrollback rows carry the cell width instead.
+    (let* ((line (propertize (string ?\N{U+1F310}) 'ebb-cell-width 2))
+           (spec (get-text-property 0 'display (ebb-render--fit-glyphs line))))
+      (should (equal '(min-width (2)) (nth 0 spec))))))
+
+(ert-deftest ebb-test-fit-glyphs-pads-narrow-glyph ()
+  "A glyph narrower than its cell is padded, not scaled."
+  (ebb-test-with-glyph-metrics '((?中 . (13 . 18)))
+    (let* ((line (propertize (string ?中) 'ebb-cell-width 2))
+           (spec (get-text-property 0 'display (ebb-render--fit-glyphs line))))
+      (should (equal '((min-width (2))) spec)))))
+
+(ert-deftest ebb-test-fit-glyphs-scales-tall-glyph ()
+  "A glyph taller than the cell is scaled so the row height is unchanged."
+  (ebb-test-with-glyph-metrics '((?中 . (13 . 20)))
+    (let* ((line (propertize (string ?中) 'ebb-cell-width 2))
+           (spec (get-text-property 0 'display (ebb-render--fit-glyphs line))))
+      (should (equal '(min-width (2)) (nth 0 spec)))
+      (should (<= (nth 1 (nth 1 spec)) (/ 18.0 20))))))
+
+(ert-deftest ebb-test-fit-glyphs-disabled ()
+  "`ebb-fit-glyphs' nil, or a text terminal, leaves rows untouched."
+  (ebb-test-with-glyph-metrics '((?\N{U+F15B} . (15 . 18)))
+    (let ((ebb-fit-glyphs nil))
+      (should-not (get-text-property
+                   0 'display (ebb-render--fit-glyphs
+                               (string ?\N{U+F15B})))))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) nil)))
+      (should-not (get-text-property
+                   0 'display (ebb-render--fit-glyphs
+                               (string ?\N{U+F15B})))))))
+
+(ert-deftest ebb-test-fit-glyphs-marks-wide-scrollback-cells ()
+  "Trimmed scrollback rows record the width of wide cells."
+  (ebb-test-with-screen ()
+    (ebb-test-output parser "a中b")
+    (let* ((line (ebb--line-at screen 0))
+           (s (ebb-render--cells-to-string-scrollback-fast
+               (ebb-line-cells line) (ebb-screen-width screen))))
+      (should (equal "a中b" (substring-no-properties s 0 3)))
+      (should (equal 2 (get-text-property 1 'ebb-cell-width s)))
+      (should-not (get-text-property 0 'ebb-cell-width s)))))
+
 (provide 'ebb-test)
 ;;; ebb-test.el ends here

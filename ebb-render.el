@@ -20,6 +20,143 @@
 
 (defvar ebb-link-map)
 
+;;;; ---- Glyph Fitting --------------------------------------------------
+
+;; Terminal cells are square-ish slots of `frame-char-width' pixels, but
+;; Emacs draws each character with whatever font actually covers it.  Nerd
+;; Font icons, emoji and other fallback glyphs are routinely wider (and
+;; taller) than the cell the terminal assigned them, so a row that holds
+;; exactly WIDTH characters can still spill past the window edge -- which is
+;; what makes `ls' output with icons look ragged.  Constrain such glyphs with
+;; a `display' spec: `min-width' pins the slot to the number of terminal
+;; columns the cell occupies, and a `height' scale shrinks glyphs that would
+;; otherwise overflow it.
+
+(defcustom ebb-fit-glyphs t
+  "Non-nil to constrain overwide glyphs to their terminal cells.
+
+On graphical frames, characters rendered from fallback fonts (Nerd Font
+icons, emoji, CJK fallbacks) can be wider or taller than the terminal
+cell they occupy, pushing the rest of the row past the window edge.  When
+non-nil, such characters get a `display' property that pins them to their
+cell width and scales them down to fit."
+  :type 'boolean
+  :group 'ebb)
+
+(defconst ebb-render--glyph-miss (make-symbol "miss")
+  "Sentinel distinguishing a cache miss from a cached nil spec.")
+
+(defvar ebb-render--glyph-cache (make-hash-table :test #'eql)
+  "Cache of display specs keyed by character and cell width.")
+
+(defvar ebb-render--glyph-stamp nil
+  "Font geometry the entries in `ebb-render--glyph-cache' were measured for.")
+
+(defvar ebb-render--cell-pixel-width 0
+  "Pixel width of one terminal cell for the current stamp.")
+
+(defvar ebb-render--cell-pixel-height 0
+  "Pixel height of one terminal cell for the current stamp.")
+
+(defun ebb-render--string-pixel-size (string)
+  "Return (WIDTH . HEIGHT) in pixels for STRING drawn in `ebb-default'."
+  (let ((text (propertize string 'face 'ebb-default)))
+    (with-temp-buffer
+      (setq-local line-prefix nil)
+      (setq-local wrap-prefix nil)
+      (insert text)
+      (let ((size (buffer-text-pixel-size nil nil t)))
+        (cons (car size) (cdr size))))))
+
+(defun ebb-render--glyph-cache-valid-p ()
+  "Refresh the glyph cache when font geometry changed; return non-nil if usable."
+  (let ((stamp (list (frame-char-width) (frame-char-height)
+                     (bound-and-true-p text-scale-mode-amount)
+                     (face-attribute 'ebb-default :height nil t)
+                     (face-attribute 'ebb-default :family nil t))))
+    (unless (equal stamp ebb-render--glyph-stamp)
+      (clrhash ebb-render--glyph-cache)
+      (let ((size (ignore-errors (ebb-render--string-pixel-size " "))))
+        (setq ebb-render--cell-pixel-width (or (car size) 0)
+              ebb-render--cell-pixel-height (or (cdr size) 0)
+              ebb-render--glyph-stamp stamp)))
+    (> ebb-render--cell-pixel-width 0)))
+
+(defun ebb-render--quantize-scale (scale)
+  "Round SCALE down to a step Emacs will not round back up.
+Emacs turns a `height' scale into an integer pixel size; flooring on that
+grid keeps the scaled glyph inside its cell."
+  (let ((pixels (max 1 ebb-render--cell-pixel-height)))
+    (/ (ffloor (* pixels scale)) (float pixels))))
+
+(defun ebb-render--glyph-display-spec (char cw)
+  "Return a display spec pinning CHAR to CW terminal columns, or nil.
+nil means the glyph already fits its cell and needs no adjustment."
+  (let* ((key (+ (* char 2) (1- cw)))
+         (cached (gethash key ebb-render--glyph-cache
+                          ebb-render--glyph-miss)))
+    (if (not (eq cached ebb-render--glyph-miss))
+        cached
+      (puthash
+       key
+       (let* ((size (ignore-errors
+                      (ebb-render--string-pixel-size (string char))))
+              (width (or (car size) 0))
+              (height (or (cdr size) 0))
+              (target-width (* cw ebb-render--cell-pixel-width))
+              (target-height ebb-render--cell-pixel-height))
+         (cond
+          ((zerop width) nil)
+          ((and (= width target-width) (<= height target-height)) nil)
+          (t
+           (let ((scale (min (/ (float target-width) width)
+                             (if (> height 0)
+                                 (/ (float target-height) height)
+                               1.0))))
+             (if (< scale 1.0)
+                 (list (list 'min-width (list cw))
+                       (list 'height (ebb-render--quantize-scale scale)))
+               (list (list 'min-width (list cw))))))))
+       ebb-render--glyph-cache))))
+
+(defun ebb-render--fit-glyphs (string)
+  "Return STRING with overwide glyphs pinned to their terminal cells.
+ASCII-only rows are returned unchanged, and STRING is copied only when an
+adjustment is actually needed."
+  (if (or (null string)
+          (not ebb-fit-glyphs)
+          (not (multibyte-string-p string))
+          (not (display-graphic-p))
+          (not (fboundp 'buffer-text-pixel-size))
+          (not (ebb-render--glyph-cache-valid-p)))
+      string
+    (let ((length (length string))
+          (index 0)
+          (copied nil))
+      (while (< index length)
+        (let ((char (aref string index)))
+          (when (and (>= char #x80)
+                     (not (get-text-property index 'display string)))
+            (let* ((cw (cond
+                        ;; Viewport rows pad a wide cell with an invisible
+                        ;; spacer for each extra column.
+                        ((and (< (1+ index) length)
+                              (get-text-property (1+ index)
+                                                 'ebb-wide-spacer string))
+                         2)
+                        ;; Trimmed scrollback rows record the cell width
+                        ;; instead, since they carry no spacers.
+                        ((get-text-property index 'ebb-cell-width string))
+                        (t 1)))
+                   (spec (ebb-render--glyph-display-spec char cw)))
+              (when spec
+                (unless copied
+                  (setq string (copy-sequence string)
+                        copied t))
+                (put-text-property index (1+ index) 'display spec string)))))
+        (cl-incf index))
+      string)))
+
 ;;;; ---- Color Tables ---------------------------------------------------
 
 (defconst ebb-render--ansi-colors
@@ -562,23 +699,24 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
   (when (ebb-line-text line)
     (setf (ebb-line-text line)
           (ebb-render--safe-string (ebb-line-text line))))
-  (cond
-   ((and (ebb-line-text line)
-         (ebb-line-attr-runs line)
-         (= (length (ebb-line-text line)) width))
-    (setf (ebb-line-dirty line) nil)
-    (ebb-render--text-runs-to-string line width))
-   ((and (ebb-line-text line)
-         (= (length (ebb-line-text line)) width))
-    (setf (ebb-line-dirty line) nil)
-    (if-let ((attr (ebb-line-uniform-attr line)))
-        (let ((s (copy-sequence (ebb-line-text line))))
-          (ebb-render--apply-attr-properties s attr)
-          s)
-      (ebb-line-text line)))
-   ((ebb-render--cells-to-string-scrollback-fast (ebb-line-cells line) width))
-   (t
-    (ebb-render--line-to-string line width))))
+  (ebb-render--fit-glyphs
+   (cond
+    ((and (ebb-line-text line)
+          (ebb-line-attr-runs line)
+          (= (length (ebb-line-text line)) width))
+     (setf (ebb-line-dirty line) nil)
+     (ebb-render--text-runs-to-string line width))
+    ((and (ebb-line-text line)
+          (= (length (ebb-line-text line)) width))
+     (setf (ebb-line-dirty line) nil)
+     (if-let ((attr (ebb-line-uniform-attr line)))
+         (let ((s (copy-sequence (ebb-line-text line))))
+           (ebb-render--apply-attr-properties s attr)
+           s)
+       (ebb-line-text line)))
+    ((ebb-render--cells-to-string-scrollback-fast (ebb-line-cells line) width))
+    (t
+     (ebb-render--line-to-string line width)))))
 
 (defun ebb-render--cells-to-string-scrollback-fast (cells width)
   "Return unstyled CELLS as visible scrollback text, or nil if styled."
@@ -598,6 +736,10 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
             (cl-incf i))
            (t
             (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
+            ;; No spacer columns here, so record the cell width for
+            ;; `ebb-render--fit-glyphs'.
+            (when (> cw 1)
+              (put-text-property pos (1+ pos) 'ebb-cell-width cw s))
             (cl-incf pos)
             (cl-incf cols cw)
             (cl-incf i cw)))))
@@ -608,35 +750,36 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
   (when (ebb-line-text line)
     (setf (ebb-line-text line)
           (ebb-render--safe-string (ebb-line-text line))))
-  (cond
-   ((and (ebb-line-text line)
-         (ebb-line-attr-runs line)
-         (= (length (ebb-line-text line)) width))
-    (let ((s (ebb-render--text-runs-to-string line width)))
-      (setf (ebb-line-rendered line) s)
-      (setf (ebb-line-dirty line) nil)
-      s))
-   ((and (ebb-line-text line)
-         (ebb-line-uniform-attr line)
-         (= (length (ebb-line-text line)) width))
-    (let ((s (copy-sequence (ebb-line-text line))))
-      (ebb-render--apply-attr-properties s (ebb-line-uniform-attr line))
-      (setf (ebb-line-rendered line) s)
-      (setf (ebb-line-dirty line) nil)
-      s))
-   ((and (ebb-line-text line)
-         (= (length (ebb-line-text line)) width))
-    (setf (ebb-line-dirty line) nil)
-    (ebb-line-text line))
-   ((and (not (ebb-line-dirty line))
-         (ebb-line-rendered line)
-         (= (length (ebb-line-rendered line)) width))
-    (ebb-line-rendered line))
-   (t
-    (let ((s (ebb-render--cells-to-string (ebb-line-cells line) width)))
-      (setf (ebb-line-rendered line) s)
-      (setf (ebb-line-dirty line) nil)
-      s))))
+  (ebb-render--fit-glyphs
+   (cond
+    ((and (ebb-line-text line)
+          (ebb-line-attr-runs line)
+          (= (length (ebb-line-text line)) width))
+     (let ((s (ebb-render--text-runs-to-string line width)))
+       (setf (ebb-line-rendered line) s)
+       (setf (ebb-line-dirty line) nil)
+       s))
+    ((and (ebb-line-text line)
+          (ebb-line-uniform-attr line)
+          (= (length (ebb-line-text line)) width))
+     (let ((s (copy-sequence (ebb-line-text line))))
+       (ebb-render--apply-attr-properties s (ebb-line-uniform-attr line))
+       (setf (ebb-line-rendered line) s)
+       (setf (ebb-line-dirty line) nil)
+       s))
+    ((and (ebb-line-text line)
+          (= (length (ebb-line-text line)) width))
+     (setf (ebb-line-dirty line) nil)
+     (ebb-line-text line))
+    ((and (not (ebb-line-dirty line))
+          (ebb-line-rendered line)
+          (= (length (ebb-line-rendered line)) width))
+     (ebb-line-rendered line))
+    (t
+     (let ((s (ebb-render--cells-to-string (ebb-line-cells line) width)))
+       (setf (ebb-line-rendered line) s)
+       (setf (ebb-line-dirty line) nil)
+       s)))))
 
 (defun ebb-render--text-runs-to-string (line width)
   "Render LINE's text plus attribute runs into a propertized string."
