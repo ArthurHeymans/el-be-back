@@ -57,7 +57,7 @@
 
 (defun ebb-parse--respond (parser response)
   "Send RESPONSE string back to the PTY."
-  (when-let ((fn (ebb-parser-write-fn parser)))
+  (when-let* ((fn (ebb-parser-write-fn parser)))
     (funcall fn response)))
 
 (defun ebb-parse--color-to-xterm (color-str)
@@ -105,7 +105,7 @@
 
 (defun ebb-parse--emit (parser type &rest args)
   "Emit an event TYPE with ARGS via the parser callback."
-  (when-let ((fn (ebb-parser-emit-fn parser)))
+  (when-let* ((fn (ebb-parser-emit-fn parser)))
     (apply fn type args)))
 
 ;;;; ---- Parameter Parsing ----------------------------------------------
@@ -1052,140 +1052,98 @@ Pm=1: read, Pm=4: read maximum."
         (`(2 ,_color-space ,r ,g ,b)
          (ebb-screen-set-attr screen property (list r g b)))))))
 
+(defun ebb-parse--set-semicolon-sgr-color (screen params index attribute)
+  "Set SCREEN's ATTRIBUTE from semicolon-form PARAMS at INDEX.
+Return the number of additional parameters consumed."
+  (let ((len (length params)))
+    (if (>= (1+ index) len)
+        0
+      (let ((sub (aref params (1+ index))))
+        (cond
+         ((and (= sub 2) (< (+ index 4) len))
+          (ebb-screen-set-attr
+           screen attribute
+           (list (aref params (+ index 2))
+                 (aref params (+ index 3))
+                 (aref params (+ index 4))))
+          4)
+         ((and (= sub 5) (< (+ index 2) len))
+          (ebb-screen-set-attr screen attribute (aref params (+ index 2)))
+          2)
+         (t 1))))))
+
+(defun ebb-parse--apply-colon-sgr (screen param)
+  "Apply colon-form SGR PARAM to SCREEN."
+  (pcase (car param)
+    (4
+     (ebb-screen-set-attr
+      screen :underline
+      (pcase (if (cdr param) (cadr param) 1)
+        (0 nil)
+        (1 'line)
+        (2 'double)
+        (3 'curly)
+        (4 'dotted)
+        (5 'dashed)
+        (_ 'line))))
+    ((or 38 48 58)
+     (ebb-parse--set-colon-sgr-color screen param))))
+
+(defun ebb-parse--apply-simple-sgr (screen param)
+  "Apply non-extended numeric SGR PARAM to SCREEN."
+  (cond
+   ((= param 0) (ebb-screen-reset-attr screen))
+   ((= param 1) (ebb-screen-set-attr screen :bold t))
+   ((= param 2) (ebb-screen-set-attr screen :faint t))
+   ((= param 3) (ebb-screen-set-attr screen :italic t))
+   ((= param 4) (ebb-screen-set-attr screen :underline 'line))
+   ((= param 5) (ebb-screen-set-attr screen :blink 'slow))
+   ((= param 6) (ebb-screen-set-attr screen :blink 'fast))
+   ((= param 7) (ebb-screen-set-attr screen :inverse t))
+   ((= param 8) (ebb-screen-set-attr screen :conceal t))
+   ((= param 9) (ebb-screen-set-attr screen :crossed t))
+   ((<= 10 param 19) (ebb-screen-set-attr screen :font (- param 10)))
+   ((= param 21) (ebb-screen-set-attr screen :underline 'double))
+   ((= param 22)
+    (ebb-screen-set-attr screen :bold nil)
+    (ebb-screen-set-attr screen :faint nil))
+   ((= param 23) (ebb-screen-set-attr screen :italic nil))
+   ((= param 24) (ebb-screen-set-attr screen :underline nil))
+   ((= param 25) (ebb-screen-set-attr screen :blink nil))
+   ((= param 27) (ebb-screen-set-attr screen :inverse nil))
+   ((= param 28) (ebb-screen-set-attr screen :conceal nil))
+   ((= param 29) (ebb-screen-set-attr screen :crossed nil))
+   ((<= 30 param 37) (ebb-screen-set-attr screen :fg (- param 30)))
+   ((= param 39) (ebb-screen-set-attr screen :fg nil))
+   ((<= 40 param 47) (ebb-screen-set-attr screen :bg (- param 40)))
+   ((= param 49) (ebb-screen-set-attr screen :bg nil))
+   ((= param 59) (ebb-screen-set-attr screen :ul-color nil))
+   ((<= 90 param 97) (ebb-screen-set-attr screen :fg (+ 8 (- param 90))))
+   ((<= 100 param 107) (ebb-screen-set-attr screen :bg (+ 8 (- param 100))))))
+
 (defun ebb-parse--csi-sgr (parser params)
-  "Handle SGR (CSI m) -- the most complex single CSI handler.
-Private CSI sequences ending in `m' (e.g. CSI > 4 ; 1 m for
-modifyOtherKeys) are not SGR and must be ignored."
-  ;; Fast path already requires null private; generic dispatch does not.
+  "Handle SGR (CSI m) attributes in PARAMS for PARSER.
+Private CSI sequences ending in `m' are not SGR and are ignored."
   (unless (ebb-parser-private parser)
-  (let ((screen (ebb-parser-screen parser))
-        (len (length params)))
-    (if (zerop len)
-        (ebb-screen-reset-attr screen)
-      (let ((i 0))
-        (while (< i len)
-          (let ((p (aref params i)))
-            (cond
-             ;; Colon-form sub-parameters, including color specifications.
-             ((listp p)
-              (pcase (car p)
-                (4
-                 ;; 4:0=off, 4:1=line, 4:2=double, 4:3=curly, etc.
-                 (let ((sub (if (cdr p) (cadr p) 1)))
-                   (ebb-screen-set-attr
-                    screen :underline
-                    (pcase sub
-                      (0 nil)
-                      (1 'line)
-                      (2 'double)
-                      (3 'curly)
-                      (4 'dotted)
-                      (5 'dashed)
-                      (_ 'line)))))
-                ((or 38 48 58)
-                 (ebb-parse--set-colon-sgr-color screen p))))
-             ;; Reset
-             ((= p 0)  (ebb-screen-reset-attr screen))
-             ;; Bold / faint / italic
-             ((= p 1)  (ebb-screen-set-attr screen :bold t))
-             ((= p 2)  (ebb-screen-set-attr screen :faint t))
-             ((= p 3)  (ebb-screen-set-attr screen :italic t))
-             ;; Underline (plain, no sub-params)
-             ((= p 4)  (ebb-screen-set-attr screen :underline 'line))
-             ;; Blink
-             ((= p 5)  (ebb-screen-set-attr screen :blink 'slow))
-             ((= p 6)  (ebb-screen-set-attr screen :blink 'fast))
-             ;; Inverse / conceal / crossed
-             ((= p 7)  (ebb-screen-set-attr screen :inverse t))
-             ((= p 8)  (ebb-screen-set-attr screen :conceal t))
-             ((= p 9)  (ebb-screen-set-attr screen :crossed t))
-             ;; Fonts 10-19
-             ((and (>= p 10) (<= p 19))
-              (ebb-screen-set-attr screen :font (- p 10)))
-             ;; Double underline
-             ((= p 21) (ebb-screen-set-attr screen :underline 'double))
-             ;; Reset intensity
-             ((= p 22) (ebb-screen-set-attr screen :bold nil)
-                        (ebb-screen-set-attr screen :faint nil))
-             ;; Reset individual attrs
-             ((= p 23) (ebb-screen-set-attr screen :italic nil))
-             ((= p 24) (ebb-screen-set-attr screen :underline nil))
-             ((= p 25) (ebb-screen-set-attr screen :blink nil))
-             ((= p 27) (ebb-screen-set-attr screen :inverse nil))
-             ((= p 28) (ebb-screen-set-attr screen :conceal nil))
-             ((= p 29) (ebb-screen-set-attr screen :crossed nil))
-             ;; Foreground ANSI 30-37
-             ((and (>= p 30) (<= p 37))
-              (ebb-screen-set-attr screen :fg (- p 30)))
-             ;; Extended foreground
-             ((= p 38)
-              (when (< (1+ i) len)
-                (let ((sub (aref params (1+ i))))
-                  (cond
-                   ;; Truecolor: 38;2;R;G;B
-                   ((and (= sub 2) (<= (+ i 4) (1- len)))
-                    (ebb-screen-set-attr
-                     screen :fg
-                     (list (aref params (+ i 2))
-                           (aref params (+ i 3))
-                           (aref params (+ i 4))))
-                    (cl-incf i 4))
-                   ;; 256-color: 38;5;N
-                   ((and (= sub 5) (<= (+ i 2) (1- len)))
-                    (ebb-screen-set-attr screen :fg (aref params (+ i 2)))
-                    (cl-incf i 2))
-                   (t (cl-incf i))))))
-             ;; Default foreground
-             ((= p 39) (ebb-screen-set-attr screen :fg nil))
-             ;; Background ANSI 40-47
-             ((and (>= p 40) (<= p 47))
-              (ebb-screen-set-attr screen :bg (- p 40)))
-             ;; Extended background
-             ((= p 48)
-              (when (< (1+ i) len)
-                (let ((sub (aref params (1+ i))))
-                  (cond
-                   ((and (= sub 2) (<= (+ i 4) (1- len)))
-                    (ebb-screen-set-attr
-                     screen :bg
-                     (list (aref params (+ i 2))
-                           (aref params (+ i 3))
-                           (aref params (+ i 4))))
-                    (cl-incf i 4))
-                   ((and (= sub 5) (<= (+ i 2) (1- len)))
-                    (ebb-screen-set-attr screen :bg (aref params (+ i 2)))
-                    (cl-incf i 2))
-                   (t (cl-incf i))))))
-             ;; Default background
-             ((= p 49) (ebb-screen-set-attr screen :bg nil))
-             ;; Underline color
-             ((= p 58)
-              (when (< (1+ i) len)
-                (let ((sub (aref params (1+ i))))
-                  (cond
-                   ((and (= sub 2) (<= (+ i 4) (1- len)))
-                    (ebb-screen-set-attr
-                     screen :ul-color
-                     (list (aref params (+ i 2))
-                           (aref params (+ i 3))
-                           (aref params (+ i 4))))
-                    (cl-incf i 4))
-                   ((and (= sub 5) (<= (+ i 2) (1- len)))
-                    (ebb-screen-set-attr screen :ul-color
-                                           (aref params (+ i 2)))
-                    (cl-incf i 2))
-                   (t (cl-incf i))))))
-             ;; Default underline color
-             ((= p 59) (ebb-screen-set-attr screen :ul-color nil))
-             ;; Bright foreground 90-97
-             ((and (>= p 90) (<= p 97))
-              (ebb-screen-set-attr screen :fg (+ 8 (- p 90))))
-             ;; Bright background 100-107
-             ((and (>= p 100) (<= p 107))
-              (ebb-screen-set-attr screen :bg (+ 8 (- p 100))))
-             ;; Unknown -- silently skip
-             (t nil)))
-          (cl-incf i)))))))
+    (let ((screen (ebb-parser-screen parser))
+          (len (length params)))
+      (if (zerop len)
+          (ebb-screen-reset-attr screen)
+        (let ((i 0))
+          (while (< i len)
+            (let ((param (aref params i)))
+              (cond
+               ((listp param)
+                (ebb-parse--apply-colon-sgr screen param))
+               ((memq param '(38 48 58))
+                (cl-incf
+                 i
+                 (ebb-parse--set-semicolon-sgr-color
+                  screen params i
+                  (pcase param (38 :fg) (48 :bg) (58 :ul-color)))))
+               (t
+                (ebb-parse--apply-simple-sgr screen param))))
+            (cl-incf i)))))))
 
 ;;;; ---- OSC Helpers ----------------------------------------------------
 
