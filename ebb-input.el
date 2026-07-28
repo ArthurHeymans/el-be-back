@@ -219,7 +219,7 @@ A string KEY is committed input text from an input method."
   "Encode mouse EVENT as terminal escape sequence.
 POS-OFFSET is the buffer position of display line 0, col 0.
 Returns a string or nil."
-  (when-let ((mouse-mode (ebb-screen-mouse-mode screen)))
+  (when-let* ((mouse-mode (ebb-screen-mouse-mode screen)))
     (when (ebb-input--mouse-event-allowed-p event mouse-mode screen)
       (when-let* ((coords (ebb-input--mouse-coordinates event screen pos-offset))
                   (x (car coords))
@@ -291,7 +291,7 @@ Returns a string or nil."
   (let ((basic (event-basic-type event)))
     (cond
      ((mouse-movement-p event)
-      (if-let ((pressed (car (ebb-screen-mouse-pressed screen))))
+      (if-let* ((pressed (car (ebb-screen-mouse-pressed screen))))
           (+ pressed 32)
         35))
      ((eq basic 'mouse-1) 0)
@@ -505,11 +505,11 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
               `([?\C-c] [?\C-q] [?\C-y] [?\e ?y]
                 ,@ebb-semi-char-non-bound-keys))))
     ;; Overrides
-    (define-key map [?\C-q] #'ebb-quoted-input)
-    (define-key map [?\C-y] #'ebb-yank)
-    (define-key map [?\M-y] #'ebb-yank-pop)
+    (define-key map (kbd "C-q") #'ebb-quoted-input)
+    (define-key map (kbd "C-y") #'ebb-yank)
+    (define-key map (kbd "M-y") #'ebb-yank-pop)
     ;; C-c C-c sends literal C-c to terminal
-    (define-key map [?\C-c ?\C-c] #'ebb-self-input)
+    (define-key map (kbd "C-c C-c") #'ebb-self-input)
     map))
 
 (defvar ebb-semi-char-mode-map
@@ -520,7 +520,7 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
   "Rebuild the semi-char keymap after customization changes."
   (setq ebb-semi-char-mode-map (ebb--prepare-semi-char-mode-map))
   ;; `define-minor-mode' records the original map object in this alist.
-  (when-let ((entry (assq 'ebb--semi-char-mode minor-mode-map-alist)))
+  (when-let* ((entry (assq 'ebb--semi-char-mode minor-mode-map-alist)))
     (setcdr entry ebb-semi-char-mode-map)))
 
 ;;;; ---- Char Keymap ----------------------------------------------------
@@ -532,7 +532,7 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
               '(:ascii :arrow :navigation :function)
               nil)))
     ;; Escape back to semi-char
-    (define-key map [?\C-\M-m] #'ebb-semi-char-mode)
+    (define-key map (kbd "C-M-m") #'ebb-semi-char-mode)
     map))
 
 (defvar ebb-char-mode-map

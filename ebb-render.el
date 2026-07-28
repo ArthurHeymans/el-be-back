@@ -460,7 +460,7 @@ state are reconciled independently so metadata-only updates are visible."
               (/= total (ebb-render-state-history-total-rows render)))
       (ebb-render--rebuild-scrollback render start count total generation)
       (dolist (entry windows)
-        (when-let ((position
+        (when-let* ((position
                     (ebb-render--anchor-buffer-position
                      render (cdr entry))))
           (set-window-start (car entry) position t))))
@@ -487,7 +487,7 @@ state are reconciled independently so metadata-only updates are visible."
 
 (defun ebb-render--anchor-buffer-position (render anchor)
   "Return ANCHOR's position when it is present in RENDER's current slab."
-  (when-let ((location
+  (when-let* ((location
               (ebb-render--anchor-location
                render anchor (ebb-render-state-history-total-rows render))))
     (let* ((row (car location))
@@ -582,7 +582,7 @@ state are reconciled independently so metadata-only updates are visible."
           (delq nil
                 (mapcar
                  (lambda (entry)
-                   (when-let ((location
+                   (when-let* ((location
                                (ebb-render--anchor-location
                                 render (cdr entry) total)))
                      (and (< (car location) total) (car location))))
@@ -607,7 +607,7 @@ state are reconciled independently so metadata-only updates are visible."
     (ebb-render--rebuild-scrollback
      render start count total (ebb-screen-history-generation screen))
     (dolist (entry other-windows)
-      (when-let ((position
+      (when-let* ((position
                   (ebb-render--anchor-buffer-position render (cdr entry))))
         (set-window-start (car entry) position t)))
     (if (= target total)
@@ -659,7 +659,7 @@ state are reconciled independently so metadata-only updates are visible."
   "Move point to stable model ANCHOR in RENDER."
   (pcase anchor
     (`(history ,id ,offset)
-     (when-let ((location
+     (when-let* ((location
                  (ebb-screen-history-anchor-location
                   (ebb-render-state-screen render) id offset)))
        (ebb-render-goto-location
@@ -709,7 +709,7 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
     ((and (ebb-line-text line)
           (= (length (ebb-line-text line)) width))
      (setf (ebb-line-dirty line) nil)
-     (if-let ((attr (ebb-line-uniform-attr line)))
+     (if-let* ((attr (ebb-line-uniform-attr line)))
          (let ((s (copy-sequence (ebb-line-text line))))
            (ebb-render--apply-attr-properties s attr)
            s)
@@ -874,9 +874,9 @@ Handles double-width characters by inserting invisible spacers."
 
 (defun ebb-render--apply-attr-properties (string attr)
   "Apply face and hyperlink properties from ATTR to STRING."
-  (when-let ((face (ebb-render--attr-to-face attr)))
+  (when-let* ((face (ebb-render--attr-to-face attr)))
     (put-text-property 0 (length string) 'face face string))
-  (when-let ((uri (and attr (ebb-attr-hyperlink attr))))
+  (when-let* ((uri (and attr (ebb-attr-hyperlink attr))))
     (put-text-property 0 (length string) 'help-echo uri string)
     (put-text-property 0 (length string) 'mouse-face 'highlight string)
     (put-text-property 0 (length string) 'keymap ebb-link-map string)
@@ -1026,14 +1026,14 @@ lists; falls back only when a styled cell is present."
           (setq face (plist-put face :background default-fg))))
       ;; Foreground (non-inverse)
       (unless inv
-        (when-let ((fg-str (ebb-render--color-to-string fg)))
+        (when-let* ((fg-str (ebb-render--color-to-string fg)))
           (setq face (plist-put face :foreground fg-str))))
       ;; Background (non-inverse)
       (unless inv
-        (when-let ((bg-str (ebb-render--color-to-string bg)))
+        (when-let* ((bg-str (ebb-render--color-to-string bg)))
           (setq face (plist-put face :background bg-str))))
       ;; Underline
-      (when-let ((ul (ebb-attr-underline attr)))
+      (when-let* ((ul (ebb-attr-underline attr)))
         (let ((ul-color (ebb-render--color-to-string
                          (ebb-attr-ul-color attr))))
           (setq face
@@ -1157,7 +1157,7 @@ hint at the live terminal position."
   (when (boundp 'ebb--render)
     (dolist (buffer (buffer-list))
       (when (buffer-live-p buffer)
-        (when-let ((render (buffer-local-value 'ebb--render buffer)))
+        (when-let* ((render (buffer-local-value 'ebb--render buffer)))
           (ebb-render--invalidate-screen-lines
            (ebb-render-state-screen render))
           (clrhash (ebb-render-state-history-cache render))
@@ -1217,7 +1217,7 @@ Used after resize when the display area size has changed."
                   (delq nil
                         (mapcar
                          (lambda (entry)
-                           (when-let ((location
+                           (when-let* ((location
                                        (ebb-render--anchor-location
                                         render (cdr entry) total)))
                              (and (< (car location) total) (car location))))
@@ -1279,7 +1279,7 @@ Used after resize when the display area size has changed."
             )
           (dolist (entry saved-windows)
             (when (window-live-p (car entry))
-              (if-let ((position
+              (if-let* ((position
                         (ebb-render--anchor-buffer-position
                          render (cdr entry))))
                   (set-window-start (car entry) position t)
@@ -1319,7 +1319,7 @@ Used after resize when the display area size has changed."
 
 (defun ebb-render-destroy (render)
   "Clean up render state."
-  (when-let ((ov (ebb-render-state-cursor-overlay render)))
+  (when-let* ((ov (ebb-render-state-cursor-overlay render)))
     (delete-overlay ov))
   (dolist (m (list (ebb-render-state-display-begin render)
                    (ebb-render-state-region-begin render)

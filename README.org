@@ -8,7 +8,7 @@ keeps Eat's user-facing model while separating terminal state from buffer
 rendering.
 
 This README is kept short to avoid the earmarks of being a pure slop project, even
-though it's entirety is AI generated.
+though its entirety is AI generated.
 
 Open a terminal with:
 

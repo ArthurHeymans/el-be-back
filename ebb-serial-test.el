@@ -16,6 +16,7 @@
 (declare-function ebb-serial--delete-foreign-buffer-processes "ebb-serial")
 (declare-function ebb-serial--live-process-p "ebb-serial")
 (declare-function ebb-serial--open-process "ebb-serial")
+(declare-function ebb-serial--process-arguments "ebb-serial")
 (declare-function ebb-serial--filter "ebb-serial")
 (declare-function ebb-serial--remote-default-directory "ebb-serial")
 (declare-function ebb-serial--remote-port-localname "ebb-serial")
@@ -23,6 +24,7 @@
 (declare-function ebb-serial--socat-open-address "ebb-serial")
 (declare-function ebb-serial-configure "ebb-serial")
 (declare-function ebb-serial-send-break "ebb-serial")
+(declare-function ebb-serial-mode "ebb-serial")
 
 (defvar ebb-serial--bytesize)
 (defvar ebb-serial--codec-state)

@@ -35,6 +35,7 @@
 
 (defconst ebb-eshell--inside-emacs (format "%s,ebb" emacs-version))
 (defvar ebb--io)
+(defvar ebb--input-mode)
 (defvar ebb--screen)
 (defvar ebb-scrollback-lines)
 (defvar eshell-current-subjob-p)

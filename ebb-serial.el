@@ -6,13 +6,13 @@
 ;; Maintainer: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.1.1
 ;; Keywords: terminals, serial, processes
-;; Package-Requires: ((emacs "30.1"))
+;; Package-Requires: ((emacs "30.1") (ebb "0.1.0"))
 ;; URL: https://github.com/ArthurHeymans/ebb-serial
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
 
-;; ebb-serial is a Ebb-backed alternative to `serial-term'.  It uses
+;; ebb-serial is an Ebb-backed alternative to `serial-term'.  It uses
 ;; Ebb's terminal renderer and input modes with an Emacs serial backend.
 ;; Serial input is opened with `no-conversion' and decoded by
 ;; `ebb-serial-codec' so split UTF-8 and malformed bytes do not corrupt the
@@ -198,7 +198,7 @@ Emacs does not currently expose a portable serial-break primitive."
 (defun ebb-serial--popup-mode-line-menu (event keymap)
   "Popup KEYMAP for mode-line EVENT and run the selected command."
   (save-selected-window
-    (when-let ((window (and event (posn-window (event-start event)))))
+    (when-let* ((window (and event (posn-window (event-start event)))))
       (when (windowp window)
         (select-window window)))
     (let* ((selection (x-popup-menu event keymap))
@@ -229,7 +229,7 @@ Emacs does not currently expose a portable serial-break primitive."
 (defun ebb-serial--resize-terminal-to-window (&rest _)
   "Resize the Ebb model to the window displaying this buffer."
   (when (and ebb--io (get-buffer-window (current-buffer) t))
-    (when-let ((window (ebb-serial--display-window)))
+    (when-let* ((window (ebb-serial--display-window)))
       (with-selected-window window
         (ebb-io-handle-resize
          ebb--io
@@ -295,12 +295,12 @@ Emacs does not currently expose a portable serial-break primitive."
 
 (defun ebb-serial--remote-port-p (&optional port)
   "Return non-nil if PORT, or the current port, is a remote Tramp file name."
-  (when-let ((port (or port ebb-serial--port)))
+  (when-let* ((port (or port ebb-serial--port)))
     (file-remote-p port)))
 
 (defun ebb-serial--remote-default-directory (port)
   "Return a remote `default-directory' for remote serial PORT."
-  (when-let ((remote (file-remote-p port)))
+  (when-let* ((remote (file-remote-p port)))
     (concat remote "/")))
 
 (defun ebb-serial--remote-port-localname (port)
@@ -527,7 +527,7 @@ values accepted by `serial-process-configure'."
 
 (defun ebb-serial--filter (process chunk)
   "Decode raw serial CHUNK from PROCESS and feed it to Ebb."
-  (when-let ((buffer (process-get process 'ebb-serial-buffer)))
+  (when-let* ((buffer (process-get process 'ebb-serial-buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (when (eq process ebb-serial--process)
@@ -540,7 +540,7 @@ values accepted by `serial-process-configure'."
 
 (defun ebb-serial--sentinel (process message)
   "Handle serial PROCESS state changes described by MESSAGE."
-  (when-let ((buffer (process-get process 'ebb-serial-buffer)))
+  (when-let* ((buffer (process-get process 'ebb-serial-buffer)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (when (and (eq process ebb-serial--process)
