@@ -248,6 +248,19 @@
     (should (eq (plist-get (ebb-serial--process-arguments) :buffer)
                 (current-buffer)))))
 
+(ert-deftest ebb-serial-char-mode-sends-control-keys-directly ()
+  "Serial command bindings must not shadow char-mode control keys."
+  (ebb-serial-tests--require-ebb-serial)
+  (with-temp-buffer
+    (ebb-mode)
+    (ebb-serial-mode 1)
+    (ebb-char-mode)
+    (should (eq (key-binding (kbd "C-c")) #'ebb-self-input))
+    (ebb-semi-char-mode)
+    (should (eq (key-binding (kbd "C-c C-c")) #'ebb-self-input))
+    (should (eq (key-binding (kbd "C-c C-s b"))
+                #'ebb-serial-send-break))))
+
 (ert-deftest ebb-serial-remote-open-uses-socat-process ()
   (ebb-serial-tests--require-ebb-serial)
   (let* ((buffer (generate-new-buffer " *ebb-serial-remote-open*"))

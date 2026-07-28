@@ -110,6 +110,15 @@ Emacs does not currently expose a portable serial-break primitive."
   :lighter " EbbSerial"
   :keymap ebb-serial-mode-map)
 
+;; `define-minor-mode' prepends new maps to `minor-mode-map-alist'.  Keep the
+;; serial command map below Ebb's input maps so char mode can send every key,
+;; including C-c, directly to the serial device.  Semi-char mode still leaves
+;; C-c available as a prefix, so the serial commands remain accessible there.
+(let ((entry (assq 'ebb-serial-mode minor-mode-map-alist)))
+  (when entry
+    (setq minor-mode-map-alist
+          (append (delq entry minor-mode-map-alist) (list entry)))))
+
 (defun ebb-serial--buffer-name (port)
   "Return the buffer name for PORT."
   (format-spec ebb-serial-buffer-name-format `((?p . ,port))))
