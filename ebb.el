@@ -34,11 +34,6 @@
 
 ;;;; ---- Customization --------------------------------------------------
 
-(defgroup ebb nil
-  "Terminal emulator."
-  :group 'processes
-  :prefix "ebb-")
-
 (defcustom ebb-buffer-name "*ebb*"
   "Default buffer name for ebb terminals."
   :type 'string
@@ -442,7 +437,7 @@ normal terminal input handling or appear in `view-lossage'."
             ebb--password-mode-p nil)
       (force-mode-line-update))))
 
-(defun ebb--detect-password-prompt ()
+(defun ebb--detect-password-prompt (&optional _render)
   "Watch the cursor row and open `read-passwd' on a password prompt.
 Called after each render.  Debounced so short-lived matches don't flash."
   (when (and ebb-detect-password-prompts ebb--screen ebb--io
@@ -474,7 +469,7 @@ Called after each render.  Debounced so short-lived matches don't flash."
 (defun ebb-mouse-input (event)
   "Send mouse EVENT to the terminal when DEC mouse tracking is active."
   (interactive "e")
-  (when-let ((win (posn-window (event-start event))))
+  (when-let* ((win (posn-window (event-start event))))
     (when (windowp win)
       (select-window win)))
   (when (and ebb--io ebb--screen ebb--render
@@ -493,7 +488,7 @@ Called after each render.  Debounced so short-lived matches don't flash."
                    (with-current-buffer buffer
                      (setq track-mouse old-track-mouse)
                      (setq ebb--mouse-drag-transient-map-exit nil))))))))
-    (when-let ((seq (ebb-input-encode-mouse
+    (when-let* ((seq (ebb-input-encode-mouse
                      event ebb--screen
                      (marker-position
                       (ebb-render-state-display-begin ebb--render)))))
@@ -585,7 +580,7 @@ Called after each render.  Debounced so short-lived matches don't flash."
 (defun ebb-kill-process ()
   "Kill the terminal process."
   (interactive)
-  (when-let ((proc (and ebb--io (ebb-io-process ebb--io))))
+  (when-let* ((proc (and ebb--io (ebb-io-process ebb--io))))
     (when (process-live-p proc)
       (kill-process proc))))
 
@@ -1000,7 +995,7 @@ Called after each render.  Debounced so short-lived matches don't flash."
 (defun ebb-other (&optional program)
   "Switch to another Ebb session, or create one with PROGRAM."
   (interactive)
-  (if-let ((other (seq-find (lambda (buffer) (not (eq buffer (current-buffer))))
+  (if-let* ((other (seq-find (lambda (buffer) (not (eq buffer (current-buffer))))
                             (ebb--buffers))))
       (pop-to-buffer-same-window other)
     (ebb program)))
@@ -1190,7 +1185,7 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
   "Start a terminal in the current project root in another window."
   (interactive)
   (let ((default-directory
-         (or (when-let ((proj (project-current)))
+         (or (when-let* ((proj (project-current)))
                (project-root proj))
              default-directory)))
     (ebb-other-window)))
@@ -1269,7 +1264,7 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
 
 (defun ebb-buffer-name-by-title (title)
   "Return \"*ebb: TITLE*\", stripping local user@host from TITLE."
-  (when-let ((pretty (ebb--format-title-for-buffer title)))
+  (when-let* ((pretty (ebb--format-title-for-buffer title)))
     (format "*ebb: %s*" pretty)))
 
 (defun ebb-buffer-name-by-directory (&optional _title)
@@ -1313,6 +1308,8 @@ Local paths omit the hostname; remote TRAMP paths keep the host."
 
 ;; Add to mode-line
 (put 'ebb--input-mode 'risky-local-variable t)
+
+(add-hook 'ebb-io-after-render-functions #'ebb--detect-password-prompt)
 
 (require 'ebb-eshell)
 

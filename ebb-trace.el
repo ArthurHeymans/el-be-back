@@ -95,7 +95,7 @@ cycles are logged to a trace buffer."
 
 (defun ebb-trace--filter-advice (orig-fn io process output)
   "Trace output arriving from the process."
-  (when-let ((buffer (ebb-io-buffer io)))
+  (when-let* ((buffer (ebb-io-buffer io)))
     (with-current-buffer buffer
       (when ebb-trace--buffer
         (ebb-trace--log nil 'output output))))
@@ -103,7 +103,7 @@ cycles are logged to a trace buffer."
 
 (defun ebb-trace--resize-advice (orig-fn io new-width new-height)
   "Trace resize events."
-  (when-let ((buffer (ebb-io-buffer io)))
+  (when-let* ((buffer (ebb-io-buffer io)))
     (with-current-buffer buffer
       (when ebb-trace--buffer
         (ebb-trace--log nil 'resize new-width new-height))))
@@ -115,6 +115,15 @@ cycles are logged to a trace buffer."
     (when ebb-trace--buffer
       (ebb-trace--log nil 'redisplay)))
   (funcall orig-fn render))
+
+(defun ebb-trace--processing-error (io error-data count)
+  "Trace ERROR-DATA from IO after COUNT consecutive failures."
+  (when-let* ((buffer (ebb-io-buffer io)))
+    (with-current-buffer buffer
+      (when ebb-trace--buffer
+        (ebb-trace--log nil 'processing-error count error-data)))))
+
+(add-hook 'ebb-io-processing-error-functions #'ebb-trace--processing-error)
 
 (provide 'ebb-trace)
 ;;; ebb-trace.el ends here

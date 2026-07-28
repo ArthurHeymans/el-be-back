@@ -36,12 +36,23 @@
   ;; Latency management
   (min-latency 0.008)     ; seconds: min delay before render
   (max-latency 0.033)     ; seconds: max delay (~30fps)
-  (first-chunk-time nil)  ; time of first unrendered chunk
+  (first-chunk-time nil)  ; float time of first unrendered chunk
   (render-timer nil)      ; pending render timer
   ;; Throughput monitoring
   (throughput-time nil)
   (throughput-bytes 0)
-  (binary-flood nil))
+  (binary-flood nil)
+  ;; Error reporting
+  (last-processing-error nil)
+  (processing-error-count 0))
+
+(defvar ebb-io-after-render-functions nil
+  "Functions called after terminal output has been rendered.
+Each function receives the current `ebb-render-state'.")
+
+(defvar ebb-io-processing-error-functions nil
+  "Functions called when asynchronous terminal processing fails.
+Each function receives IO, the error value, and its consecutive count.")
 
 ;;;; ---- Customization --------------------------------------------------
 
@@ -62,6 +73,13 @@ Ensures responsiveness."
   :type 'number
   :group 'ebb)
 
+(defcustom ebb-enable-shell-integration t
+  "If non-nil, automatically source shell integration scripts.
+When enabled, ebb wraps the shell command to source the appropriate
+integration script for the detected shell."
+  :type 'boolean
+  :group 'ebb)
+
 ;;;; ---- Process Filter (never blocks) ----------------------------------
 
 (defun ebb-io-receive (io output)
@@ -70,7 +88,7 @@ This is the supported entry point for non-PTY transports."
   (ebb-io--enqueue-output io output)
   ;; Record time of first unprocessed chunk
   (unless (ebb-io-first-chunk-time io)
-    (setf (ebb-io-first-chunk-time io) (current-time)))
+    (setf (ebb-io-first-chunk-time io) (float-time)))
   ;; Schedule processing
   (unless (ebb-io-processing io)
     (ebb-io--schedule-processing io)))
@@ -108,9 +126,9 @@ This is the supported entry point for non-PTY transports."
 
 (defun ebb-io--schedule-processing (io)
   "Schedule the next parse+render cycle."
-  (let* ((now (current-time))
+  (let* ((now (float-time))
          (first (ebb-io-first-chunk-time io))
-         (elapsed (if first (float-time (time-subtract now first)) 0))
+         (elapsed (if first (- now first) 0))
          (time-left (- (ebb-io-max-latency io) elapsed))
          (delay (if (<= time-left 0) 0
                   (min time-left (ebb-io-min-latency io)))))
@@ -155,23 +173,37 @@ This is the supported entry point for non-PTY transports."
 
             ;; Render
             (ebb-render-refresh (ebb-io-render io))
-            ;; Post-render shell integration (prompt annotations, etc.)
-            (when (fboundp 'ebb-shell-post-render)
-              (ebb-shell-post-render (ebb-io-render io)))
-            (when (fboundp 'ebb--detect-password-prompt)
-              (ebb--detect-password-prompt))))
+            (run-hook-with-args 'ebb-io-after-render-functions
+                                (ebb-io-render io))))
 
         ;; Reset latency tracking
-        (setf (ebb-io-first-chunk-time io) nil)
+        (setf (ebb-io-first-chunk-time io) nil
+              (ebb-io-last-processing-error io) nil
+              (ebb-io-processing-error-count io) 0)
 
         ;; Check for more pending data
         (setf (ebb-io-processing io) nil)
         (when (ebb-io--pending-p io)
-          (setf (ebb-io-first-chunk-time io) (current-time))
+          (setf (ebb-io-first-chunk-time io) (float-time))
           (ebb-io--schedule-processing io)))
     (error
      (setf (ebb-io-processing io) nil)
-     (message "[ebb-io] Processing error: %S" err))))
+     (if (equal err (ebb-io-last-processing-error io))
+         (cl-incf (ebb-io-processing-error-count io))
+       (setf (ebb-io-last-processing-error io) err
+             (ebb-io-processing-error-count io) 1))
+     (run-hook-with-args 'ebb-io-processing-error-functions
+                         io err (ebb-io-processing-error-count io)))))
+
+(defun ebb-io--report-processing-error (_io error-data count)
+  "Report asynchronous ERROR-DATA after COUNT consecutive failures.
+Repeated identical failures are rate-limited to avoid flooding *Messages*."
+  (when (or (<= count 3) (zerop (% count 100)))
+    (message "[ebb-io] Processing error%s: %S"
+             (if (> count 1) (format " (repeated %d times)" count) "")
+             error-data)))
+
+(add-hook 'ebb-io-processing-error-functions #'ebb-io--report-processing-error)
 
 ;;;; ---- Binary Flood Detection -----------------------------------------
 
@@ -189,13 +221,6 @@ This is the supported entry point for non-PTY transports."
           (> (ebb-io-throughput-bytes io) 1048576))))
 
 ;;;; ---- Command Building -----------------------------------------------
-
-(defcustom ebb-enable-shell-integration t
-  "If non-nil, automatically source shell integration scripts.
-When enabled, ebb wraps the shell command to source the appropriate
-integration script for the detected shell."
-  :type 'boolean
-  :group 'ebb)
 
 (defun ebb-io--detect-shell (shell-command)
   "Detect the shell type from SHELL-COMMAND.
@@ -475,7 +500,7 @@ Ebb through `ebb-io--filter'."
 Multibyte text is encoded with `ebb-io-input-coding-system'.
 Unibyte strings are always sent unchanged.  Sending an interrupt discards
 queued output so the interrupted program's prompt is not stuck behind it."
-  (when-let ((proc (ebb-io-process io)))
+  (when-let* ((proc (ebb-io-process io)))
     (when (process-live-p proc)
       (when (string-search "\C-c" string)
         (ebb-io--prepare-interrupt io))
@@ -502,7 +527,7 @@ queued output so the interrupted program's prompt is not stuck behind it."
       ;; Step 2: Notify PTY.  Without this the child keeps its startup size
       ;; and never gets SIGWINCH, so shells and TUIs format for the old
       ;; width and their output wraps in the middle of a row.
-      (when-let ((proc (ebb-io-process io)))
+      (when-let* ((proc (ebb-io-process io)))
         (when (and (process-live-p proc)
                    (ebb-io--pty-process-p proc))
           (set-process-window-size proc new-height new-width)))
@@ -520,7 +545,7 @@ queued output so the interrupted program's prompt is not stuck behind it."
   (when (ebb-io-render-timer io)
     (cancel-timer (ebb-io-render-timer io))
     (setf (ebb-io-render-timer io) nil))
-  (when-let ((proc (ebb-io-process io)))
+  (when-let* ((proc (ebb-io-process io)))
     (when (process-live-p proc)
       (delete-process proc))
     (setf (ebb-io-process io) nil))

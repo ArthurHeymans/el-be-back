@@ -26,6 +26,7 @@ Binds `screen' and `parser' in BODY."
         (height (or (plist-get spec :height) 6)))
     `(let* ((screen (ebb-screen-create ,width ,height))
             (parser (ebb-parse-create screen)))
+       (ignore parser)
        ,@body)))
 
 (defun ebb-test-output (parser str)
@@ -2191,6 +2192,39 @@ Binds `screen' and `parser' in BODY."
     (should (equal '("abc" "def") (ebb-io-pending-chunks io)))
     (should (= 0 (ebb-io-pending-offset io)))))
 
+(ert-deftest ebb-test-io-runs-post-render-functions ()
+  "Post-render integration uses the documented abnormal hook."
+  (let* ((screen (ebb-screen-create 5 2))
+         (parser (ebb-parse-create screen))
+         seen)
+    (with-temp-buffer
+      (let* ((render (ebb-render-create screen (current-buffer)))
+             (io (make-ebb-io :screen screen :parser parser :render render
+                              :buffer (current-buffer)))
+             (ebb-io-after-render-functions
+              (list (lambda (value) (setq seen value)))))
+        (ebb-io--enqueue-output io "OK")
+        (ebb-io--process-pending io t)
+        (should (eq seen render))))))
+
+(ert-deftest ebb-test-io-processing-errors-are-counted ()
+  "Repeated asynchronous processing errors reach the error hook with a count."
+  (let* ((screen (ebb-screen-create 5 2))
+         (parser (ebb-parse-create screen))
+         counts)
+    (with-temp-buffer
+      (let* ((render (ebb-render-create screen (current-buffer)))
+             (io (make-ebb-io :screen screen :parser parser :render render
+                              :buffer (current-buffer)))
+             (ebb-io-processing-error-functions
+              (list (lambda (_io _error count) (push count counts)))))
+        (ebb-io--enqueue-output io "bad")
+        (cl-letf (((symbol-function 'ebb-parse-bytes)
+                   (lambda (&rest _) (error "test failure"))))
+          (ebb-io--process-pending io t)
+          (ebb-io--process-pending io t))
+        (should (equal '(2 1) counts))))))
+
 (ert-deftest ebb-test-io-binary-flood-does-not-drop-output ()
   "Flood mode still parses pending terminal output."
   (let* ((screen (ebb-screen-create 10 2))
@@ -2644,8 +2678,7 @@ Binds `screen' and `parser' in BODY."
 
 (ert-deftest ebb-test-shell-osc51-dispatch ()
   "OSC 51 dispatch parses command letters correctly."
-  (let ((events nil))
-    (with-temp-buffer
+  (with-temp-buffer
       ;; Set up buffer-local state
       (setq-local ebb-enable-shell-prompt-annotation nil)  ; disable annotation
       (setq-local ebb-enable-directory-tracking nil)       ; disable for test
@@ -2658,7 +2691,7 @@ Binds `screen' and `parser' in BODY."
       ;; Test command text
       (let ((cmd-b64 (base64-encode-string "ls -la" t)))
         (ebb-shell-handle-osc51 (concat "e;F;" cmd-b64) nil)
-        (should (equal "ls -la" ebb-shell--current-command))))))
+        (should (equal "ls -la" ebb-shell--current-command)))))
 
 (ert-deftest ebb-test-shell-message-default-deny ()
   "OSC 51 messages do nothing with the default nil whitelist."

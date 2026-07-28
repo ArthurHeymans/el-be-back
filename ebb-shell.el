@@ -300,6 +300,8 @@ after `ebb-render-refresh'."
     (when ebb-enable-shell-prompt-annotation
       (ebb-shell--schedule-overlay-correction))))
 
+(add-hook 'ebb-io-after-render-functions #'ebb-shell-post-render)
+
 (defun ebb-shell--line-to-buffer-pos (render abs-line &optional column)
   "Convert ABS-LINE and COLUMN to a buffer position in RENDER."
   (let* ((display-begin (ebb-render-state-display-begin render))
@@ -323,7 +325,7 @@ after `ebb-render-refresh'."
 
 (defun ebb-shell--apply-prompt-start (render abs-line column)
   "Remember an annotation start at ABS-LINE and COLUMN in RENDER."
-  (when-let ((pos (ebb-shell--line-to-buffer-pos render abs-line column)))
+  (when-let* ((pos (ebb-shell--line-to-buffer-pos render abs-line column)))
     (let ((m (copy-marker pos)))
       (set-marker-insertion-type m t)
       (setq ebb-shell--prompt-start-line m))))
@@ -338,7 +340,7 @@ after `ebb-render-refresh'."
         (setf (cadr ebb-shell--prompt-mark)
               (ebb-shell--status-indicator ebb-shell--command-status))
         (setq ebb-shell--prompt-mark nil))
-      (when-let ((end (ebb-shell--line-to-buffer-pos
+      (when-let* ((end (ebb-shell--line-to-buffer-pos
                        render abs-line column)))
         (let ((beg (marker-position prompt-begin)))
           (when (< beg end)
@@ -463,7 +465,7 @@ N defaults to 1."
             (user-error "No %s prompt" (if (> step 0) "next" "previous")))
           (goto-char position)
           (when (get-text-property (point) 'ebb-shell-prompt-end)
-            (when-let ((next
+            (when-let* ((next
                         (if (> step 0)
                             (next-single-property-change
                              (point) 'ebb-shell-prompt-end)
