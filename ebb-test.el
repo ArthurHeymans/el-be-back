@@ -2344,6 +2344,16 @@ Binds `screen' and `parser' in BODY."
 
 ;;;; ---- Mode Line Tests ------------------------------------------------
 
+(ert-deftest ebb-test-mode-disables-undo-history ()
+  "Generated terminal output does not accumulate undo history."
+  (with-temp-buffer
+    (ebb-mode)
+    (should (eq buffer-undo-list t))
+    (let ((inhibit-read-only t))
+      (insert "streamed output")
+      (delete-region (point-min) (point-max)))
+    (should (eq buffer-undo-list t))))
+
 (ert-deftest ebb-test-mode-disables-fontification ()
   "Ebb prevents deferred fontification from scanning terminal scrollback."
   (let (emojify-argument)

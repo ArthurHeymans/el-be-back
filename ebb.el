@@ -886,7 +886,9 @@ Called after each render.  Debounced so short-lived matches don't flash."
 (define-derived-mode ebb-mode fundamental-mode "Ebb"
   "Major mode for the ebb terminal emulator."
   (setq-local buffer-read-only t)
-  (setq-local buffer-undo-list t)
+  ;; Terminal buffers are generated views.  Recording every streaming render
+  ;; update would retain a large undo history for content users cannot edit.
+  (buffer-disable-undo)
   (setq-local truncate-lines t)
   (setq-local scroll-margin 0)
   (setq-local scroll-conservatively 101)
