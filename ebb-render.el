@@ -423,6 +423,8 @@ state are reconciled independently so metadata-only updates are visible."
                                  (ebb-render-buffer-anchor
                                   render (window-start window)))))
          (point-anchor (ebb-render-buffer-anchor render (point)))
+         (mark-anchor (and (mark t)
+                           (ebb-render-buffer-anchor render (mark t))))
          (total (ebb-screen-history-row-count screen))
          (generation (ebb-screen-history-generation screen))
          (capacity (ebb-render--history-capacity render))
@@ -434,11 +436,16 @@ state are reconciled independently so metadata-only updates are visible."
                         windows)))
          (point-location (ebb-render--anchor-location
                           render point-anchor total))
+         (mark-location (ebb-render--anchor-location
+                         render mark-anchor total))
          (history-rows
           (delq nil
                 (mapcar (lambda (location)
-                          (and (< (car location) total) (car location)))
-                        (append history-locations (list point-location)))))
+                          (and location
+                               (< (car location) total)
+                               (car location)))
+                        (append history-locations
+                                (list point-location mark-location)))))
          ;; A buffer shared by several windows needs one contiguous slab that
          ;; covers all their starts.  Usually this remains CAPACITY rows; widely
          ;; separated windows intentionally expand it rather than corrupting one
@@ -677,17 +684,22 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
          (history-rows (ebb-screen-history-row-count screen))
          (capacity (ebb-render--history-capacity render)))
     (if (< row history-rows)
-        (let* ((start (min (max 0 (- row (/ capacity 3)))
-                           (max 0 (- history-rows capacity))))
-               (count (min capacity (- history-rows start)))
-               (inhibit-read-only t)
-               (inhibit-modification-hooks t)
-               (buffer-undo-list t))
-          (ebb-render--rebuild-scrollback
-           render start count history-rows
-           (ebb-screen-history-generation screen))
+        (let* ((slab-start (ebb-render-state-history-start-row render))
+               (slab-end (+ slab-start
+                            (ebb-render-state-scrollback-count render))))
+          (unless (and (>= row slab-start) (< row slab-end))
+            (let* ((start (min (max 0 (- row (/ capacity 3)))
+                               (max 0 (- history-rows capacity))))
+                   (count (min capacity (- history-rows start)))
+                   (inhibit-read-only t)
+                   (inhibit-modification-hooks t)
+                   (buffer-undo-list t))
+              (ebb-render--rebuild-scrollback
+               render start count history-rows
+               (ebb-screen-history-generation screen))))
           (goto-char (ebb-render-state-region-begin render))
-          (forward-line (- row start)))
+          (forward-line (- row
+                           (ebb-render-state-history-start-row render))))
       (goto-char (ebb-render-state-display-begin render))
       (forward-line (- row history-rows)))
     (move-to-column column)

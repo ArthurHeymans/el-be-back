@@ -2088,6 +2088,50 @@ Binds `screen' and `parser' in BODY."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest ebb-test-render-emacs-mode-preserves-separated-history-anchors ()
+  "Refreshing history preserves point, mark, and a distant reading window."
+  (let* ((screen (ebb-screen-create 8 3))
+         (buffer (generate-new-buffer " *ebb-test-history-view*")))
+    (setf (ebb-screen-scrollback screen)
+          (cl-loop for id downfrom 199 to 0
+                   collect (make-ebb-history-line
+                            :id id :text (format "%03d" id)
+                            :text-length 3))
+          (ebb-screen-scrollback-length screen) 200
+          (ebb-screen-history-next-id screen) 200
+          (ebb-screen-history-generation screen) 1
+          (ebb-screen-history-logical-p screen) t)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (setq-local ebb--input-mode 'emacs)
+          (let ((render (ebb-render-create screen buffer)))
+            (ebb-render--rebuild-scrollback render 10 160 200 1)
+            (ebb-render-goto-location render 150 1 t)
+            (set-mark (save-excursion
+                        (ebb-render-goto-location render 100 2 t)
+                        (point)))
+            (setq mark-active t)
+            (save-excursion
+              (ebb-render-goto-location render 20 0 t)
+              (set-window-start (selected-window) (point) t))
+            (let ((point-anchor (ebb-render-buffer-anchor render))
+                  (mark-anchor (ebb-render-buffer-anchor render (mark t)))
+                  (start-anchor
+                   (ebb-render-buffer-anchor render (window-start))))
+              (cl-incf (ebb-screen-history-generation screen))
+              (setf (ebb-screen-scrollback-dirty screen) t)
+              (ebb-render-refresh render)
+              (should (equal point-anchor
+                             (ebb-render-buffer-anchor render)))
+              (should (equal mark-anchor
+                             (ebb-render-buffer-anchor render (mark t))))
+              (should (equal start-anchor
+                             (ebb-render-buffer-anchor
+                              render (window-start)))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest ebb-test-render-ed2-shows-viewport-top ()
   "ED 2 makes Ctrl-L and clear show the top of the live viewport."
   (save-window-excursion
