@@ -972,6 +972,42 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[0K")    ; erase to end of line
     (should (equal "XXXXX" (ebb-test-display-line screen 0)))))
 
+(ert-deftest ebb-test-parse-decaln ()
+  "DECALN fills the display with E characters and homes the cursor."
+  (ebb-test-with-screen (:width 5 :height 3)
+    (ebb-test-output parser "junk\e#")
+    (should (eq :escape-intermediate (ebb-parser-state parser)))
+    (ebb-test-output parser "8")
+    (should (equal '("EEEEE" "EEEEE" "EEEEE")
+                   (ebb-test-display-text screen)))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))
+    (should (eq :ground (ebb-parser-state parser)))))
+
+(ert-deftest ebb-test-parse-esc-encoding-selector-is-consumed ()
+  "ESC percent encoding selectors do not leak their final byte as text."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-test-output parser "\e%Gok")
+    (should (equal "ok" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-parse-deccolm ()
+  "DECCOLM selects 80/132 columns, clears the display, and homes the cursor."
+  (ebb-test-with-screen (:width 100 :height 24)
+    (ebb-test-output parser "junk\e[3;20r\e[?3l")
+    (should (= 80 (ebb-screen-width screen)))
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 23 (ebb-screen-scroll-bottom screen)))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))
+    (should (equal "" (ebb-test-display-line screen 0)))
+    ;; VTTEST deliberately moves beyond column 80 to verify clamping.
+    (ebb-test-output parser "\e[23;70H\e[42C+")
+    (should (= ?+ (ebb-cell-char
+                   (aref (ebb-line-cells
+                          (ebb-screen-get-line screen 22)) 79))))
+    (ebb-test-output parser "\e[?3h")
+    (should (= 132 (ebb-screen-width screen)))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))
+    (should (equal "" (ebb-test-display-line screen 22)))))
+
 (ert-deftest ebb-test-parse-sgr-basic ()
   "Parser handles basic SGR attributes."
   (ebb-test-with-screen (:width 20 :height 6)
@@ -1049,6 +1085,20 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[2;4r")  ; scroll region rows 2-4 (1-indexed)
     (should (= 1 (ebb-screen-scroll-top screen)))   ; 0-indexed
     (should (= 3 (ebb-screen-scroll-bottom screen)))))
+
+(ert-deftest ebb-test-parse-origin-mode ()
+  "DECOM makes cursor addressing relative to the scrolling region."
+  (ebb-test-with-screen (:width 10 :height 6)
+    (ebb-test-output parser "\e[2;5r\e[?6h")
+    (should (ebb-screen-origin-mode screen))
+    (should (equal '(0 . 1) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[2;3H")
+    (should (equal '(2 . 2) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[20A")
+    (should (equal '(2 . 1) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[?6l")
+    (should-not (ebb-screen-origin-mode screen))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))))
 
 (ert-deftest ebb-test-parse-insert-delete ()
   "Parser handles ICH, DCH, IL, DL."

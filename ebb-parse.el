@@ -34,7 +34,7 @@
   ;; CSI collection
   (param-string "")      ; digits, semicolons, colons
   (private nil)          ; ?/>/= prefix char or nil
-  (intermediates "")     ; intermediate bytes (space etc.)
+  (intermediates "")     ; ESC/CSI intermediate bytes (space etc.)
   ;; String collection
   (osc-string "")
   (dcs-string "")
@@ -432,7 +432,8 @@ only digits and semicolons."
    ;; C0 controls (0x00-0x1F) handled inline in most states
    ((and (< ch ?\s)
          (memq (ebb-parser-state parser)
-               '(:ground :escape :csi-entry :csi-param :csi-intermediate)))
+               '(:ground :escape :escape-intermediate
+                 :csi-entry :csi-param :csi-intermediate)))
     (ebb-parse--dispatch-c0 parser ch))
 
    ;; DEL -- ignore
@@ -443,6 +444,8 @@ only digits and semicolons."
     (pcase (ebb-parser-state parser)
       (:ground            (ebb-parse--ground parser ch))
       (:escape            (ebb-parse--escape parser ch))
+      (:escape-intermediate
+       (ebb-parse--escape-intermediate parser ch))
       (:csi-entry         (ebb-parse--csi-entry parser ch))
       (:csi-param         (ebb-parse--csi-param parser ch))
       (:csi-intermediate  (ebb-parse--csi-intermediate parser ch))
@@ -511,11 +514,46 @@ only digits and semicolons."
    ((memq ch '(?X ?^ ?_))
     (setf (ebb-parser-string-state parser) nil)
     (setf (ebb-parser-state parser) :sos-pm-apc))
+   ;; Other ESC intermediate sequences, such as DECALN (ESC # 8).
+   ((and (>= ch ?\s) (<= ch ?/))
+    (setf (ebb-parser-string-state parser) nil)
+    (setf (ebb-parser-intermediates parser) (string ch))
+    (setf (ebb-parser-state parser) :escape-intermediate))
    ;; Simple ESC commands
    (t
     (setf (ebb-parser-string-state parser) nil)
     (ebb-parse--dispatch-esc parser ch)
     (setf (ebb-parser-state parser) :ground))))
+
+(defun ebb-parse--escape-intermediate (parser ch)
+  "Collect and dispatch an ESC sequence with intermediate bytes."
+  (cond
+   ((and (>= ch ?\s) (<= ch ?/))
+    (setf (ebb-parser-intermediates parser)
+          (concat (ebb-parser-intermediates parser) (string ch))))
+   ((and (>= ch ?0) (<= ch ?~))
+    (ebb-parse--dispatch-esc-intermediate parser ch)
+    (setf (ebb-parser-state parser) :ground))
+   (t
+    (setf (ebb-parser-state parser) :ground))))
+
+(defun ebb-parse--dispatch-esc-intermediate (parser ch)
+  "Dispatch an ESC sequence ending in CH after intermediate bytes."
+  (let ((intermediates (ebb-parser-intermediates parser))
+        (screen (ebb-parser-screen parser)))
+    (condition-case err
+        (cond
+         ((and (string= intermediates "#") (= ch ?8))
+          (ebb-screen-alignment-test screen))
+         ;; ESC % G and ESC % @ select UTF-8 and ISO 2022 respectively.
+         ;; Input decoding is managed by the process coding system, but the
+         ;; complete sequence must still be consumed rather than displayed.
+         ((and (string= intermediates "%") (memq ch '(?G ?@))) nil)
+         (t
+          (ebb-parse--log "Unknown ESC %s%c" intermediates ch)))
+      (error
+       (ebb-parse--log "ESC intermediate dispatch error for %s%c: %S"
+                       intermediates ch err)))))
 
 (defun ebb-parse--dispatch-esc (parser ch)
   "Dispatch a simple ESC sequence."

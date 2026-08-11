@@ -672,6 +672,18 @@ Called after each render.  Debounced so short-lived matches don't flash."
             (when ebb--mouse-drag-transient-map-exit
               (funcall ebb--mouse-drag-transient-map-exit)
               (setq ebb--mouse-drag-transient-map-exit nil))))
+         (3
+          ;; DECCOLM changes the model width independently of the Emacs
+          ;; window.  Keep the PTY and renderer synchronized with that grid.
+          (when-let* ((proc (and ebb--io (ebb-io-process ebb--io))))
+            (when (and (process-live-p proc)
+                       (ebb-io--pty-process-p proc))
+              (set-process-window-size
+               proc
+               (ebb-screen-height ebb--screen)
+               (ebb-screen-width ebb--screen))))
+          (when (and ebb--io (ebb-io-render ebb--io))
+            (ebb-render-full-reset (ebb-io-render ebb--io))))
          (1004
           ;; Focus events -- could enable focus tracking here
           nil)

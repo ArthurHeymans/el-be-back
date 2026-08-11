@@ -2181,10 +2181,44 @@ Handles LF, VT, FF."
 
 ;;;; ---- Mode Setting ---------------------------------------------------
 
+(defun ebb-screen-alignment-test (screen)
+  "Fill SCREEN with `E' characters for the DEC screen alignment test."
+  (let ((width (ebb-screen-width screen))
+        (height (ebb-screen-height screen)))
+    (dotimes (row height)
+      (ebb--set-line-at
+       screen row
+       (make-ebb-line :cells nil
+                      :cells-valid nil
+                      :text (make-string width ?E)
+                      :dirty t)))
+    (setf (ebb-screen-cursor-x screen) 0
+          (ebb-screen-cursor-y screen) 0
+          (ebb-screen-pending-wrap screen) nil)
+    (ebb-screen-mark-viewport-reset screen)
+    (ebb--mark-region-dirty screen 0 (1- height))))
+
+(defun ebb-screen-set-column-mode (screen wide)
+  "Select 132 columns when WIDE is non-nil, otherwise 80 columns.
+DECCOLM clears the display, restores full-screen margins, and homes the cursor."
+  (let ((width (if wide 132 80))
+        (height (ebb-screen-height screen)))
+    (ebb-screen-resize screen width height)
+    (setf (ebb-screen-scroll-top screen) 0
+          (ebb-screen-scroll-bottom screen) (1- height)
+          (ebb-screen-cursor-x screen) 0
+          (ebb-screen-cursor-y screen) 0
+          (ebb-screen-pending-wrap screen) nil
+          (ebb-screen-tab-stops screen) (ebb--default-tab-stops width))
+    (ebb-screen-erase-in-display screen 2)))
+
 (defun ebb-screen-set-mode (screen mode value)
   "Set a DECSET/DECRST MODE to VALUE (t or nil)."
   (pcase mode
     (1    (setf (ebb-screen-keypad-mode screen) value))
+    (3    (ebb-screen-set-column-mode screen value))
+    (6    (setf (ebb-screen-origin-mode screen) value)
+          (ebb-screen-cursor-goto screen 0 0))
     (7    (setf (ebb-screen-auto-wrap screen) value))
     (9    (setf (ebb-screen-mouse-mode screen) (and value 'x10)))
     (12   (setf (ebb-screen-cursor-blink screen) value))
