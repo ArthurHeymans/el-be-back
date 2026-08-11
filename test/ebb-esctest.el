@@ -46,8 +46,10 @@
           (setq parser
                 (ebb-parse-create
                  screen nil
-                 (lambda (type &rest _args)
-                   (when (eq type 'resize-request)
+                 (lambda (type &rest args)
+                   (when (or (memq type '(reset resize-request))
+                             (and (eq type 'mode-set)
+                                  (= (car args) 3)))
                      (when-let* ((proc (and io (ebb-io-process io))))
                        (when (and (process-live-p proc)
                                   (ebb-io--pty-process-p proc))
@@ -67,8 +69,13 @@
                        (concat "--logfile=" logfile)
                        "--no-print-logs")
                  terminal-buffer))
-          (while (process-live-p process)
-            (accept-process-output process 0.1))
+          (let ((deadline (+ (float-time) 180)))
+            (while (and (process-live-p process)
+                        (< (float-time) deadline))
+              (accept-process-output process 0.1))
+            (when (process-live-p process)
+              (delete-process process)
+              (error "esctest2 timed out after 180 seconds")))
           (when (ebb-io--pending-p io)
             (ebb-io--process-pending io t))
           (when (ebb-io-last-processing-error io)

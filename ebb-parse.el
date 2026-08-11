@@ -516,6 +516,9 @@ only digits and semicolons."
 
 (defun ebb-parse--escape (parser ch)
   "Handle character after ESC."
+  ;; Preserve DCS intermediates only for the ESC \\ string terminator.
+  (unless (and (= ch ?\\) (ebb-parser-string-state parser))
+    (setf (ebb-parser-intermediates parser) ""))
   (cond
    ;; ST (ESC \) terminates a pending string
    ((and (= ch ?\\) (ebb-parser-string-state parser))
@@ -900,7 +903,19 @@ Return non-nil when the sequence was handled."
                     (cond
                      ((= mode 8) 4)
                      ((= mode 60) 4)
-                     ((memq mode '(1 3 4 5 6 7 18 19 25 35 42 66 67 69))
+                     ((= mode 1)
+                      (if (ebb-screen-keypad-mode screen) 1 2))
+                     ((= mode 3)
+                      (if (ebb-screen-column-mode-enabled-p screen) 1 2))
+                     ((= mode 6)
+                      (if (ebb-screen-origin-mode screen) 1 2))
+                     ((= mode 7)
+                      (if (ebb-screen-auto-wrap screen) 1 2))
+                     ((= mode 25)
+                      (if (ebb-screen-cursor-visible screen) 1 2))
+                     ((= mode 69)
+                      (if (ebb-screen-horizontal-margins-enabled-p screen) 1 2))
+                     ((memq mode '(4 5 18 19 35 42 66 67))
                       (if (ebb-parse--recorded-mode
                            ebb-parse--dec-mode-states screen mode) 1 2))
                      (t 0))
@@ -969,26 +984,11 @@ Return non-nil when the sequence was handled."
       t)
      ;; DECRQCRA - request checksum of rectangular area.
      ((and (= final-byte ?y) (string= intermediates "*"))
-      (let* ((height (ebb-screen-height screen))
-             (width (ebb-screen-width screen))
-             (pid (if (> (length params) 0) (aref params 0) 0))
-             (origin (if (ebb-screen-origin-mode screen)
-                         (ebb-screen-scroll-top screen) 0))
-             (top (+ origin (1- (ebb-parse--param params 2 1))))
-             (left (1- (ebb-parse--param params 3 1)))
-             (bottom (+ origin (1- (ebb-parse--param params 4 height))))
-             (right (1- (ebb-parse--param params 5 width)))
-             (checksum
-              (if (or (> top bottom) (> left right)
-                      (>= top height) (>= left width)
-                      (< bottom 0) (< right 0))
-                  0
-                (ebb-screen-checksum-rect
-                 screen
-                 (ebb--clamp top 0 (1- height))
-                 (ebb--clamp left 0 (1- width))
-                 (ebb--clamp bottom 0 (1- height))
-                 (ebb--clamp right 0 (1- width))))))
+      (let* ((pid (if (> (length params) 0) (aref params 0) 0))
+             (rectangle (ebb-parse--rect-coordinates screen params 2))
+             (checksum (if rectangle
+                           (apply #'ebb-screen-checksum-rect screen rectangle)
+                         0)))
         (ebb-parse--respond parser
                            (format "\eP%d!~%04X\e\\" pid checksum)))
       t)
@@ -997,15 +997,17 @@ Return non-nil when the sequence was handled."
 (defun ebb-parse--dispatch-csi (parser final-byte)
   "Parse parameters and dispatch CSI sequence."
   (condition-case err
-      (let* ((param (ebb-parser-param-string parser))
-             (params (ebb-parse--parse-params param)))
-        (unless (or (ebb-parse--dispatch-csi-intermediate
-                     parser final-byte params)
-                    (ebb-parse--fast-csi parser final-byte param))
-          (let ((handler (if (< final-byte 128)
-                             (aref ebb-parse--csi-dispatch final-byte)
-                           #'ebb-parse--csi-unknown)))
-            (funcall handler parser params))))
+      (let ((param (ebb-parser-param-string parser)))
+        (unless (ebb-parse--fast-csi parser final-byte param)
+          (let ((params (ebb-parse--parse-params param)))
+            (unless (and (not (string-empty-p
+                               (ebb-parser-intermediates parser)))
+                         (ebb-parse--dispatch-csi-intermediate
+                          parser final-byte params))
+              (let ((handler (if (< final-byte 128)
+                                 (aref ebb-parse--csi-dispatch final-byte)
+                               #'ebb-parse--csi-unknown)))
+                (funcall handler parser params))))))
     (error
      (ebb-parse--log "CSI dispatch error for %c: %S" final-byte err)))
   (setf (ebb-parser-state parser) :ground))
@@ -1251,8 +1253,7 @@ Pm=1: read, Pm=4: read maximum."
   (when (and (null (ebb-parser-private parser))
              (string-empty-p (ebb-parser-intermediates parser)))
     (let ((screen (ebb-parser-screen parser)))
-      (if (and (ebb-screen-horizontal-margins-enabled-p screen)
-               (> (length params) 0))
+      (if (ebb-screen-horizontal-margins-enabled-p screen)
           (ebb-screen-set-horizontal-margins
            screen
            (1- (ebb-parse--param params 0 1))
@@ -1305,7 +1306,9 @@ Pm=1: read, Pm=4: read maximum."
            (puthash screen height ebb-parse--page-lengths)
            (ebb-parse--emit parser 'resize-request width height))))
       ;; DECSLPP - set number of lines per page.
-      (27 (puthash screen 27 ebb-parse--page-lengths))
+      ((pred (lambda (value) (>= value 24)))
+       (puthash screen (ebb-parse--param params 0 24)
+                ebb-parse--page-lengths))
       ;; Report terminal size in chars.
       (18 (ebb-parse--respond
            parser
@@ -1585,6 +1588,17 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
 
 ;;;; ---- DCS Dispatch ---------------------------------------------------
 
+(defun ebb-parse--sgr-color-status (color foreground)
+  "Return SGR parameters for COLOR as foreground when FOREGROUND is non-nil."
+  (cond
+   ((integerp color)
+    (cond
+     ((< color 8) (list (+ (if foreground 30 40) color)))
+     ((< color 16) (list (+ (if foreground 90 100) (- color 8))))
+     (t (list (if foreground 38 48) 5 color))))
+   ((and (listp color) (= (length color) 3))
+    (append (list (if foreground 38 48) 2) color))))
+
 (defun ebb-parse--sgr-status (screen)
   "Return SCREEN's current rendition as a DECRQSS parameter string."
   (let ((attr (ebb-screen-current-attr screen))
@@ -1593,7 +1607,21 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
     (when (ebb-attr-faint attr) (setq params (append params '(2))))
     (when (ebb-attr-italic attr) (setq params (append params '(3))))
     (when (ebb-attr-underline attr) (setq params (append params '(4))))
+    (when (eq (ebb-attr-blink attr) 'slow)
+      (setq params (append params '(5))))
+    (when (eq (ebb-attr-blink attr) 'fast)
+      (setq params (append params '(6))))
     (when (ebb-attr-inverse attr) (setq params (append params '(7))))
+    (when (ebb-attr-conceal attr) (setq params (append params '(8))))
+    (when (ebb-attr-crossed attr) (setq params (append params '(9))))
+    (when (ebb-attr-fg attr)
+      (setq params (append params
+                           (ebb-parse--sgr-color-status
+                            (ebb-attr-fg attr) t))))
+    (when (ebb-attr-bg attr)
+      (setq params (append params
+                           (ebb-parse--sgr-color-status
+                            (ebb-attr-bg attr) nil))))
     (mapconcat #'number-to-string params ";")))
 
 (defun ebb-parse--cursor-style-status (screen)
@@ -1644,7 +1672,7 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
           (if-let* ((value (ebb-parse--decrqss-value
                             (ebb-parser-screen parser) body)))
               (ebb-parse--respond parser (concat "\eP1$r" value "\e\\"))
-            (ebb-parse--respond parser (concat "\eP0$r" body "\e\\"))))
+            (ebb-parse--respond parser "\eP0$r\e\\")))
          ;; Sixel graphics.
          ((= final ?q) (ebb-parse--emit parser 'sixel body))
          (t (ebb-parse--log "Unknown DCS final %c" final))))
