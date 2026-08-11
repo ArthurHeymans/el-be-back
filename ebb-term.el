@@ -67,6 +67,7 @@
   (text nil)          ; lazy single-width text, instead of CELLS
   (text-length 0)     ; logical prefix of TEXT, excluding trailing blanks
   (attr-runs nil)     ; logical (START END ATTR) ranges over TEXT
+  (rendition 'normal) ; DEC width/height rendition for reflowed rows
   (prompt-begins nil)
   (prompt-ends nil)
   (open nil)
@@ -840,23 +841,37 @@ that actually scrolled off the display."
       (ebb-history-line-text-length line)
     (length (ebb-history-line-cells line))))
 
+(defsubst ebb--history-line-width (line width)
+  "Return LINE's logical row width at physical WIDTH."
+  (if (eq (ebb-history-line-rendition line) 'normal)
+      width
+    (max 1 (/ width 2))))
+
 (defsubst ebb--history-line-wrap-end (line offset width)
-  "Return LINE's wrap end after OFFSET at WIDTH."
-  (if (ebb-history-line-text line)
-      (min (ebb-history-line-text-length line) (+ offset width))
-    (ebb--wrap-end (ebb-history-line-cells line) offset width)))
+  "Return LINE's wrap end after OFFSET at physical WIDTH."
+  (let ((logical-width (ebb--history-line-width line width)))
+    (if (ebb-history-line-text line)
+        (min (ebb-history-line-text-length line) (+ offset logical-width))
+      (ebb--wrap-end (ebb-history-line-cells line) offset logical-width))))
 
 (defun ebb--history-push-row (screen line width)
   "Append physical LINE of WIDTH columns to SCREEN's logical history."
   (setf (ebb-screen-history-logical-p screen) t)
   (let* ((wrapped (ebb-line-wrapped line))
-         (plain-info (ebb--history-plain-row-text line width wrapped))
-         (text-info (ebb--history-text-row-info line width wrapped))
+         (rendition (ebb-line-rendition line))
+         (normal (eq rendition 'normal))
+         (logical-width (if normal width (max 1 (/ width 2))))
+         (plain-info (and normal
+                          (ebb--history-plain-row-text line width wrapped)))
+         (text-info (and normal
+                         (ebb--history-text-row-info line width wrapped)))
          (text (nth 0 text-info))
          (text-length (or (nth 1 text-info) 0))
          (attr-runs (nth 2 text-info))
          (cells (unless text-info
-                  (let ((row-cells (ebb--line-ensure-cells line width)))
+                  (let ((row-cells
+                         (cl-subseq (ebb--line-ensure-cells line width)
+                                    0 logical-width)))
                     (if wrapped
                         (vconcat row-cells)
                       (ebb--trim-trailing-blank-cells row-cells)))))
@@ -876,7 +891,8 @@ that actually scrolled off the display."
         (setq history (ebb-screen-scrollback screen)
               current (car history)))
       (if (and current (ebb-history-line-p current)
-               (ebb-history-line-open current))
+               (ebb-history-line-open current)
+               (eq rendition (ebb-history-line-rendition current)))
           (let ((offset (ebb--history-line-length current)))
             (if (and text-info (ebb-history-line-text current))
                 (let ((current-length
@@ -920,6 +936,7 @@ that actually scrolled off the display."
                 :text text
                 :text-length text-length
                 :attr-runs attr-runs
+                :rendition rendition
                 :prompt-begins (copy-sequence (ebb-line-prompt-begins line))
                 :prompt-ends (copy-sequence (ebb-line-prompt-ends line))
                 :open wrapped)))
@@ -1065,26 +1082,32 @@ ordered oldest first.  A plain chunk may represent many logical lines."
                       when (and (> column offset) (<= column end))
                       collect (- column offset))
              :wrapped (not last)
-             :dirty t)))
-      (if-let* ((plain (ebb-history-line-text logical)))
-          (apply #'make-ebb-line
-                 :text (concat (substring plain offset end)
-                               (make-string (- width (- end offset)) ?\s))
-                 :cells-valid nil
-                 :attr-runs
-                 (ebb--slice-attr-runs
-                  (ebb-history-line-attr-runs logical) offset end)
-                 common)
-        (let* ((cells (ebb-history-line-cells logical))
-               (row-cells (if (= offset end) []
-                            (cl-subseq cells offset end))))
-          (apply #'make-ebb-line
-                 :cells (ebb--fit-cells-to-width row-cells width)
-                 common))))))
+             :dirty t))
+           (line
+            (if-let* ((plain (ebb-history-line-text logical)))
+                (apply #'make-ebb-line
+                       :text (concat (substring plain offset end)
+                                     (make-string (- width (- end offset)) ?\s))
+                       :cells-valid nil
+                       :attr-runs
+                       (ebb--slice-attr-runs
+                        (ebb-history-line-attr-runs logical) offset end)
+                       common)
+              (let* ((cells (ebb-history-line-cells logical))
+                     (row-cells (if (= offset end) []
+                                  (cl-subseq cells offset end))))
+                (apply #'make-ebb-line
+                       :cells (ebb--fit-cells-to-width row-cells width)
+                       common)))))
+      (unless (eq (ebb-history-line-rendition logical) 'normal)
+        (puthash line (ebb-history-line-rendition logical)
+                 ebb--line-renditions))
+      line)))
 
 (defun ebb-history-line-offset-position (line width offset)
   "Return LINE's physical (ROW . COLUMN) for cell OFFSET at WIDTH."
-  (let ((length (ebb--history-line-length line))
+  (let ((width (ebb--history-line-width line width))
+        (length (ebb--history-line-length line))
         (start 0)
         (row 0)
         end)
@@ -2239,12 +2262,12 @@ Handles LF, VT, FF."
 (defun ebb-screen-restore-cursor (screen)
   "Restore cursor and rendition state (DECRC)."
   (setf (ebb-screen-pending-wrap screen) nil
-        (ebb-screen-cursor-x screen)
-        (ebb--clamp (ebb-screen-cursor-saved-x screen)
-                    0 (1- (ebb-screen-width screen)))
         (ebb-screen-cursor-y screen)
         (ebb--clamp (ebb-screen-cursor-saved-y screen)
                     0 (1- (ebb-screen-height screen))))
+  (setf (ebb-screen-cursor-x screen)
+        (ebb--clamp (ebb-screen-cursor-saved-x screen)
+                    0 (1- (ebb-screen-line-width screen))))
   (when-let* ((state (gethash screen ebb--saved-cursor-renditions)))
     (setf (ebb-screen-origin-mode screen) (nth 0 state)
           (ebb-screen-auto-wrap screen) (nth 1 state)

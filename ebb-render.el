@@ -711,24 +711,28 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
   (when (ebb-line-text line)
     (setf (ebb-line-text line)
           (ebb-render--safe-string (ebb-line-text line))))
-  (ebb-render--fit-glyphs
-   (cond
-    ((and (ebb-line-text line)
-          (ebb-line-attr-runs line)
-          (= (length (ebb-line-text line)) width))
-     (setf (ebb-line-dirty line) nil)
-     (ebb-render--text-runs-to-string line width))
-    ((and (ebb-line-text line)
-          (= (length (ebb-line-text line)) width))
-     (setf (ebb-line-dirty line) nil)
-     (if-let* ((attr (ebb-line-uniform-attr line)))
-         (let ((s (copy-sequence (ebb-line-text line))))
-           (ebb-render--apply-attr-properties s attr)
-           s)
-       (ebb-line-text line)))
-    ((ebb-render--cells-to-string-scrollback-fast (ebb-line-cells line) width))
-    (t
-     (ebb-render--line-to-string line width)))))
+  (ebb-render--apply-line-rendition
+   line
+   (ebb-render--fit-glyphs
+    (cond
+     ((and (ebb-line-text line)
+           (ebb-line-attr-runs line)
+           (= (length (ebb-line-text line)) width))
+      (setf (ebb-line-dirty line) nil)
+      (ebb-render--text-runs-to-string line width))
+     ((and (ebb-line-text line)
+           (= (length (ebb-line-text line)) width))
+      (setf (ebb-line-dirty line) nil)
+      (if-let* ((attr (ebb-line-uniform-attr line)))
+          (let ((s (copy-sequence (ebb-line-text line))))
+            (ebb-render--apply-attr-properties s attr)
+            s)
+        (ebb-line-text line)))
+     ((ebb-render--cells-to-string-scrollback-fast
+       (ebb-line-cells line) width))
+     (t
+      (ebb-render--cells-to-string (ebb-line-cells line) width))))
+   width))
 
 (defun ebb-render--cells-to-string-scrollback-fast (cells width)
   "Return unstyled CELLS as visible scrollback text, or nil if styled."
@@ -768,8 +772,9 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
   "Apply LINE's DEC width rendition to STRING for a WIDTH-column screen."
   (if (eq (ebb-line-rendition line) 'normal)
       string
-    (let* ((logical-width (/ width 2))
-           (result (substring string 0 (min logical-width (length string)))))
+    (let* ((logical-width (max 1 (/ width 2)))
+           (result (copy-sequence
+                    (truncate-string-to-width string logical-width))))
       ;; Emacs cannot clip separate top and bottom halves of a text glyph as a
       ;; VT100 did.  Preserve the correct double-width layout and render both
       ;; double-height halves as expanded lines.

@@ -1050,6 +1050,49 @@ Binds `screen' and `parser' in BODY."
       (should (equal 'ultra-expanded
                      (plist-get (get-text-property 0 'face rendered) :width))))))
 
+(ert-deftest ebb-test-render-dec-double-width-clips-by-display-columns ()
+  "Combining characters do not reduce a double-width line's visible cells."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-test-output parser (concat "\e#6" "ãbcde"))
+    (let ((rendered (ebb-render--line-to-string
+                     (ebb-screen-get-line screen 0) 10)))
+      (should (equal "ãbcde" rendered))
+      (should (= 5 (string-width rendered)))
+      (should (equal 'ultra-expanded
+                     (plist-get (get-text-property 0 'face rendered) :width))))))
+
+(ert-deftest ebb-test-dec-double-width-rendition-survives-scrollback ()
+  "History preserves and reflows DEC double-width line metadata."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-test-output parser "\e#6Hello")
+    (ebb-screen-cursor-goto screen 1 0)
+    (ebb-screen-index screen)
+    (let* ((logical (car (ebb-screen-scrollback screen)))
+           (line (ebb-screen-history-render-row screen 0))
+           (rendered (ebb-render--line-to-string-scrollback line 10)))
+      (should (eq 'double-width (ebb-history-line-rendition logical)))
+      (should (eq 'double-width (ebb-line-rendition line)))
+      (should (equal "Hello" rendered))
+      (should (= 5 (length rendered)))
+      (should (equal 'ultra-expanded
+                     (plist-get (get-text-property 0 'face rendered) :width))))
+    (ebb-screen-resize screen 12 2)
+    (let* ((line (ebb-screen-history-render-row screen 0))
+           (rendered (ebb-render--line-to-string-scrollback line 12)))
+      (should (eq 'double-width (ebb-line-rendition line)))
+      (should (equal "Hello " rendered))
+      (should (= 6 (length rendered))))))
+
+(ert-deftest ebb-test-restore-cursor-clamps-to-restored-line-width ()
+  "DECRC cannot restore the cursor into a double-width line's hidden half."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-screen-cursor-goto screen 0 8)
+    (ebb-screen-save-cursor screen)
+    (ebb-screen-cursor-goto screen 0 0)
+    (ebb-screen-set-line-rendition screen 'double-width)
+    (ebb-screen-restore-cursor screen)
+    (should (equal '(4 . 0) (ebb-test-cursor screen)))))
+
 (ert-deftest ebb-test-parse-esc-encoding-selector-is-consumed ()
   "ESC percent encoding selectors do not leak their final byte as text."
   (ebb-test-with-screen (:width 10 :height 2)
