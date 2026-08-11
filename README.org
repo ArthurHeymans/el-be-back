@@ -23,7 +23,7 @@ comparison.
 
 * Requirements
 
-- Emacs 28.1 or newer
+- Emacs 29.1 or newer
 - Emacs 30.1 or newer for =ebb-serial=
 
 * Tests

@@ -16,8 +16,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - emacs: "28.2"
-            serial: false
           - emacs: "29.4"
             serial: false
           - emacs: "30.2"

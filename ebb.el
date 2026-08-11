@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 ;; Author: Arthur
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1"))
+;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: terminals, processes
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -759,12 +759,10 @@ Called after each render.  Debounced so short-lived matches don't flash."
 
 ;;;; ---- Major Mode -----------------------------------------------------
 
-(defvar ebb-link-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "<mouse-1>") #'ebb-open-link-at-click)
-    (define-key map (kbd "<mouse-2>") #'ebb-open-link-at-click)
-    map)
-  "Keymap for OSC 8 and automatically detected links.")
+(defvar-keymap ebb-link-map
+  :doc "Keymap for OSC 8 and automatically detected links."
+  "<mouse-1>" #'ebb-open-link-at-click
+  "<mouse-2>" #'ebb-open-link-at-click)
 
 (defun ebb--link-at (position)
   "Return the link URI at POSITION, or nil."
@@ -859,13 +857,12 @@ Called after each render.  Debounced so short-lived matches don't flash."
     (save-excursion
       (goto-char position)
       (catch 'found
-        (let (match)
-          (while (setq match (funcall search 'help-echo nil
-                                      (lambda (_ value) value) t))
-            (let ((at (prop-match-beginning match)))
-              (unless (and skip-id
-                           (equal skip-id (get-text-property at 'ebb-link-id)))
-                (throw 'found at)))))))))
+        (while-let ((match (funcall search 'help-echo nil
+                                    (lambda (_ value) value) t)))
+          (let ((at (prop-match-beginning match)))
+            (unless (and skip-id
+                         (equal skip-id (get-text-property at 'ebb-link-id)))
+              (throw 'found at))))))))
 
 (defun ebb--goto-hyperlink (direction)
   "Move to a hyperlink in DIRECTION, wrapping at buffer boundaries."

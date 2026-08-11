@@ -1183,16 +1183,9 @@ hint at the live terminal position."
           (clrhash (ebb-render-state-history-cache render))
           (ebb-render-full-reset render))))))
 
-(defun ebb-render--after-load-theme (&rest _)
-  "Emacs 28 fallback advice for invalidating colors after `load-theme'."
-  (ebb-render--theme-changed))
-
 (defun ebb-render--install-theme-invalidation ()
-  "Install the available theme-change invalidation path."
-  (if (boundp 'enable-theme-functions)
-      (add-hook 'enable-theme-functions #'ebb-render--theme-changed)
-    (unless (advice-member-p #'ebb-render--after-load-theme 'load-theme)
-      (advice-add 'load-theme :after #'ebb-render--after-load-theme))))
+  "Install the theme-change invalidation hook."
+  (add-hook 'enable-theme-functions #'ebb-render--theme-changed))
 
 (defun ebb-render-invalidate-all (render)
   "Mark all display lines as needing re-render."
