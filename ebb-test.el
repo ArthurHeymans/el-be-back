@@ -2617,7 +2617,7 @@ Binds `screen' and `parser' in BODY."
                     (format "%s@%s:~/src/ebb$" user host))))
     (should (equal (format "*ebb: alice@otherbox:~/x*")
                    (ebb-buffer-name-by-title "alice@otherbox:~/x")))
-    (let ((default-directory "/home/arthur/src/ebb/"))
+    (let ((default-directory (expand-file-name "src/ebb/" "~")))
       (should (equal "*ebb: ~/src/ebb*"
                      (ebb-buffer-name-by-directory nil))))
     (let ((default-directory "/ssh:remote:/home/arthur/src/"))
@@ -3111,6 +3111,8 @@ cell is 9x18 unless overridden."
          (ebb-render--cell-pixel-height 0)
          (ebb-fit-glyphs t))
      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+               ((symbol-function 'buffer-text-pixel-size)
+                (lambda (&rest _) '(9 . 18)))
                ((symbol-function 'ebb-render--string-pixel-size)
                 (lambda (string)
                   (or (cdr (assq (aref string 0) ,metrics)) '(9 . 18)))))

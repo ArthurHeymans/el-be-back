@@ -733,7 +733,8 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
 (defun ebb-render--cells-to-string-scrollback-fast (cells width)
   "Return unstyled CELLS as visible scrollback text, or nil if styled."
   (catch 'styled
-    (let ((s (make-string width ?\s t))
+    (let ((chars nil)
+          (wide-ranges nil)
           (i 0)
           (pos 0)
           (cols 0))
@@ -747,15 +748,21 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
            ((zerop cw)
             (cl-incf i))
            (t
-            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
+            (push (ebb-render--safe-char (ebb-cell-char cell)) chars)
             ;; No spacer columns here, so record the cell width for
             ;; `ebb-render--fit-glyphs'.
             (when (> cw 1)
-              (put-text-property pos (1+ pos) 'ebb-cell-width cw s))
+              (push (cons pos cw) wide-ranges))
             (cl-incf pos)
             (cl-incf cols cw)
             (cl-incf i cw)))))
-      (substring s 0 (+ pos (max 0 (- width cols)))))))
+      (let ((s (apply #'string
+                      (append (nreverse chars)
+                              (make-list (max 0 (- width cols)) ?\s)))))
+        (dolist (range wide-ranges)
+          (put-text-property (car range) (1+ (car range))
+                             'ebb-cell-width (cdr range) s))
+        s))))
 
 (defun ebb-render--line-to-string (line width)
   "Convert LINE to a string of WIDTH terminal columns."
@@ -869,13 +876,9 @@ Clean unibyte ASCII is returned unchanged."
         ;; Keep clean ASCII strings unibyte.  The model writes them far more
         ;; often than the bounded renderer inserts them into an Emacs buffer.
         string
-      (let ((result (make-string length ?\s t))
-            (position 0))
-        (while (< position length)
-          (aset result position
-                (ebb-render--safe-char (aref string position)))
-          (cl-incf position))
-        result))))
+      (apply #'string
+             (cl-loop for position below length
+                      collect (ebb-render--safe-char (aref string position)))))))
 
 (defun ebb-render--cells-to-string (cells width)
   "Convert a vector of ebb-cells to a propertized string.
@@ -898,10 +901,11 @@ Handles double-width characters by inserting invisible spacers."
 
 (defun ebb-render--cells-to-string-fast (cells width)
   "Fast path for default-attribute CELLS, or nil if styled.
-Handles both single-width and wide characters without consing per-cell run
-lists; falls back only when a styled cell is present."
+Builds both single-width and wide characters, and falls back only when a
+styled cell is present."
   (catch 'styled
-    (let ((s (make-string width ?\s t))
+    (let ((parts nil)
+          (wide-ranges nil)
           (i 0)
           (pos 0))
       (while (< i width)
@@ -914,18 +918,22 @@ lists; falls back only when a styled cell is present."
            ((zerop cw)
             (cl-incf i))
            ((> cw 1)
-            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
-            (let ((end (min width (+ pos cw))))
-              (when (< (1+ pos) end)
-                (put-text-property (1+ pos) end 'invisible t s)
-                (put-text-property (1+ pos) end 'ebb-wide-spacer t s)))
+            (push (concat (string (ebb-render--safe-char (ebb-cell-char cell)))
+                          (make-string (1- cw) ?\s))
+                  parts)
+            (push (cons (1+ pos) (+ pos cw)) wide-ranges)
             (cl-incf pos cw)
             (cl-incf i cw))
            (t
-            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
+            (push (string (ebb-render--safe-char (ebb-cell-char cell))) parts)
             (cl-incf pos)
             (cl-incf i)))))
-      s)))
+      (let ((s (apply #'concat (nreverse parts))))
+        (dolist (range wide-ranges)
+          (put-text-property (car range) (cdr range) 'invisible t s)
+          (put-text-property (car range) (cdr range)
+                             'ebb-wide-spacer t s))
+        s))))
 
 (defun ebb-render--cells-to-string-uniform (cells width)
   "Fast path for single-width rows with one shared/equal attribute."
@@ -940,10 +948,10 @@ lists; falls back only when a styled cell is present."
                              (equal (ebb-cell-attr cell) attr)))))
         (cl-incf i))
       (when (= i width)
-        (let ((s (make-string width ?\s t)))
-          (dotimes (j width)
-            (aset s j (ebb-render--safe-char
-                       (ebb-cell-char (aref cells j)))))
+        (let ((s (apply #'string
+                        (cl-loop for j below width
+                                 collect (ebb-render--safe-char
+                                          (ebb-cell-char (aref cells j)))))))
           (ebb-render--apply-attr-properties s attr)
           s)))))
 

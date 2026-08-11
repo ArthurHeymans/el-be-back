@@ -759,10 +759,12 @@ Called after each render.  Debounced so short-lived matches don't flash."
 
 ;;;; ---- Major Mode -----------------------------------------------------
 
-(defvar-keymap ebb-link-map
-  :doc "Keymap for OSC 8 and automatically detected links."
-  "<mouse-1>" #'ebb-open-link-at-click
-  "<mouse-2>" #'ebb-open-link-at-click)
+(defvar ebb-link-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "<mouse-1>") #'ebb-open-link-at-click)
+    (define-key map (kbd "<mouse-2>") #'ebb-open-link-at-click)
+    map)
+  "Keymap for OSC 8 and automatically detected links.")
 
 (defun ebb--link-at (position)
   "Return the link URI at POSITION, or nil."
