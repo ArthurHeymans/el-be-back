@@ -764,41 +764,57 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
                              'ebb-cell-width (cdr range) s))
         s))))
 
+(defun ebb-render--apply-line-rendition (line string width)
+  "Apply LINE's DEC width rendition to STRING for a WIDTH-column screen."
+  (if (eq (ebb-line-rendition line) 'normal)
+      string
+    (let* ((logical-width (/ width 2))
+           (result (substring string 0 (min logical-width (length string)))))
+      ;; Emacs cannot clip separate top and bottom halves of a text glyph as a
+      ;; VT100 did.  Preserve the correct double-width layout and render both
+      ;; double-height halves as expanded lines.
+      (add-face-text-property 0 (length result) '(:width ultra-expanded)
+                              t result)
+      result)))
+
 (defun ebb-render--line-to-string (line width)
-  "Convert LINE to a string of WIDTH terminal columns."
+  "Convert LINE to a string for a WIDTH-column terminal display."
   (when (ebb-line-text line)
     (setf (ebb-line-text line)
           (ebb-render--safe-string (ebb-line-text line))))
-  (ebb-render--fit-glyphs
-   (cond
-    ((and (ebb-line-text line)
-          (ebb-line-attr-runs line)
-          (= (length (ebb-line-text line)) width))
-     (let ((s (ebb-render--text-runs-to-string line width)))
-       (setf (ebb-line-rendered line) s)
-       (setf (ebb-line-dirty line) nil)
-       s))
-    ((and (ebb-line-text line)
-          (ebb-line-uniform-attr line)
-          (= (length (ebb-line-text line)) width))
-     (let ((s (copy-sequence (ebb-line-text line))))
-       (ebb-render--apply-attr-properties s (ebb-line-uniform-attr line))
-       (setf (ebb-line-rendered line) s)
-       (setf (ebb-line-dirty line) nil)
-       s))
-    ((and (ebb-line-text line)
-          (= (length (ebb-line-text line)) width))
-     (setf (ebb-line-dirty line) nil)
-     (ebb-line-text line))
-    ((and (not (ebb-line-dirty line))
-          (ebb-line-rendered line)
-          (= (length (ebb-line-rendered line)) width))
-     (ebb-line-rendered line))
-    (t
-     (let ((s (ebb-render--cells-to-string (ebb-line-cells line) width)))
-       (setf (ebb-line-rendered line) s)
-       (setf (ebb-line-dirty line) nil)
-       s)))))
+  (ebb-render--apply-line-rendition
+   line
+   (ebb-render--fit-glyphs
+    (cond
+     ((and (ebb-line-text line)
+           (ebb-line-attr-runs line)
+           (= (length (ebb-line-text line)) width))
+      (let ((s (ebb-render--text-runs-to-string line width)))
+        (setf (ebb-line-rendered line) s)
+        (setf (ebb-line-dirty line) nil)
+        s))
+     ((and (ebb-line-text line)
+           (ebb-line-uniform-attr line)
+           (= (length (ebb-line-text line)) width))
+      (let ((s (copy-sequence (ebb-line-text line))))
+        (ebb-render--apply-attr-properties s (ebb-line-uniform-attr line))
+        (setf (ebb-line-rendered line) s)
+        (setf (ebb-line-dirty line) nil)
+        s))
+     ((and (ebb-line-text line)
+           (= (length (ebb-line-text line)) width))
+      (setf (ebb-line-dirty line) nil)
+      (ebb-line-text line))
+     ((and (not (ebb-line-dirty line))
+           (ebb-line-rendered line)
+           (= (length (ebb-line-rendered line)) width))
+      (ebb-line-rendered line))
+     (t
+      (let ((s (ebb-render--cells-to-string (ebb-line-cells line) width)))
+        (setf (ebb-line-rendered line) s)
+        (setf (ebb-line-dirty line) nil)
+        s))))
+   width))
 
 (defun ebb-render--text-runs-to-string (line width)
   "Render LINE's text plus attribute runs into a propertized string."
@@ -818,12 +834,12 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
       string
     (let ((result (copy-sequence string)))
       (dolist (column (ebb-line-prompt-begins line))
-        (when (< column width)
+        (when (< column (length result))
           (put-text-property column (1+ column)
                              'ebb-shell-prompt-begin t result)))
       (dolist (column (ebb-line-prompt-ends line))
         (let ((position (max 0 (1- column))))
-          (when (< position width)
+          (when (< position (length result))
             (put-text-property position (1+ position)
                                'ebb-shell-prompt-end t result))))
       result)))

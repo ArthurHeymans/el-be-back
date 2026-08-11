@@ -1009,6 +1009,47 @@ Binds `screen' and `parser' in BODY."
     (should (equal '(0 . 0) (ebb-test-cursor screen)))
     (should (eq :ground (ebb-parser-state parser)))))
 
+(ert-deftest ebb-test-parse-dec-line-renditions ()
+  "DEC line-size sequences select 40-column behavior on an 80-column line."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e[1;10H\e#6")
+    (should (eq 'double-width
+                (ebb-line-rendition (ebb-screen-get-line screen 0))))
+    (should (= 5 (ebb-screen-line-width screen)))
+    (should (equal '(4 . 0) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[1;1HABCDEF")
+    (should (equal "ABCDE" (ebb-test-display-line screen 0)))
+    (should (equal "F" (ebb-test-display-line screen 1)))
+    (ebb-test-output parser "\e[2;1H\e#3")
+    (should (eq 'double-height-top
+                (ebb-line-rendition (ebb-screen-get-line screen 1))))
+    (ebb-test-output parser "\e#4")
+    (should (eq 'double-height-bottom
+                (ebb-line-rendition (ebb-screen-get-line screen 1))))
+    (ebb-test-output parser "\e#5")
+    (should (eq 'normal
+                (ebb-line-rendition (ebb-screen-get-line screen 1))))
+    ;; The per-character path recomputes the width after wrapping onto a
+    ;; normal-width line.
+    (ebb-screen-cursor-goto screen 0 0)
+    (ebb-screen-set-line-rendition screen 'double-width)
+    (mapc (lambda (char) (ebb-screen-write-char screen char))
+          (string-to-list "123456"))
+    (should (equal "12345" (ebb-test-display-line screen 0)))
+    (should (equal "6" (ebb-test-display-line screen 1)))
+    (should (equal '(1 . 1) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-render-dec-double-width-line ()
+  "DEC double-width lines render as expanded half-column strings."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-test-output parser "\e#6Hello")
+    (let ((rendered (ebb-render--line-to-string
+                     (ebb-screen-get-line screen 0) 10)))
+      (should (= 5 (length rendered)))
+      (should (equal "Hello" rendered))
+      (should (equal 'ultra-expanded
+                     (plist-get (get-text-property 0 'face rendered) :width))))))
+
 (ert-deftest ebb-test-parse-esc-encoding-selector-is-consumed ()
   "ESC percent encoding selectors do not leak their final byte as text."
   (ebb-test-with-screen (:width 10 :height 2)
@@ -1135,6 +1176,12 @@ Binds `screen' and `parser' in BODY."
     (should (ebb-screen-insert-mode screen))
     (ebb-test-output parser "\e[4l")
     (should-not (ebb-screen-insert-mode screen))))
+
+(ert-deftest ebb-test-insert-mode-preserves-shifted-cell ()
+  "ANSI insert mode shifts rather than aliases the overwritten cell."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "AAAAAAAAAA\e[1;2HB\e[1D\e[4h********\e[4l")
+    (should (equal "A********B" (ebb-test-display-line screen 0)))))
 
 (ert-deftest ebb-test-parse-insert-delete ()
   "Parser handles ICH, DCH, IL, DL."

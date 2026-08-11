@@ -543,8 +543,14 @@ only digits and semicolons."
         (screen (ebb-parser-screen parser)))
     (condition-case err
         (cond
-         ((and (string= intermediates "#") (= ch ?8))
-          (ebb-screen-alignment-test screen))
+         ((string= intermediates "#")
+          (pcase ch
+            (?3 (ebb-screen-set-line-rendition screen 'double-height-top))
+            (?4 (ebb-screen-set-line-rendition screen 'double-height-bottom))
+            (?5 (ebb-screen-set-line-rendition screen 'normal))
+            (?6 (ebb-screen-set-line-rendition screen 'double-width))
+            (?8 (ebb-screen-alignment-test screen))
+            (_ (ebb-parse--log "Unknown ESC #%c" ch))))
          ;; ESC % G and ESC % @ select UTF-8 and ISO 2022 respectively.
          ;; Input decoding is managed by the process coding system, but the
          ;; complete sequence must still be consumed rather than displayed.
