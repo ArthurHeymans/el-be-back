@@ -347,18 +347,44 @@ Binds `screen' and `parser' in BODY."
     (should (equal "main" (ebb-test-display-line screen 0)))))
 
 (ert-deftest ebb-test-save-restore-cursor ()
-  "Save and restore cursor position and attributes."
+  "DECSC/DECRC preserve position, attributes, modes, and character sets."
   (ebb-test-with-screen (:width 20 :height 6)
     (ebb-screen-cursor-goto screen 3 10)
     (ebb-screen-set-attr screen :bold t)
+    (ebb-screen-designate-charset screen ?\( ?0)
+    (setf (ebb-screen-origin-mode screen) t
+          (ebb-screen-auto-wrap screen) nil)
     (ebb-screen-save-cursor screen)
-    ;; Move elsewhere and change attrs
+    ;; Move elsewhere and change rendition state.
     (ebb-screen-cursor-goto screen 0 0)
     (ebb-screen-reset-attr screen)
-    ;; Restore
+    (ebb-screen-designate-charset screen ?\( ?B)
+    (setf (ebb-screen-origin-mode screen) nil
+          (ebb-screen-auto-wrap screen) t)
+    ;; Restore.
     (ebb-screen-restore-cursor screen)
     (should (equal '(10 . 3) (ebb-test-cursor screen)))
-    (should (ebb-attr-bold (ebb-screen-current-attr screen)))))
+    (should (ebb-attr-bold (ebb-screen-current-attr screen)))
+    (should (ebb-screen-origin-mode screen))
+    (should-not (ebb-screen-auto-wrap screen))
+    (should (eq 'dec-graphics (ebb-screen-charset-g0 screen)))
+    (ebb-screen-write-char screen ?q)
+    (should (= #x2500
+               (ebb-cell-char
+                (aref (ebb-line-cells (ebb-screen-get-line screen 3)) 10))))))
+
+(ert-deftest ebb-test-alt-screen-preserves-extended-saved-cursor-state ()
+  "Alternate-screen DECSC state does not replace the main screen's state."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-screen-designate-charset screen ?\( ?0)
+    (ebb-screen-save-cursor screen)
+    (ebb-screen-enter-alt screen)
+    (ebb-screen-designate-charset screen ?\( ?B)
+    (ebb-screen-save-cursor screen)
+    (ebb-screen-leave-alt screen)
+    (ebb-screen-designate-charset screen ?\( ?B)
+    (ebb-screen-restore-cursor screen)
+    (should (eq 'dec-graphics (ebb-screen-charset-g0 screen)))))
 
 (ert-deftest ebb-test-tab-stops ()
   "Tab stops work correctly."
@@ -1099,6 +1125,16 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[?6l")
     (should-not (ebb-screen-origin-mode screen))
     (should (equal '(0 . 0) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-private-mode-4-is-not-insert-mode ()
+  "DEC smooth-scroll mode does not enable ANSI insert mode."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e[?4h")
+    (should-not (ebb-screen-insert-mode screen))
+    (ebb-test-output parser "\e[4h")
+    (should (ebb-screen-insert-mode screen))
+    (ebb-test-output parser "\e[4l")
+    (should-not (ebb-screen-insert-mode screen))))
 
 (ert-deftest ebb-test-parse-insert-delete ()
   "Parser handles ICH, DCH, IL, DL."
