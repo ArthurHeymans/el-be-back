@@ -347,18 +347,44 @@ Binds `screen' and `parser' in BODY."
     (should (equal "main" (ebb-test-display-line screen 0)))))
 
 (ert-deftest ebb-test-save-restore-cursor ()
-  "Save and restore cursor position and attributes."
+  "DECSC/DECRC preserve position, attributes, modes, and character sets."
   (ebb-test-with-screen (:width 20 :height 6)
     (ebb-screen-cursor-goto screen 3 10)
     (ebb-screen-set-attr screen :bold t)
+    (ebb-screen-designate-charset screen ?\( ?0)
+    (setf (ebb-screen-origin-mode screen) t
+          (ebb-screen-auto-wrap screen) nil)
     (ebb-screen-save-cursor screen)
-    ;; Move elsewhere and change attrs
+    ;; Move elsewhere and change rendition state.
     (ebb-screen-cursor-goto screen 0 0)
     (ebb-screen-reset-attr screen)
-    ;; Restore
+    (ebb-screen-designate-charset screen ?\( ?B)
+    (setf (ebb-screen-origin-mode screen) nil
+          (ebb-screen-auto-wrap screen) t)
+    ;; Restore.
     (ebb-screen-restore-cursor screen)
     (should (equal '(10 . 3) (ebb-test-cursor screen)))
-    (should (ebb-attr-bold (ebb-screen-current-attr screen)))))
+    (should (ebb-attr-bold (ebb-screen-current-attr screen)))
+    (should (ebb-screen-origin-mode screen))
+    (should-not (ebb-screen-auto-wrap screen))
+    (should (eq 'dec-graphics (ebb-screen-charset-g0 screen)))
+    (ebb-screen-write-char screen ?q)
+    (should (= #x2500
+               (ebb-cell-char
+                (aref (ebb-line-cells (ebb-screen-get-line screen 3)) 10))))))
+
+(ert-deftest ebb-test-alt-screen-preserves-extended-saved-cursor-state ()
+  "Alternate-screen DECSC state does not replace the main screen's state."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-screen-designate-charset screen ?\( ?0)
+    (ebb-screen-save-cursor screen)
+    (ebb-screen-enter-alt screen)
+    (ebb-screen-designate-charset screen ?\( ?B)
+    (ebb-screen-save-cursor screen)
+    (ebb-screen-leave-alt screen)
+    (ebb-screen-designate-charset screen ?\( ?B)
+    (ebb-screen-restore-cursor screen)
+    (should (eq 'dec-graphics (ebb-screen-charset-g0 screen)))))
 
 (ert-deftest ebb-test-tab-stops ()
   "Tab stops work correctly."
@@ -972,6 +998,126 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[0K")    ; erase to end of line
     (should (equal "XXXXX" (ebb-test-display-line screen 0)))))
 
+(ert-deftest ebb-test-parse-decaln ()
+  "DECALN fills the display with E characters and homes the cursor."
+  (ebb-test-with-screen (:width 5 :height 3)
+    (ebb-test-output parser "junk\e#")
+    (should (eq :escape-intermediate (ebb-parser-state parser)))
+    (ebb-test-output parser "8")
+    (should (equal '("EEEEE" "EEEEE" "EEEEE")
+                   (ebb-test-display-text screen)))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))
+    (should (eq :ground (ebb-parser-state parser)))))
+
+(ert-deftest ebb-test-parse-dec-line-renditions ()
+  "DEC line-size sequences select 40-column behavior on an 80-column line."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e[1;10H\e#6")
+    (should (eq 'double-width
+                (ebb-line-rendition (ebb-screen-get-line screen 0))))
+    (should (= 5 (ebb-screen-line-width screen)))
+    (should (equal '(4 . 0) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[1;1HABCDEF")
+    (should (equal "ABCDE" (ebb-test-display-line screen 0)))
+    (should (equal "F" (ebb-test-display-line screen 1)))
+    (ebb-test-output parser "\e[2;1H\e#3")
+    (should (eq 'double-height-top
+                (ebb-line-rendition (ebb-screen-get-line screen 1))))
+    (ebb-test-output parser "\e#4")
+    (should (eq 'double-height-bottom
+                (ebb-line-rendition (ebb-screen-get-line screen 1))))
+    (ebb-test-output parser "\e#5")
+    (should (eq 'normal
+                (ebb-line-rendition (ebb-screen-get-line screen 1))))
+    ;; The per-character path recomputes the width after wrapping onto a
+    ;; normal-width line.
+    (ebb-screen-cursor-goto screen 0 0)
+    (ebb-screen-set-line-rendition screen 'double-width)
+    (mapc (lambda (char) (ebb-screen-write-char screen char))
+          (string-to-list "123456"))
+    (should (equal "12345" (ebb-test-display-line screen 0)))
+    (should (equal "6" (ebb-test-display-line screen 1)))
+    (should (equal '(1 . 1) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-render-dec-double-width-line ()
+  "DEC double-width lines render as expanded half-column strings."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-test-output parser "\e#6Hello")
+    (let ((rendered (ebb-render--line-to-string
+                     (ebb-screen-get-line screen 0) 10)))
+      (should (= 5 (length rendered)))
+      (should (equal "Hello" rendered))
+      (should (equal 'ultra-expanded
+                     (plist-get (get-text-property 0 'face rendered) :width))))))
+
+(ert-deftest ebb-test-render-dec-double-width-clips-by-display-columns ()
+  "Combining characters do not reduce a double-width line's visible cells."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-test-output parser (concat "\e#6" "ãbcde"))
+    (let ((rendered (ebb-render--line-to-string
+                     (ebb-screen-get-line screen 0) 10)))
+      (should (equal "ãbcde" rendered))
+      (should (= 5 (string-width rendered)))
+      (should (equal 'ultra-expanded
+                     (plist-get (get-text-property 0 'face rendered) :width))))))
+
+(ert-deftest ebb-test-dec-double-width-rendition-survives-scrollback ()
+  "History preserves and reflows DEC double-width line metadata."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-test-output parser "\e#6Hello")
+    (ebb-screen-cursor-goto screen 1 0)
+    (ebb-screen-index screen)
+    (let* ((logical (car (ebb-screen-scrollback screen)))
+           (line (ebb-screen-history-render-row screen 0))
+           (rendered (ebb-render--line-to-string-scrollback line 10)))
+      (should (eq 'double-width (ebb-history-line-rendition logical)))
+      (should (eq 'double-width (ebb-line-rendition line)))
+      (should (equal "Hello" rendered))
+      (should (= 5 (length rendered)))
+      (should (equal 'ultra-expanded
+                     (plist-get (get-text-property 0 'face rendered) :width))))
+    (ebb-screen-resize screen 12 2)
+    (let* ((line (ebb-screen-history-render-row screen 0))
+           (rendered (ebb-render--line-to-string-scrollback line 12)))
+      (should (eq 'double-width (ebb-line-rendition line)))
+      (should (equal "Hello " rendered))
+      (should (= 6 (length rendered))))))
+
+(ert-deftest ebb-test-restore-cursor-clamps-to-restored-line-width ()
+  "DECRC cannot restore the cursor into a double-width line's hidden half."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-screen-cursor-goto screen 0 8)
+    (ebb-screen-save-cursor screen)
+    (ebb-screen-cursor-goto screen 0 0)
+    (ebb-screen-set-line-rendition screen 'double-width)
+    (ebb-screen-restore-cursor screen)
+    (should (equal '(4 . 0) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-parse-esc-encoding-selector-is-consumed ()
+  "ESC percent encoding selectors do not leak their final byte as text."
+  (ebb-test-with-screen (:width 10 :height 2)
+    (ebb-test-output parser "\e%Gok")
+    (should (equal "ok" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-parse-deccolm ()
+  "DECCOLM selects 80/132 columns, clears the display, and homes the cursor."
+  (ebb-test-with-screen (:width 100 :height 24)
+    (ebb-test-output parser "junk\e[3;20r\e[?3l")
+    (should (= 80 (ebb-screen-width screen)))
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 23 (ebb-screen-scroll-bottom screen)))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))
+    (should (equal "" (ebb-test-display-line screen 0)))
+    ;; VTTEST deliberately moves beyond column 80 to verify clamping.
+    (ebb-test-output parser "\e[23;70H\e[42C+")
+    (should (= ?+ (ebb-cell-char
+                   (aref (ebb-line-cells
+                          (ebb-screen-get-line screen 22)) 79))))
+    (ebb-test-output parser "\e[?3h")
+    (should (= 132 (ebb-screen-width screen)))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))
+    (should (equal "" (ebb-test-display-line screen 22)))))
+
 (ert-deftest ebb-test-parse-sgr-basic ()
   "Parser handles basic SGR attributes."
   (ebb-test-with-screen (:width 20 :height 6)
@@ -1049,6 +1195,36 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[2;4r")  ; scroll region rows 2-4 (1-indexed)
     (should (= 1 (ebb-screen-scroll-top screen)))   ; 0-indexed
     (should (= 3 (ebb-screen-scroll-bottom screen)))))
+
+(ert-deftest ebb-test-parse-origin-mode ()
+  "DECOM makes cursor addressing relative to the scrolling region."
+  (ebb-test-with-screen (:width 10 :height 6)
+    (ebb-test-output parser "\e[2;5r\e[?6h")
+    (should (ebb-screen-origin-mode screen))
+    (should (equal '(0 . 1) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[2;3H")
+    (should (equal '(2 . 2) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[20A")
+    (should (equal '(2 . 1) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[?6l")
+    (should-not (ebb-screen-origin-mode screen))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-private-mode-4-is-not-insert-mode ()
+  "DEC smooth-scroll mode does not enable ANSI insert mode."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e[?4h")
+    (should-not (ebb-screen-insert-mode screen))
+    (ebb-test-output parser "\e[4h")
+    (should (ebb-screen-insert-mode screen))
+    (ebb-test-output parser "\e[4l")
+    (should-not (ebb-screen-insert-mode screen))))
+
+(ert-deftest ebb-test-insert-mode-preserves-shifted-cell ()
+  "ANSI insert mode shifts rather than aliases the overwritten cell."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "AAAAAAAAAA\e[1;2HB\e[1D\e[4h********\e[4l")
+    (should (equal "A********B" (ebb-test-display-line screen 0)))))
 
 (ert-deftest ebb-test-parse-insert-delete ()
   "Parser handles ICH, DCH, IL, DL."
@@ -1187,6 +1363,13 @@ Binds `screen' and `parser' in BODY."
                     (aref (ebb-line-cells (ebb-screen-get-line screen 0)) 0))))
     (should (= ?B (ebb-cell-char
                     (aref (ebb-line-cells (ebb-screen-get-line screen 0)) 8))))))
+
+(ert-deftest ebb-test-parse-hts ()
+  "ESC H sets a horizontal tab stop at the cursor."
+  (ebb-test-with-screen (:width 20 :height 3)
+    (ebb-test-output parser "\e[3g\e[1;7H\eH\e[1;1H\t*")
+    (should (equal "      *" (ebb-test-display-line screen 0)))
+    (should (equal '(7 . 0) (ebb-test-cursor screen)))))
 
 ;;;; ---- Render Tests ---------------------------------------------------
 
