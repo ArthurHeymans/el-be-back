@@ -990,6 +990,29 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[3C")
     (should (equal '(8 . 1) (ebb-test-cursor screen)))))
 
+(ert-deftest ebb-test-selective-erase-protection ()
+  "ISO and DEC protection preserve cells for their selective erase forms."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "ab\eVc\eW\e[1;1H\e[3X")
+    (should (equal "  c" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[2Jab\e[1\"qc\e[0\"q\e[1;1H\e[?2K")
+    (should (equal "  c" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-parse-dec-rectangular-operations ()
+  "DEC rectangular copy, fill, and selective erase preserve cursor state."
+  (ebb-test-with-screen (:width 8 :height 4)
+    (ebb-test-output parser "abcdefgh\r\nijklmnop\r\nqrstuvwx")
+    (ebb-test-output parser "\e[4;2H\e[1;2;2;4;1;3;5;1$v")
+    (should (equal "qrstbcdx" (ebb-test-display-line screen 2)))
+    (should (equal "    jkl" (ebb-test-display-line screen 3)))
+    (should (equal '(1 . 3) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[37;1;1;2;2$x")
+    (should (equal "%%cdefgh" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[1;1H\e[1\"qP\e[0\"qI\eVZ\eW\e[1;1;1;3${")
+    (should (equal "P  defgh" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[1;1;1;1$z")
+    (should (equal "   defgh" (ebb-test-display-line screen 0)))))
+
 (ert-deftest ebb-test-parse-erase ()
   "Parser handles CSI J and CSI K."
   (ebb-test-with-screen (:width 10 :height 3)
@@ -1119,6 +1142,30 @@ Binds `screen' and `parser' in BODY."
     (should (equal "" (ebb-test-display-line screen 22)))
     (ebb-test-output parser "\ec")
     (should (= 80 (ebb-screen-width screen)))))
+
+(ert-deftest ebb-test-parse-decrqm ()
+  "DECRQM reports supported ANSI and DEC mode state."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e[65;1\"p\e[4h\e[4$p")
+      (should (equal "\e[4;1$y" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\e[?69h\e[?69$p")
+      (should (equal "\e[?69;1$y" (car responses))))))
+
+(ert-deftest ebb-test-parse-decrqss ()
+  "DECRQSS reports current rendition and margin state."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e[1m\eP$qm\e\\")
+      (should (equal "\eP1$r0;1m\e\\" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\e[2;4r\eP$qr\e\\")
+      (should (equal "\eP1$r2;4r\e\\" (car responses))))))
 
 (ert-deftest ebb-test-parse-decrqcra ()
   "DECRQCRA reports the DEC checksum for the requested rectangle."

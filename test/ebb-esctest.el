@@ -15,10 +15,9 @@
   (concat
    "(APCTests.test_APC_Basic|BSTests|CHATests|CHTTests|CNLTests|CPLTests|"
    "CRTests|CUBTests|CUDTests|CUFTests|CUPTests|CUUTests|DCHTests|DLTests|"
-   "DECALNTests|ECHTests.test_ECH_(DefaultParam|ExplicitParam|"
-   "IgnoresScrollRegion|OutsideScrollRegion|doesNotRespectDECPRotection)|"
-   "EDTests.test_ED_(?!respectsISOProtection)|"
-   "ELTests.test_EL_(?!respectsISOProtection)|"
+   "DECALNTests|DECCRATests|DECERATests|DECFRATests|DECRQMTests|"
+   "DECRQSSTests|DECSEDTests|DECSELTests|DECSERATests|"
+   "ECHTests|EDTests|ELTests|"
    "ICHTests|ILTests|INDTests|LFTests|NELTests|RITests|"
    "DECSTRTests.test_DECSTR_(CursorStaysPut|DECSC|IRM|STBM)|"
    "RISTests.test_RIS_(ClearsScreen|CursorToOrigin|ResetTabs|ResetDECCOLM)|"
@@ -32,7 +31,7 @@
          (script (expand-file-name "esctest.py" test-dir))
          (include (or (getenv "EBB_ESCTEST_INCLUDE") ebb-esctest--include))
          (expected (or (getenv "EBB_ESCTEST_EXPECTED")
-                       "153 tests passed, 3 known bugs, 0 tests failed"))
+                       "258 tests passed, 28 known bugs, 0 tests failed"))
          (logfile (make-temp-file "ebb-esctest-" nil ".log"))
          (default-directory (file-name-as-directory test-dir))
          (ebb-enable-shell-integration nil)

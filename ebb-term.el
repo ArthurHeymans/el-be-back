@@ -198,6 +198,59 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (make-hash-table :test #'eq :weakness 'key)
   "Initialization bits used to distinguish empty cells from erased blanks.")
 
+(defvar ebb--dec-protected-cells
+  (make-hash-table :test #'eq :weakness 'key)
+  "DEC-protected cell bits keyed by terminal line.")
+
+(defvar ebb--iso-protected-cells
+  (make-hash-table :test #'eq :weakness 'key)
+  "ISO-protected cell bits keyed by terminal line.")
+
+(defvar ebb--dec-protection-mode-screens
+  (make-hash-table :test #'eq :weakness 'key)
+  "Screens currently writing DEC-protected cells.")
+
+(defvar ebb--iso-protection-mode-screens
+  (make-hash-table :test #'eq :weakness 'key)
+  "Screens currently writing ISO-protected cells.")
+
+(defun ebb--line-protection-bits (table line width)
+  "Return LINE's WIDTH protection bit vector from TABLE."
+  (let ((bits (gethash line table)))
+    (unless (and bits (= (length bits) width))
+      (setq bits (make-bool-vector width nil))
+      (puthash line bits table))
+    bits))
+
+(defun ebb--mark-written-protection (screen line start end)
+  "Record protection modes for cells in LINE from START through END."
+  (let* ((width (ebb-screen-width screen))
+         (dec-bits (ebb--line-protection-bits
+                    ebb--dec-protected-cells line width))
+         (iso-bits (ebb--line-protection-bits
+                    ebb--iso-protected-cells line width))
+         (dec (and (gethash screen ebb--dec-protection-mode-screens) t))
+         (iso (and (gethash screen ebb--iso-protection-mode-screens) t)))
+    (cl-loop for column from start below (min end width)
+             do (aset dec-bits column dec)
+             and do (aset iso-bits column iso))))
+
+(defun ebb-screen-dec-protection-enabled-p (screen)
+  "Return non-nil when SCREEN writes DEC-protected cells."
+  (and (gethash screen ebb--dec-protection-mode-screens) t))
+
+(defun ebb-screen-set-dec-protection (screen enabled)
+  "Set whether subsequent writes on SCREEN are DEC-protected."
+  (if enabled
+      (puthash screen t ebb--dec-protection-mode-screens)
+    (remhash screen ebb--dec-protection-mode-screens)))
+
+(defun ebb-screen-set-iso-protection (screen enabled)
+  "Set whether subsequent writes on SCREEN are ISO-protected."
+  (if enabled
+      (puthash screen t ebb--iso-protection-mode-screens)
+    (remhash screen ebb--iso-protection-mode-screens)))
+
 (defun ebb--line-initialized-cells (line cells width)
   "Return LINE's WIDTH initialization bits, refreshing them from CELLS."
   (let ((bits (gethash line ebb--initialized-cells)))
@@ -1425,6 +1478,7 @@ only join with a line that was auto-wrapped."
       (setf (ebb-line-text line) nil
             (ebb-line-attr-runs line) nil
             (ebb-line-uniform-attr line) nil)))
+  (ebb--mark-written-protection screen line column (1+ column))
   (setf (ebb-line-dirty line) t
         (ebb-screen-last-char screen) translated)
   (ebb--mark-dirty screen row)
@@ -1483,6 +1537,8 @@ only join with a line that was auto-wrapped."
                     (ebb-cell-combining cell) nil
                     (ebb-cell-width cell) 0
                     (ebb-cell-attr cell) attr))
+  (ebb--mark-written-protection
+   screen line column (+ column char-width))
   (setf (ebb-line-dirty line) t
         (ebb-screen-last-char screen) translated)
   (ebb--mark-dirty screen row)
@@ -1611,6 +1667,8 @@ for wide/non-ASCII/insert-mode cases."
               (progn
                 (ebb-screen-write-char screen (aref string i))
                 (cl-incf i))
+            (ebb--mark-written-protection
+             screen line cx (+ cx (- i start-i)))
             (setf (ebb-line-rendered line) nil)
             (setf (ebb-line-dirty line) t)
             (ebb--mark-dirty screen cy)
@@ -1987,17 +2045,17 @@ Handles LF, VT, FF."
 
 ;;;; ---- Erasing --------------------------------------------------------
 
-(defun ebb-screen-erase-in-display (screen mode)
-  "Erase in display.  MODE: 0=to-end, 1=to-start, 2=whole, 3=scrollback."
+(defun ebb-screen--erase-in-display-unprotected (screen mode)
+  "Erase in display without preserving protected cells."
   (let ((cy (ebb-screen-cursor-y screen))
         (height (ebb-screen-height screen)))
     (pcase mode
       (0 ;; Erase from cursor to end of display
-       (ebb-screen-erase-in-line screen 0)
+       (ebb-screen--erase-in-line-unprotected screen 0)
        (cl-loop for r from (1+ cy) below height
                 do (ebb--erase-whole-line screen r)))
       (1 ;; Erase from start to cursor
-       (ebb-screen-erase-in-line screen 1)
+       (ebb-screen--erase-in-line-unprotected screen 1)
        (cl-loop for r from 0 below cy
                 do (ebb--erase-whole-line screen r)))
       (2 ;; Erase whole display
@@ -2019,8 +2077,8 @@ Handles LF, VT, FF."
       (3 ;; Erase scrollback
        (ebb--history-clear screen)))))
 
-(defun ebb-screen-erase-in-line (screen mode)
-  "Erase in line.  MODE: 0=to-end, 1=to-start, 2=whole."
+(defun ebb-screen--erase-in-line-unprotected (screen mode)
+  "Erase in line without preserving protected cells."
   (let* ((cx (ebb-screen-cursor-x screen))
          (cy (ebb-screen-cursor-y screen))
          (width (ebb-screen-width screen))
@@ -2092,8 +2150,8 @@ Handles LF, VT, FF."
     (setf (ebb-line-dirty line) t)
     (ebb--mark-dirty screen row)))
 
-(defun ebb-screen-erase-chars (screen count)
-  "Erase COUNT characters starting at cursor (ECH)."
+(defun ebb-screen--erase-chars-unprotected (screen count)
+  "Erase COUNT characters starting at cursor without protection."
   (let* ((cx (ebb-screen-cursor-x screen))
          (cy (ebb-screen-cursor-y screen))
          (width (ebb-screen-width screen))
@@ -2118,6 +2176,116 @@ Handles LF, VT, FF."
             (ebb-line-uniform-attr line) nil))
     (setf (ebb-line-dirty line) t)
     (ebb--mark-dirty screen cy)))
+
+(defun ebb-screen--protected-snapshot (screen table)
+  "Return protected cells from TABLE as coordinate snapshots for SCREEN."
+  (let ((width (ebb-screen-width screen))
+        snapshots)
+    (dotimes (row (ebb-screen-height screen))
+      (let* ((line (ebb--line-at screen row))
+             (bits (gethash line table)))
+        (when bits
+          (let* ((cells (ebb--line-ensure-cells line width))
+                 (initialized (ebb--line-initialized-cells line cells width)))
+            (dotimes (column (min width (length bits)))
+              (when (aref bits column)
+                (push (list row column
+                            (copy-ebb-cell (aref cells column))
+                            (aref initialized column))
+                      snapshots)))))))
+    snapshots))
+
+(defun ebb-screen--restore-protected-snapshot (screen table snapshots)
+  "Restore SCREEN cell SNAPSHOTS and their protection bits in TABLE."
+  (let ((width (ebb-screen-width screen)))
+    (dolist (snapshot snapshots)
+      (pcase-let ((`(,row ,column ,cell ,initialized-p) snapshot))
+        (when (and (< row (ebb-screen-height screen)) (< column width))
+          (let* ((line (ebb--line-at screen row))
+                 (cells (ebb--line-ensure-cells line width))
+                 (initialized (ebb--line-initialized-cells line cells width))
+                 (bits (ebb--line-protection-bits table line width)))
+            (aset cells column cell)
+            (aset initialized column initialized-p)
+            (aset bits column t)
+            (setf (ebb-line-text line) nil
+                  (ebb-line-attr-runs line) nil
+                  (ebb-line-uniform-attr line) nil
+                  (ebb-line-rendered line) nil
+                  (ebb-line-dirty line) t)
+            (ebb--mark-dirty screen row)))))))
+
+(defun ebb-screen--initialized-snapshot (screen)
+  "Return coordinates of initialized cells on SCREEN."
+  (let ((width (ebb-screen-width screen))
+        coordinates)
+    (dotimes (row (ebb-screen-height screen))
+      (let* ((line (ebb--line-at screen row))
+             (cells (ebb--line-ensure-cells line width))
+             (bits (ebb--line-initialized-cells line cells width)))
+        (dotimes (column width)
+          (when (aref bits column)
+            (push (cons row column) coordinates)))))
+    coordinates))
+
+(defun ebb-screen--restore-initialized-snapshot (screen coordinates)
+  "Mark prior initialized cell COORDINATES initialized on SCREEN."
+  (let ((width (ebb-screen-width screen)))
+    (dolist (coordinate coordinates)
+      (when (and (< (car coordinate) (ebb-screen-height screen))
+                 (< (cdr coordinate) width))
+        (let* ((line (ebb--line-at screen (car coordinate)))
+               (cells (ebb--line-ensure-cells line width))
+               (bits (ebb--line-initialized-cells line cells width)))
+          (aset bits (cdr coordinate) t))))))
+
+(defun ebb-screen--preserving-protection (screen table function &rest args)
+  "Call FUNCTION with ARGS while preserving cells protected in TABLE."
+  (let* ((snapshots (ebb-screen--protected-snapshot screen table))
+         (initialized (and snapshots
+                           (ebb-screen--initialized-snapshot screen))))
+    (apply function screen args)
+    (when initialized
+      (ebb-screen--restore-initialized-snapshot screen initialized))
+    (ebb-screen--restore-protected-snapshot screen table snapshots)))
+
+(defun ebb-screen--erase-preserving-dec-and-iso
+    (screen function mode)
+  "Call erase FUNCTION for MODE preserving DEC and ISO protected cells."
+  (ebb-screen--preserving-protection
+   screen ebb--dec-protected-cells
+   (lambda (target erase-mode)
+     (ebb-screen--preserving-protection
+      target ebb--iso-protected-cells function erase-mode))
+   mode))
+
+(defun ebb-screen-erase-in-display (screen mode)
+  "Erase display while preserving ISO-protected cells."
+  (ebb-screen--preserving-protection
+   screen ebb--iso-protected-cells
+   #'ebb-screen--erase-in-display-unprotected mode))
+
+(defun ebb-screen-erase-in-line (screen mode)
+  "Erase line while preserving ISO-protected cells."
+  (ebb-screen--preserving-protection
+   screen ebb--iso-protected-cells
+   #'ebb-screen--erase-in-line-unprotected mode))
+
+(defun ebb-screen-erase-chars (screen count)
+  "Erase characters while preserving ISO-protected cells."
+  (ebb-screen--preserving-protection
+   screen ebb--iso-protected-cells
+   #'ebb-screen--erase-chars-unprotected count))
+
+(defun ebb-screen-dec-erase-in-display (screen mode)
+  "Selectively erase display with xterm-compatible protection."
+  (ebb-screen--erase-preserving-dec-and-iso
+   screen #'ebb-screen--erase-in-display-unprotected mode))
+
+(defun ebb-screen-dec-erase-in-line (screen mode)
+  "Selectively erase line with xterm-compatible protection."
+  (ebb-screen--erase-preserving-dec-and-iso
+   screen #'ebb-screen--erase-in-line-unprotected mode))
 
 ;;;; ---- Scrolling (public) ---------------------------------------------
 
@@ -3031,7 +3199,9 @@ OFFSET, when non-nil, is translated to the normalized cell sequence."
   (remhash screen ebb--saved-cursor-renditions)
   (remhash screen ebb--alt-saved-cursor-renditions)
   (remhash screen ebb--horizontal-margins)
-  (remhash screen ebb--reverse-wrap-modes))
+  (remhash screen ebb--reverse-wrap-modes)
+  (remhash screen ebb--dec-protection-mode-screens)
+  (remhash screen ebb--iso-protection-mode-screens))
 
 (defun ebb-screen-reset (screen)
   "Full terminal reset (RIS)."
@@ -3040,6 +3210,8 @@ OFFSET, when non-nil, is translated to the normalized cell sequence."
   (remhash screen ebb--column-mode-screens)
   (remhash screen ebb--horizontal-margins)
   (remhash screen ebb--reverse-wrap-modes)
+  (remhash screen ebb--dec-protection-mode-screens)
+  (remhash screen ebb--iso-protection-mode-screens)
   (let ((w (ebb-screen-width screen))
         (h (ebb-screen-height screen)))
     ;; Leave alt screen if active
@@ -3186,6 +3358,118 @@ Locations are (ROW . COLUMN) pairs."
                           (not (ebb-line-wrapped line)))
                  (push "\n" parts))))
     (apply #'concat (nreverse parts))))
+
+;;;; ---- Rectangular Operations -----------------------------------------
+
+(defun ebb-screen--invalidate-rect-line (screen row line)
+  "Invalidate cached representations of LINE after changing ROW on SCREEN."
+  (setf (ebb-line-text line) nil
+        (ebb-line-attr-runs line) nil
+        (ebb-line-uniform-attr line) nil
+        (ebb-line-rendered line) nil
+        (ebb-line-dirty line) t)
+  (ebb--mark-dirty screen row))
+
+(defun ebb-screen-fill-rect (screen char top left bottom right)
+  "Fill the inclusive rectangle on SCREEN with CHAR.
+Coordinates are zero-based, clipped, and validated by the caller."
+  (let ((width (ebb-screen-width screen))
+        (attr (and (ebb-screen-current-attr screen)
+                   (ebb-attr-copy (ebb-screen-current-attr screen))))
+        (dec (and (gethash screen ebb--dec-protection-mode-screens) t))
+        (iso (and (gethash screen ebb--iso-protection-mode-screens) t)))
+    (cl-loop for row from top to bottom
+             for line = (ebb--line-at screen row)
+             for cells = (ebb--line-ensure-cells line width)
+             for initialized = (ebb--line-initialized-cells line cells width)
+             for dec-bits = (ebb--line-protection-bits
+                             ebb--dec-protected-cells line width)
+             for iso-bits = (ebb--line-protection-bits
+                             ebb--iso-protected-cells line width)
+             do (cl-loop for column from left to right
+                         do (aset cells column
+                                  (make-ebb-cell :char char :width 1
+                                                 :attr attr))
+                         and do (aset initialized column t)
+                         and do (aset dec-bits column dec)
+                         and do (aset iso-bits column iso))
+             do (ebb-screen--invalidate-rect-line screen row line))))
+
+(defun ebb-screen-erase-rect (screen top left bottom right &optional selective)
+  "Erase the inclusive rectangle on SCREEN.
+When SELECTIVE is non-nil, preserve DEC-protected cells.  ISO protection does
+not affect this operation, matching DECSERA semantics."
+  (let ((width (ebb-screen-width screen))
+        (erase-cell (ebb--make-erase-cell screen)))
+    (cl-loop for row from top to bottom
+             for line = (ebb--line-at screen row)
+             for cells = (ebb--line-ensure-cells line width)
+             for initialized = (ebb--line-initialized-cells line cells width)
+             for dec-bits = (ebb--line-protection-bits
+                             ebb--dec-protected-cells line width)
+             for iso-bits = (ebb--line-protection-bits
+                             ebb--iso-protected-cells line width)
+             do (cl-loop for column from left to right
+                         unless (and selective (aref dec-bits column))
+                         do (aset cells column (copy-ebb-cell erase-cell))
+                         and do (aset initialized column t)
+                         and do (aset dec-bits column nil)
+                         and do (aset iso-bits column nil))
+             do (ebb-screen--invalidate-rect-line screen row line))))
+
+(defun ebb-screen-copy-rect
+    (screen source-top source-left source-bottom source-right
+            destination-top destination-left)
+  "Copy an inclusive rectangle on SCREEN to DESTINATION-TOP/LEFT.
+All coordinates are zero-based and source coordinates are already clipped."
+  (let* ((width (ebb-screen-width screen))
+         (height (- source-bottom source-top -1))
+         (columns (- source-right source-left -1))
+         snapshots)
+    ;; Snapshot first so overlapping copies behave as if done simultaneously.
+    (dotimes (row-offset height)
+      (let* ((line (ebb--line-at screen (+ source-top row-offset)))
+             (cells (ebb--line-ensure-cells line width))
+             (initialized (ebb--line-initialized-cells line cells width))
+             (dec-bits (ebb--line-protection-bits
+                        ebb--dec-protected-cells line width))
+             (iso-bits (ebb--line-protection-bits
+                        ebb--iso-protected-cells line width))
+             row)
+        (dotimes (column-offset columns)
+          (let ((column (+ source-left column-offset)))
+            (push (list (copy-ebb-cell (aref cells column))
+                        (aref initialized column)
+                        (aref dec-bits column)
+                        (aref iso-bits column))
+                  row)))
+        (push (nreverse row) snapshots)))
+    (setq snapshots (nreverse snapshots))
+    (cl-loop for snapshot-row in snapshots
+             for row from destination-top
+             while (< row (ebb-screen-height screen))
+             when (>= row 0)
+             do (let* ((line (ebb--line-at screen row))
+                       (cells (ebb--line-ensure-cells line width))
+                       (initialized (ebb--line-initialized-cells
+                                     line cells width))
+                       (dec-bits (ebb--line-protection-bits
+                                  ebb--dec-protected-cells line width))
+                       (iso-bits (ebb--line-protection-bits
+                                  ebb--iso-protected-cells line width)))
+                  (cl-loop for snapshot in snapshot-row
+                           for column from destination-left
+                           while (< column width)
+                           when (>= column 0)
+                           do (pcase-let ((`(,cell ,initialized-p
+                                                   ,dec-protected-p
+                                                   ,iso-protected-p)
+                                           snapshot))
+                                (aset cells column cell)
+                                (aset initialized column initialized-p)
+                                (aset dec-bits column dec-protected-p)
+                                (aset iso-bits column iso-protected-p)))
+                  (ebb-screen--invalidate-rect-line screen row line)))))
 
 ;;;; ---- Query ----------------------------------------------------------
 
