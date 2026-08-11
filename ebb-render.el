@@ -423,6 +423,8 @@ state are reconciled independently so metadata-only updates are visible."
                                  (ebb-render-buffer-anchor
                                   render (window-start window)))))
          (point-anchor (ebb-render-buffer-anchor render (point)))
+         (mark-anchor (and (mark t)
+                           (ebb-render-buffer-anchor render (mark t))))
          (total (ebb-screen-history-row-count screen))
          (generation (ebb-screen-history-generation screen))
          (capacity (ebb-render--history-capacity render))
@@ -434,11 +436,16 @@ state are reconciled independently so metadata-only updates are visible."
                         windows)))
          (point-location (ebb-render--anchor-location
                           render point-anchor total))
+         (mark-location (ebb-render--anchor-location
+                         render mark-anchor total))
          (history-rows
           (delq nil
                 (mapcar (lambda (location)
-                          (and (< (car location) total) (car location)))
-                        (append history-locations (list point-location)))))
+                          (and location
+                               (< (car location) total)
+                               (car location)))
+                        (append history-locations
+                                (list point-location mark-location)))))
          ;; A buffer shared by several windows needs one contiguous slab that
          ;; covers all their starts.  Usually this remains CAPACITY rows; widely
          ;; separated windows intentionally expand it rather than corrupting one
@@ -677,17 +684,22 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
          (history-rows (ebb-screen-history-row-count screen))
          (capacity (ebb-render--history-capacity render)))
     (if (< row history-rows)
-        (let* ((start (min (max 0 (- row (/ capacity 3)))
-                           (max 0 (- history-rows capacity))))
-               (count (min capacity (- history-rows start)))
-               (inhibit-read-only t)
-               (inhibit-modification-hooks t)
-               (buffer-undo-list t))
-          (ebb-render--rebuild-scrollback
-           render start count history-rows
-           (ebb-screen-history-generation screen))
+        (let* ((slab-start (ebb-render-state-history-start-row render))
+               (slab-end (+ slab-start
+                            (ebb-render-state-scrollback-count render))))
+          (unless (and (>= row slab-start) (< row slab-end))
+            (let* ((start (min (max 0 (- row (/ capacity 3)))
+                               (max 0 (- history-rows capacity))))
+                   (count (min capacity (- history-rows start)))
+                   (inhibit-read-only t)
+                   (inhibit-modification-hooks t)
+                   (buffer-undo-list t))
+              (ebb-render--rebuild-scrollback
+               render start count history-rows
+               (ebb-screen-history-generation screen))))
           (goto-char (ebb-render-state-region-begin render))
-          (forward-line (- row start)))
+          (forward-line (- row
+                           (ebb-render-state-history-start-row render))))
       (goto-char (ebb-render-state-display-begin render))
       (forward-line (- row history-rows)))
     (move-to-column column)
@@ -721,7 +733,8 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
 (defun ebb-render--cells-to-string-scrollback-fast (cells width)
   "Return unstyled CELLS as visible scrollback text, or nil if styled."
   (catch 'styled
-    (let ((s (make-string width ?\s t))
+    (let ((chars nil)
+          (wide-ranges nil)
           (i 0)
           (pos 0)
           (cols 0))
@@ -735,15 +748,21 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
            ((zerop cw)
             (cl-incf i))
            (t
-            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
+            (push (ebb-render--safe-char (ebb-cell-char cell)) chars)
             ;; No spacer columns here, so record the cell width for
             ;; `ebb-render--fit-glyphs'.
             (when (> cw 1)
-              (put-text-property pos (1+ pos) 'ebb-cell-width cw s))
+              (push (cons pos cw) wide-ranges))
             (cl-incf pos)
             (cl-incf cols cw)
             (cl-incf i cw)))))
-      (substring s 0 (+ pos (max 0 (- width cols)))))))
+      (let ((s (apply #'string
+                      (append (nreverse chars)
+                              (make-list (max 0 (- width cols)) ?\s)))))
+        (dolist (range wide-ranges)
+          (put-text-property (car range) (1+ (car range))
+                             'ebb-cell-width (cdr range) s))
+        s))))
 
 (defun ebb-render--line-to-string (line width)
   "Convert LINE to a string of WIDTH terminal columns."
@@ -857,13 +876,9 @@ Clean unibyte ASCII is returned unchanged."
         ;; Keep clean ASCII strings unibyte.  The model writes them far more
         ;; often than the bounded renderer inserts them into an Emacs buffer.
         string
-      (let ((result (make-string length ?\s t))
-            (position 0))
-        (while (< position length)
-          (aset result position
-                (ebb-render--safe-char (aref string position)))
-          (cl-incf position))
-        result))))
+      (apply #'string
+             (cl-loop for position below length
+                      collect (ebb-render--safe-char (aref string position)))))))
 
 (defun ebb-render--cells-to-string (cells width)
   "Convert a vector of ebb-cells to a propertized string.
@@ -886,10 +901,11 @@ Handles double-width characters by inserting invisible spacers."
 
 (defun ebb-render--cells-to-string-fast (cells width)
   "Fast path for default-attribute CELLS, or nil if styled.
-Handles both single-width and wide characters without consing per-cell run
-lists; falls back only when a styled cell is present."
+Builds both single-width and wide characters, and falls back only when a
+styled cell is present."
   (catch 'styled
-    (let ((s (make-string width ?\s t))
+    (let ((parts nil)
+          (wide-ranges nil)
           (i 0)
           (pos 0))
       (while (< i width)
@@ -902,18 +918,22 @@ lists; falls back only when a styled cell is present."
            ((zerop cw)
             (cl-incf i))
            ((> cw 1)
-            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
-            (let ((end (min width (+ pos cw))))
-              (when (< (1+ pos) end)
-                (put-text-property (1+ pos) end 'invisible t s)
-                (put-text-property (1+ pos) end 'ebb-wide-spacer t s)))
+            (push (concat (string (ebb-render--safe-char (ebb-cell-char cell)))
+                          (make-string (1- cw) ?\s))
+                  parts)
+            (push (cons (1+ pos) (+ pos cw)) wide-ranges)
             (cl-incf pos cw)
             (cl-incf i cw))
            (t
-            (aset s pos (ebb-render--safe-char (ebb-cell-char cell)))
+            (push (string (ebb-render--safe-char (ebb-cell-char cell))) parts)
             (cl-incf pos)
             (cl-incf i)))))
-      s)))
+      (let ((s (apply #'concat (nreverse parts))))
+        (dolist (range wide-ranges)
+          (put-text-property (car range) (cdr range) 'invisible t s)
+          (put-text-property (car range) (cdr range)
+                             'ebb-wide-spacer t s))
+        s))))
 
 (defun ebb-render--cells-to-string-uniform (cells width)
   "Fast path for single-width rows with one shared/equal attribute."
@@ -928,10 +948,10 @@ lists; falls back only when a styled cell is present."
                              (equal (ebb-cell-attr cell) attr)))))
         (cl-incf i))
       (when (= i width)
-        (let ((s (make-string width ?\s t)))
-          (dotimes (j width)
-            (aset s j (ebb-render--safe-char
-                       (ebb-cell-char (aref cells j)))))
+        (let ((s (apply #'string
+                        (cl-loop for j below width
+                                 collect (ebb-render--safe-char
+                                          (ebb-cell-char (aref cells j)))))))
           (ebb-render--apply-attr-properties s attr)
           s)))))
 
@@ -1163,16 +1183,9 @@ hint at the live terminal position."
           (clrhash (ebb-render-state-history-cache render))
           (ebb-render-full-reset render))))))
 
-(defun ebb-render--after-load-theme (&rest _)
-  "Emacs 28 fallback advice for invalidating colors after `load-theme'."
-  (ebb-render--theme-changed))
-
 (defun ebb-render--install-theme-invalidation ()
-  "Install the available theme-change invalidation path."
-  (if (boundp 'enable-theme-functions)
-      (add-hook 'enable-theme-functions #'ebb-render--theme-changed)
-    (unless (advice-member-p #'ebb-render--after-load-theme 'load-theme)
-      (advice-add 'load-theme :after #'ebb-render--after-load-theme))))
+  "Install the theme-change invalidation hook."
+  (add-hook 'enable-theme-functions #'ebb-render--theme-changed))
 
 (defun ebb-render-invalidate-all (render)
   "Mark all display lines as needing re-render."

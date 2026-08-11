@@ -1245,48 +1245,24 @@ Binds `screen' and `parser' in BODY."
             (ebb-render--attr-to-face (make-ebb-attr :fg 1))
             (should (> (hash-table-count ebb-render--attr-face-cache) 0))
             (setq color "#222222")
-            ;; Invoke the Emacs 29+ hook callback.
+            ;; Invoke the theme-change hook callback.
             (ebb-render--theme-changed 'test-theme)
             (should (= 2 resets))
             (should (memq t cleared))
-            (should (equal "#222222" (ebb-render--color-to-string 1)))
-            ;; Exercise the Emacs 28 load-theme advice callback too.
-            (setq color "#333333" cleared nil)
-            (ebb-render--after-load-theme)
-            (should (= 4 resets))
-            (should (memq t cleared))
-            (should (equal "#333333" (ebb-render--color-to-string 1)))))
+            (should (equal "#222222" (ebb-render--color-to-string 1)))))
       (mapc (lambda (buffer)
               (when (buffer-live-p buffer) (kill-buffer buffer)))
             buffers))))
 
-(ert-deftest ebb-test-render-theme-hook-installation-paths ()
-  "Theme invalidation installs the modern hook and Emacs 28 advice fallback."
-  (let ((original-boundp (symbol-function 'boundp))
-        hook advice)
-    (cl-letf (((symbol-function 'boundp)
-               (lambda (symbol)
-                 (if (eq symbol 'enable-theme-functions)
-                     t
-                   (funcall original-boundp symbol))))
-              ((symbol-function 'add-hook)
+(ert-deftest ebb-test-render-theme-hook-installation ()
+  "Theme invalidation installs the theme-change hook."
+  (let (hook)
+    (cl-letf (((symbol-function 'add-hook)
                (lambda (symbol function &rest _)
                  (setq hook (list symbol function)))))
       (ebb-render--install-theme-invalidation))
     (should (equal '(enable-theme-functions ebb-render--theme-changed)
-                   hook))
-    (cl-letf (((symbol-function 'boundp)
-               (lambda (symbol)
-                 (if (eq symbol 'enable-theme-functions)
-                     nil
-                   (funcall original-boundp symbol))))
-              ((symbol-function 'advice-member-p) (lambda (&rest _) nil))
-              ((symbol-function 'advice-add)
-               (lambda (symbol where function &rest _)
-                 (setq advice (list symbol where function)))))
-      (ebb-render--install-theme-invalidation))
-    (should (equal '(load-theme :after ebb-render--after-load-theme)
-                   advice))))
+                   hook))))
 
 (ert-deftest ebb-test-render-attr-to-face ()
   "Attribute to face conversion works."
@@ -2088,6 +2064,50 @@ Binds `screen' and `parser' in BODY."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest ebb-test-render-emacs-mode-preserves-separated-history-anchors ()
+  "Refreshing history preserves point, mark, and a distant reading window."
+  (let* ((screen (ebb-screen-create 8 3))
+         (buffer (generate-new-buffer " *ebb-test-history-view*")))
+    (setf (ebb-screen-scrollback screen)
+          (cl-loop for id downfrom 199 to 0
+                   collect (make-ebb-history-line
+                            :id id :text (format "%03d" id)
+                            :text-length 3))
+          (ebb-screen-scrollback-length screen) 200
+          (ebb-screen-history-next-id screen) 200
+          (ebb-screen-history-generation screen) 1
+          (ebb-screen-history-logical-p screen) t)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (setq-local ebb--input-mode 'emacs)
+          (let ((render (ebb-render-create screen buffer)))
+            (ebb-render--rebuild-scrollback render 10 160 200 1)
+            (ebb-render-goto-location render 150 1 t)
+            (set-mark (save-excursion
+                        (ebb-render-goto-location render 100 2 t)
+                        (point)))
+            (setq mark-active t)
+            (save-excursion
+              (ebb-render-goto-location render 20 0 t)
+              (set-window-start (selected-window) (point) t))
+            (let ((point-anchor (ebb-render-buffer-anchor render))
+                  (mark-anchor (ebb-render-buffer-anchor render (mark t)))
+                  (start-anchor
+                   (ebb-render-buffer-anchor render (window-start))))
+              (cl-incf (ebb-screen-history-generation screen))
+              (setf (ebb-screen-scrollback-dirty screen) t)
+              (ebb-render-refresh render)
+              (should (equal point-anchor
+                             (ebb-render-buffer-anchor render)))
+              (should (equal mark-anchor
+                             (ebb-render-buffer-anchor render (mark t))))
+              (should (equal start-anchor
+                             (ebb-render-buffer-anchor
+                              render (window-start)))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest ebb-test-render-ed2-shows-viewport-top ()
   "ED 2 makes Ctrl-L and clear show the top of the live viewport."
   (save-window-excursion
@@ -2573,7 +2593,7 @@ Binds `screen' and `parser' in BODY."
                     (format "%s@%s:~/src/ebb$" user host))))
     (should (equal (format "*ebb: alice@otherbox:~/x*")
                    (ebb-buffer-name-by-title "alice@otherbox:~/x")))
-    (let ((default-directory "/home/arthur/src/ebb/"))
+    (let ((default-directory (expand-file-name "src/ebb/" "~")))
       (should (equal "*ebb: ~/src/ebb*"
                      (ebb-buffer-name-by-directory nil))))
     (let ((default-directory "/ssh:remote:/home/arthur/src/"))

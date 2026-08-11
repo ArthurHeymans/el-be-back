@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026
 ;; Author: Arthur
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1"))
+;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: terminals, processes
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
