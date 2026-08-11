@@ -41,3 +41,15 @@ jobs:
       - name: Run serial tests
         if: matrix.serial
         run: emacs -Q --batch -L . -l ebb-serial-test.el -f ert-run-tests-batch-and-exit
+
+      - name: Check out esctest2
+        if: matrix.emacs == '30.2'
+        run: |
+          git clone https://github.com/ThomasDickey/esctest2.git /tmp/esctest2
+          git -C /tmp/esctest2 checkout 664be3cf2c1e3f06bc93a8bafb48a0db83c607db
+
+      - name: Run terminal compatibility tests
+        if: matrix.emacs == '30.2'
+        env:
+          EBB_ESCTEST_DIR: /tmp/esctest2
+        run: emacs -Q --batch -L . -l test/ebb-esctest.el

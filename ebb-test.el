@@ -1116,7 +1116,51 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[?3h")
     (should (= 132 (ebb-screen-width screen)))
     (should (equal '(0 . 0) (ebb-test-cursor screen)))
-    (should (equal "" (ebb-test-display-line screen 22)))))
+    (should (equal "" (ebb-test-display-line screen 22)))
+    (ebb-test-output parser "\ec")
+    (should (= 80 (ebb-screen-width screen)))))
+
+(ert-deftest ebb-test-parse-decrqcra ()
+  "DECRQCRA reports the DEC checksum for the requested rectangle."
+  (ebb-test-with-screen (:width 5 :height 3)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "A\e[7;0;1;1;1;1*y")
+      (should (equal "\eP7!~FFBF\e\\" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\e[8;0;1;2;1;2*y")
+      (should (equal "\eP8!~10000\e\\" (car responses))))))
+
+(ert-deftest ebb-test-parse-decstr ()
+  "DECSTR resets modes and saved cursor without clearing or moving."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (ebb-test-output parser "X\e[4h\e[2;4r\e[3;4H\e7\e[!p")
+    (should (equal "X" (ebb-test-display-line screen 0)))
+    (should (equal '(3 . 2) (ebb-test-cursor screen)))
+    (should-not (ebb-screen-insert-mode screen))
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 4 (ebb-screen-scroll-bottom screen)))
+    (ebb-test-output parser "\e8")
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-parse-decscl-resets-terminal ()
+  "DECSCL performs a full terminal reset."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "junk\e[3;3H\e[65;1\"p")
+    (should (equal "" (ebb-test-display-line screen 0)))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-parse-winops-resize-characters ()
+  "CSI 8 t resizes the model and emits a synchronization event."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (let (events)
+      (setf (ebb-parser-emit-fn parser)
+            (lambda (type &rest args) (push (cons type args) events)))
+      (ebb-test-output parser "\e[8;25;80t")
+      (should (= 80 (ebb-screen-width screen)))
+      (should (= 25 (ebb-screen-height screen)))
+      (should (equal '(resize-request 80 25) (car events))))))
 
 (ert-deftest ebb-test-parse-sgr-basic ()
   "Parser handles basic SGR attributes."

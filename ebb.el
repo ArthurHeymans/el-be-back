@@ -641,6 +641,18 @@ Called after each render.  Debounced so short-lived matches don't flash."
 
 ;;;; ---- Event Handler --------------------------------------------------
 
+(defun ebb--sync-model-size ()
+  "Synchronize the PTY and renderer with `ebb--screen'."
+  (when-let* ((proc (and ebb--io (ebb-io-process ebb--io))))
+    (when (and (process-live-p proc)
+               (ebb-io--pty-process-p proc))
+      (set-process-window-size
+       proc
+       (ebb-screen-height ebb--screen)
+       (ebb-screen-width ebb--screen))))
+  (when (and ebb--io (ebb-io-render ebb--io))
+    (ebb-render-full-reset (ebb-io-render ebb--io))))
+
 (defun ebb--handle-event (type &rest args)
   "Handle events emitted by the parser."
   (pcase type
@@ -675,19 +687,15 @@ Called after each render.  Debounced so short-lived matches don't flash."
          (3
           ;; DECCOLM changes the model width independently of the Emacs
           ;; window.  Keep the PTY and renderer synchronized with that grid.
-          (when-let* ((proc (and ebb--io (ebb-io-process ebb--io))))
-            (when (and (process-live-p proc)
-                       (ebb-io--pty-process-p proc))
-              (set-process-window-size
-               proc
-               (ebb-screen-height ebb--screen)
-               (ebb-screen-width ebb--screen))))
-          (when (and ebb--io (ebb-io-render ebb--io))
-            (ebb-render-full-reset (ebb-io-render ebb--io))))
+          (ebb--sync-model-size))
          (1004
           ;; Focus events -- could enable focus tracking here
           nil)
          (_ nil))))
+    ('reset
+     (ebb--sync-model-size))
+    ('resize-request
+     (ebb--sync-model-size))
     ('process-exit
      (let ((event (car args)))
        (when (buffer-live-p (current-buffer))
@@ -712,7 +720,6 @@ Called after each render.  Debounced so short-lived matches don't flash."
        (apply #'ebb--defer-callback ebb-notification-function args)))
     ('progress
      (ebb--run-callback (current-buffer) ebb-progress-function args))
-    ('reset nil)
     (_ nil)))
 
 ;;;; ---- Focus Events ---------------------------------------------------

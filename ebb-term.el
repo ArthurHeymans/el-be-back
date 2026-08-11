@@ -178,6 +178,10 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (make-hash-table :test #'eq :weakness 'key)
   "DEC width/height rendition keyed by screen line.")
 
+(defvar ebb--column-mode-screens
+  (make-hash-table :test #'eq :weakness 'key)
+  "Reload-safe DECCOLM state keyed by terminal screen.")
+
 (defun ebb-line-rendition (line)
   "Return LINE's DEC rendition, or `normal'."
   (or (gethash line ebb--line-renditions) 'normal))
@@ -2302,6 +2306,7 @@ Handles LF, VT, FF."
 (defun ebb-screen-set-column-mode (screen wide)
   "Select 132 columns when WIDE is non-nil, otherwise 80 columns.
 DECCOLM clears the display, restores full-screen margins, and homes the cursor."
+  (puthash screen (and wide t) ebb--column-mode-screens)
   (let ((width (if wide 132 80))
         (height (ebb-screen-height screen)))
     (ebb-screen-resize screen width height)
@@ -2779,8 +2784,33 @@ OFFSET, when non-nil, is translated to the normalized cell sequence."
 
 ;;;; ---- Reset ----------------------------------------------------------
 
+(defun ebb-screen-soft-reset (screen)
+  "Reset terminal modes and saved state without clearing the display (DECSTR)."
+  (setf (ebb-screen-pending-wrap screen) nil
+        (ebb-screen-cursor-saved-x screen) 0
+        (ebb-screen-cursor-saved-y screen) 0
+        (ebb-screen-cursor-saved-attr screen) nil
+        (ebb-screen-current-attr screen) (make-ebb-attr)
+        (ebb-screen-scroll-top screen) 0
+        (ebb-screen-scroll-bottom screen) (1- (ebb-screen-height screen))
+        (ebb-screen-auto-wrap screen) t
+        (ebb-screen-insert-mode screen) nil
+        (ebb-screen-origin-mode screen) nil
+        (ebb-screen-keypad-mode screen) nil
+        (ebb-screen-cursor-visible screen) t
+        (ebb-screen-charset-g0 screen) 'us-ascii
+        (ebb-screen-charset-g1 screen) 'us-ascii
+        (ebb-screen-charset-g2 screen) 'us-ascii
+        (ebb-screen-charset-g3 screen) 'us-ascii
+        (ebb-screen-charset-active screen) 'g0)
+  (remhash screen ebb--saved-cursor-renditions)
+  (remhash screen ebb--alt-saved-cursor-renditions))
+
 (defun ebb-screen-reset (screen)
   "Full terminal reset (RIS)."
+  (when (gethash screen ebb--column-mode-screens)
+    (ebb-screen-resize screen 80 (ebb-screen-height screen)))
+  (remhash screen ebb--column-mode-screens)
   (let ((w (ebb-screen-width screen))
         (h (ebb-screen-height screen)))
     ;; Leave alt screen if active
@@ -2929,6 +2959,22 @@ Locations are (ROW . COLUMN) pairs."
     (apply #'concat (nreverse parts))))
 
 ;;;; ---- Query ----------------------------------------------------------
+
+(defun ebb-screen-checksum-rect (screen top left bottom right)
+  "Return the DEC checksum for the inclusive rectangle on SCREEN.
+TOP, LEFT, BOTTOM, and RIGHT are zero-based and already clipped.  Untouched
+blank cells contribute zero, matching the original xterm/DEC checksum mode."
+  (let ((sum 0))
+    (cl-loop for row from top to bottom
+             for line = (ebb--line-at screen row)
+             for cells = (ebb--line-ensure-cells line (ebb-screen-width screen))
+             do (cl-loop for column from left to right
+                         for cell = (aref cells column)
+                         for char = (ebb-cell-char cell)
+                         unless (or (= (ebb-cell-width cell) 0) (= char ?\s))
+                         do (setq sum (logand #xffff (+ sum char)))))
+    ;; DEC represents zero as 10000 rather than truncating it to four digits.
+    (- #x10000 sum)))
 
 (defun ebb-screen-get-line (screen row)
   "Return the ebb-line at ROW."

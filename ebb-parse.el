@@ -808,13 +808,58 @@ only digits and semicolons."
              t)))
           (t nil)))))
 
+(defun ebb-parse--dispatch-csi-intermediate (parser final-byte params)
+  "Handle CSI FINAL-BYTE sequences distinguished by intermediate bytes.
+Return non-nil when the sequence was handled."
+  (let ((intermediates (ebb-parser-intermediates parser))
+        (screen (ebb-parser-screen parser)))
+    (cond
+     ;; DECSTR - soft terminal reset.
+     ((and (= final-byte ?p) (string= intermediates "!"))
+      (ebb-screen-soft-reset screen)
+      t)
+     ;; DECSCL - select conformance level.  Ebb always uses 7-bit replies, but
+     ;; changing the level still performs the specified terminal reset.
+     ((and (= final-byte ?p) (string= intermediates "\""))
+      (ebb-screen-reset screen)
+      (ebb-parse--emit parser 'reset)
+      t)
+     ;; DECRQCRA - request checksum of rectangular area.
+     ((and (= final-byte ?y) (string= intermediates "*"))
+      (let* ((height (ebb-screen-height screen))
+             (width (ebb-screen-width screen))
+             (pid (if (> (length params) 0) (aref params 0) 0))
+             (origin (if (ebb-screen-origin-mode screen)
+                         (ebb-screen-scroll-top screen) 0))
+             (top (+ origin (1- (ebb-parse--param params 2 1))))
+             (left (1- (ebb-parse--param params 3 1)))
+             (bottom (+ origin (1- (ebb-parse--param params 4 height))))
+             (right (1- (ebb-parse--param params 5 width)))
+             (checksum
+              (if (or (> top bottom) (> left right)
+                      (>= top height) (>= left width)
+                      (< bottom 0) (< right 0))
+                  0
+                (ebb-screen-checksum-rect
+                 screen
+                 (ebb--clamp top 0 (1- height))
+                 (ebb--clamp left 0 (1- width))
+                 (ebb--clamp bottom 0 (1- height))
+                 (ebb--clamp right 0 (1- width))))))
+        (ebb-parse--respond parser
+                           (format "\eP%d!~%04X\e\\" pid checksum)))
+      t)
+     (t nil))))
+
 (defun ebb-parse--dispatch-csi (parser final-byte)
   "Parse parameters and dispatch CSI sequence."
   (condition-case err
-      (let ((param (ebb-parser-param-string parser)))
-        (unless (ebb-parse--fast-csi parser final-byte param)
-          (let ((params (ebb-parse--parse-params param))
-                (handler (if (< final-byte 128)
+      (let* ((param (ebb-parser-param-string parser))
+             (params (ebb-parse--parse-params param)))
+        (unless (or (ebb-parse--dispatch-csi-intermediate
+                     parser final-byte params)
+                    (ebb-parse--fast-csi parser final-byte param))
+          (let ((handler (if (< final-byte 128)
                              (aref ebb-parse--csi-dispatch final-byte)
                            #'ebb-parse--csi-unknown)))
             (funcall handler parser params))))
@@ -1068,14 +1113,31 @@ Pm=1: read, Pm=4: read maximum."
                   (1+ (ebb-screen-cursor-y screen))
                   (1+ (ebb-screen-cursor-x screen))))))))
 
-;; Window manipulation (CSI t) -- mostly ignore, report minimal
+;; Window manipulation (CSI t) -- character-cell resize and size reporting.
 (defun ebb-parse--csi-winops (parser params)
   (let ((screen (ebb-parser-screen parser)))
     (pcase (ebb-parse--param params 0 0)
-      ;; Report terminal size in chars
+      ;; Resize text area in character cells.  A zero/omitted dimension keeps
+      ;; the current size, which is useful when no display maximum is known.
+      (8
+       (let ((height (ebb-parse--param
+                      params 1 (ebb-screen-height screen)))
+             (width (ebb-parse--param
+                     params 2 (ebb-screen-width screen))))
+         (when (and (> width 0) (> height 0))
+           (ebb-screen-resize screen width height)
+           (ebb-parse--emit parser 'resize-request width height))))
+      ;; Report terminal size in chars.
       (18 (ebb-parse--respond
            parser
            (format "\e[8;%d;%dt"
+                   (ebb-screen-height screen)
+                   (ebb-screen-width screen))))
+      ;; Report display size in chars.  Emacs does not expose a separate
+      ;; terminal display grid, so report the available model dimensions.
+      (19 (ebb-parse--respond
+           parser
+           (format "\e[9;%d;%dt"
                    (ebb-screen-height screen)
                    (ebb-screen-width screen))))
       (_ nil))))
