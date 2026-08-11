@@ -1240,6 +1240,44 @@ Binds `screen' and `parser' in BODY."
     (should (= 1 (ebb-screen-scroll-top screen)))   ; 0-indexed
     (should (= 3 (ebb-screen-scroll-bottom screen)))))
 
+(ert-deftest ebb-test-parse-horizontal-margins ()
+  "DECLRMM and DECSLRM constrain margin-aware cursor operations."
+  (ebb-test-with-screen (:width 20 :height 10)
+    (ebb-test-output parser "\e[?69h\e[5;10s")
+    (should (ebb-screen-horizontal-margins-enabled-p screen))
+    (should (= 4 (ebb-screen-left-margin screen)))
+    (should (= 9 (ebb-screen-right-margin screen)))
+    (ebb-test-output parser "\e[1;6H\e[99C")
+    (should (equal '(9 . 0) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[1;4H\r")
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[1;6H\r")
+    (should (equal '(4 . 0) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[?69l")
+    (should-not (ebb-screen-horizontal-margins-enabled-p screen))))
+
+(ert-deftest ebb-test-cursor-movement-respects-active-region ()
+  "Relative movement stops at a margin only when starting inside it."
+  (ebb-test-with-screen (:width 20 :height 10)
+    (ebb-test-output parser "\e[3;6r\e[4;1H\e[99B")
+    (should (equal '(0 . 5) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[8;1H\e[99B")
+    (should (equal '(0 . 9) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[?69h\e[5;10s\e[4;6H\e[99D")
+    (should (equal '(4 . 3) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[4;3H\e[99D")
+    (should (equal '(0 . 3) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-origin-mode-reports-relative-horizontal-margins ()
+  "CPR reports coordinates relative to both margins in origin mode."
+  (ebb-test-with-screen (:width 20 :height 10)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e[3;8r\e[?69h\e[5;10s\e[?6h\e[2;3H\e[6n")
+      (should (equal '(6 . 3) (ebb-test-cursor screen)))
+      (should (equal "\e[2;3R" (car responses))))))
+
 (ert-deftest ebb-test-parse-origin-mode ()
   "DECOM makes cursor addressing relative to the scrolling region."
   (ebb-test-with-screen (:width 10 :height 6)

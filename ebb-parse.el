@@ -907,10 +907,16 @@ Return non-nil when the sequence was handled."
 ;; CHA - Cursor Horizontal Absolute
 (defun ebb-parse--csi-cha (parser params)
   (let* ((screen (ebb-parser-screen parser))
-         (col (1- (ebb-parse--param params 0 1))))
+         (origin (and (ebb-screen-origin-mode screen)
+                      (ebb-screen-horizontal-margins-enabled-p screen)))
+         (min-x (if origin (ebb-screen-left-margin screen) 0))
+         (max-x (if origin
+                    (ebb-screen-right-margin screen)
+                  (1- (ebb-screen-line-width screen))))
+         (col (+ min-x (1- (ebb-parse--param params 0 1)))))
     (setf (ebb-screen-pending-wrap screen) nil)
     (setf (ebb-screen-cursor-x screen)
-          (ebb--clamp col 0 (1- (ebb-screen-width screen))))))
+          (ebb--clamp col min-x max-x))))
 
 ;; CUP - Cursor Position
 (defun ebb-parse--csi-cup (parser params)
@@ -1081,12 +1087,19 @@ Pm=1: read, Pm=4: read maximum."
          (bot (1- (ebb-parse--param params 1 h))))
     (ebb-screen-set-scroll-region screen top bot)))
 
-;; SCP - Save Cursor Position
+;; SCP / DECSLRM - Save Cursor Position or set left/right margins.
 (defun ebb-parse--csi-scp (parser params)
   (when (and (null (ebb-parser-private parser))
-             (string-empty-p (ebb-parser-intermediates parser))
-             (zerop (length params)))
-    (ebb-screen-save-cursor (ebb-parser-screen parser))))
+             (string-empty-p (ebb-parser-intermediates parser)))
+    (let ((screen (ebb-parser-screen parser)))
+      (if (and (ebb-screen-horizontal-margins-enabled-p screen)
+               (> (length params) 0))
+          (ebb-screen-set-horizontal-margins
+           screen
+           (1- (ebb-parse--param params 0 1))
+           (1- (ebb-parse--param params 1 (ebb-screen-width screen))))
+        (when (zerop (length params))
+          (ebb-screen-save-cursor screen))))))
 
 ;; RCP - Restore Cursor Position
 (defun ebb-parse--csi-rcp (parser params)
@@ -1107,11 +1120,15 @@ Pm=1: read, Pm=4: read maximum."
   (let ((screen (ebb-parser-screen parser)))
     (pcase (ebb-parse--param params 0 0)
       (5 (ebb-parse--respond parser "\e[0n"))
-      (6 (ebb-parse--respond
-          parser
-          (format "\e[%d;%dR"
-                  (1+ (ebb-screen-cursor-y screen))
-                  (1+ (ebb-screen-cursor-x screen))))))))
+      (6 (let ((row (ebb-screen-cursor-y screen))
+               (column (ebb-screen-cursor-x screen)))
+           (when (ebb-screen-origin-mode screen)
+             (setq row (- row (ebb-screen-scroll-top screen)))
+             (when (ebb-screen-horizontal-margins-enabled-p screen)
+               (setq column (- column (ebb-screen-left-margin screen)))))
+           (ebb-parse--respond
+            parser
+            (format "\e[%d;%dR" (1+ row) (1+ column))))))))
 
 ;; Window manipulation (CSI t) -- character-cell resize and size reporting.
 (defun ebb-parse--csi-winops (parser params)

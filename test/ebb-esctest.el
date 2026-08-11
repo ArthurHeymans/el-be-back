@@ -13,7 +13,13 @@
 
 (defconst ebb-esctest--include
   (concat
-   "(APCTests.test_APC_Basic|DECALNTests|"
+   "(APCTests.test_APC_Basic|BSTests|CHATests|CHTTests|CNLTests|CPLTests|"
+   "CRTests|CUBTests|CUDTests|CUFTests|CUPTests|CUUTests|DCHTests|DLTests|"
+   "DECALNTests|ECHTests.test_ECH_(DefaultParam|ExplicitParam|"
+   "IgnoresScrollRegion|OutsideScrollRegion|doesNotRespectDECPRotection)|"
+   "EDTests.test_ED_(?!respectsISOProtection)|"
+   "ELTests.test_EL_(?!respectsISOProtection)|"
+   "ICHTests|ILTests|INDTests|LFTests|NELTests|RITests|"
    "DECSTRTests.test_DECSTR_(CursorStaysPut|DECSC|IRM|STBM)|"
    "RISTests.test_RIS_(ClearsScreen|CursorToOrigin|ResetTabs|ResetDECCOLM)|"
    "XtermWinopsTests.test_XtermWinops_ResizeChars_BothParameters)"))
@@ -24,6 +30,9 @@
                    (error "EBB_ESCTEST_DIR is not set")))
          (test-dir (expand-file-name "esctest" root))
          (script (expand-file-name "esctest.py" test-dir))
+         (include (or (getenv "EBB_ESCTEST_INCLUDE") ebb-esctest--include))
+         (expected (or (getenv "EBB_ESCTEST_EXPECTED")
+                       "153 tests passed, 3 known bugs, 0 tests failed"))
          (logfile (make-temp-file "ebb-esctest-" nil ".log"))
          (default-directory (file-name-as-directory test-dir))
          (ebb-enable-shell-integration nil)
@@ -55,7 +64,7 @@
                  io
                  (list "python3" script
                        "--expected-terminal=xterm"
-                       (concat "--include=" ebb-esctest--include)
+                       (concat "--include=" include)
                        (concat "--logfile=" logfile)
                        "--no-print-logs")
                  terminal-buffer))
@@ -71,7 +80,7 @@
                        (buffer-string))))
             (princ log)
             (unless (string-match-p
-                     "\\*\\*\\* 14 tests passed, 0 known bugs, 0 tests failed \\*\\*\\*"
+                     (concat "\\*\\*\\* " (regexp-quote expected) " \\*\\*\\*")
                      log)
               (error "Focused esctest2 suite failed"))))
       (when (and process (process-live-p process))
