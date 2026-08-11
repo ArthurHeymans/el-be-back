@@ -408,10 +408,11 @@ Remove overlays that point to deleted text."
     ;; Keep the renderer-only fallback useful to embedders and tests that do
     ;; not install the buffer-local terminal model.
     (let ((position (point-min))
-          entries)
-      (while-let ((prompt-end
+          entries
+          prompt-end)
+      (while (setq prompt-end
                    (text-property-any position (point-max)
-                                      'ebb-shell-prompt-end t)))
+                                      'ebb-shell-prompt-end t))
         (let* ((command-start (1+ prompt-end))
                (line-start (save-excursion
                              (goto-char prompt-end) (line-beginning-position)))

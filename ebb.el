@@ -859,12 +859,13 @@ Called after each render.  Debounced so short-lived matches don't flash."
     (save-excursion
       (goto-char position)
       (catch 'found
-        (while-let ((match (funcall search 'help-echo nil
-                                    (lambda (_ value) value) t)))
-          (let ((at (prop-match-beginning match)))
-            (unless (and skip-id
-                         (equal skip-id (get-text-property at 'ebb-link-id)))
-              (throw 'found at))))))))
+        (let (match)
+          (while (setq match (funcall search 'help-echo nil
+                                      (lambda (_ value) value) t))
+            (let ((at (prop-match-beginning match)))
+              (unless (and skip-id
+                           (equal skip-id (get-text-property at 'ebb-link-id)))
+                (throw 'found at)))))))))
 
 (defun ebb--goto-hyperlink (direction)
   "Move to a hyperlink in DIRECTION, wrapping at buffer boundaries."
