@@ -564,6 +564,7 @@ only digits and semicolons."
           (?8 (ebb-screen-restore-cursor screen))
           (?D (ebb-screen-index screen))
           (?E (ebb-screen-next-line screen))
+          (?H (ebb-screen-set-tab-stop screen))
           (?M (ebb-screen-reverse-index screen))
           (?c (ebb-screen-reset screen)
               (ebb-parse--emit parser 'reset))

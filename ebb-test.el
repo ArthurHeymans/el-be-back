@@ -1238,6 +1238,13 @@ Binds `screen' and `parser' in BODY."
     (should (= ?B (ebb-cell-char
                     (aref (ebb-line-cells (ebb-screen-get-line screen 0)) 8))))))
 
+(ert-deftest ebb-test-parse-hts ()
+  "ESC H sets a horizontal tab stop at the cursor."
+  (ebb-test-with-screen (:width 20 :height 3)
+    (ebb-test-output parser "\e[3g\e[1;7H\eH\e[1;1H\t*")
+    (should (equal "      *" (ebb-test-display-line screen 0)))
+    (should (equal '(7 . 0) (ebb-test-cursor screen)))))
+
 ;;;; ---- Render Tests ---------------------------------------------------
 
 (ert-deftest ebb-test-render-color-conversion ()
