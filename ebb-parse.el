@@ -50,6 +50,35 @@
 (defvar ebb-parse-debug nil
   "When non-nil, log unknown escape sequences to *Messages*.")
 
+(defvar ebb-parse--conformance-levels
+  (make-hash-table :test #'eq :weakness 'key)
+  "DECSCL conformance level keyed by terminal screen.")
+
+(defvar ebb-parse--page-lengths
+  (make-hash-table :test #'eq :weakness 'key)
+  "Requested page length keyed by terminal screen.")
+
+(defvar ebb-parse--ansi-mode-states
+  (make-hash-table :test #'eq :weakness 'key)
+  "ANSI mode state maps keyed by terminal screen.")
+
+(defvar ebb-parse--dec-mode-states
+  (make-hash-table :test #'eq :weakness 'key)
+  "DEC private mode state maps keyed by terminal screen.")
+
+(defun ebb-parse--record-mode (table screen mode enabled)
+  "Record MODE as ENABLED for SCREEN in TABLE."
+  (let ((states (or (gethash screen table)
+                    (let ((map (make-hash-table :test #'eql)))
+                      (puthash screen map table)
+                      map))))
+    (puthash mode (and enabled t) states)))
+
+(defun ebb-parse--recorded-mode (table screen mode)
+  "Return recorded MODE state for SCREEN from TABLE."
+  (when-let* ((states (gethash screen table)))
+    (gethash mode states)))
+
 (defun ebb-parse--log (fmt &rest args)
   "Log a parser message when debug is enabled."
   (when ebb-parse-debug
@@ -424,10 +453,13 @@ only digits and semicolons."
             (:osc-string :osc)
             (:dcs-passthrough :dcs)
             (_ nil)))
-    (setf (ebb-parser-state parser) :escape)
-    (setf (ebb-parser-param-string parser) "")
-    (setf (ebb-parser-private parser) nil)
-    (setf (ebb-parser-intermediates parser) ""))
+    (let ((inside-dcs (eq (ebb-parser-state parser) :dcs-passthrough)))
+      (setf (ebb-parser-state parser) :escape)
+      (setf (ebb-parser-param-string parser) "")
+      (setf (ebb-parser-private parser) nil)
+      ;; Preserve DCS intermediates until ST dispatches the completed string.
+      (unless inside-dcs
+        (setf (ebb-parser-intermediates parser) ""))))
 
    ;; C0 controls (0x00-0x1F) handled inline in most states
    ((and (< ch ?\s)
@@ -484,6 +516,9 @@ only digits and semicolons."
 
 (defun ebb-parse--escape (parser ch)
   "Handle character after ESC."
+  ;; Preserve DCS intermediates only for the ESC \\ string terminator.
+  (unless (and (= ch ?\\) (ebb-parser-string-state parser))
+    (setf (ebb-parser-intermediates parser) ""))
   (cond
    ;; ST (ESC \) terminates a pending string
    ((and (= ch ?\\) (ebb-parser-string-state parser))
@@ -504,6 +539,7 @@ only digits and semicolons."
     (setf (ebb-parser-string-state parser) nil)
     (setf (ebb-parser-dcs-params parser) "")
     (setf (ebb-parser-dcs-string parser) "")
+    (setf (ebb-parser-intermediates parser) "")
     (setf (ebb-parser-state parser) :dcs-entry))
    ;; Charset designation
    ((memq ch '(?\( ?\) ?* ?+ ?- ?. ?/))
@@ -572,7 +608,13 @@ only digits and semicolons."
           (?E (ebb-screen-next-line screen))
           (?H (ebb-screen-set-tab-stop screen))
           (?M (ebb-screen-reverse-index screen))
+          (?V (ebb-screen-set-iso-protection screen t))
+          (?W (ebb-screen-set-iso-protection screen nil))
           (?c (ebb-screen-reset screen)
+              (remhash screen ebb-parse--conformance-levels)
+              (remhash screen ebb-parse--page-lengths)
+              (remhash screen ebb-parse--ansi-mode-states)
+              (remhash screen ebb-parse--dec-mode-states)
               (ebb-parse--emit parser 'reset))
           (?n (setf (ebb-screen-charset-active screen) 'g2))
           (?o (setf (ebb-screen-charset-active screen) 'g3))
@@ -658,6 +700,9 @@ only digits and semicolons."
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;))
     (setf (ebb-parser-dcs-params parser) (string ch))
     (setf (ebb-parser-state parser) :dcs-param))
+   ((and (>= ch ?\s) (<= ch ?/))
+    (setf (ebb-parser-intermediates parser)
+          (concat (ebb-parser-intermediates parser) (string ch))))
    ((and (>= ch ?@) (<= ch ?~))
     (setf (ebb-parser-dcs-final parser) ch)
     (setf (ebb-parser-state parser) :dcs-passthrough))
@@ -669,6 +714,9 @@ only digits and semicolons."
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;))
     (setf (ebb-parser-dcs-params parser)
           (concat (ebb-parser-dcs-params parser) (string ch))))
+   ((and (>= ch ?\s) (<= ch ?/))
+    (setf (ebb-parser-intermediates parser)
+          (concat (ebb-parser-intermediates parser) (string ch))))
    ((and (>= ch ?@) (<= ch ?~))
     (setf (ebb-parser-dcs-final parser) ch)
     (setf (ebb-parser-state parser) :dcs-passthrough))
@@ -773,7 +821,9 @@ only digits and semicolons."
                        (setq col (+ (* col 10) (- ch ?0)))
                      (setq row (+ (* row 10) (- ch ?0)))))
                   ((= ch ?\;)
-                   (setq in-col t))
+                   (if in-col
+                       (setq ok nil)
+                     (setq in-col t)))
                   (t
                    (setq ok nil))))
                (cl-incf i))
@@ -808,16 +858,160 @@ only digits and semicolons."
              t)))
           (t nil)))))
 
+(defun ebb-parse--rect-coordinates (screen params offset)
+  "Return a clipped rectangle from PARAMS beginning at OFFSET for SCREEN.
+Rectangle coordinates are one-based in the sequence.  In origin mode they are
+relative to the top and left margins."
+  (let* ((height (ebb-screen-height screen))
+         (width (ebb-screen-width screen))
+         (origin-row (if (ebb-screen-origin-mode screen)
+                         (ebb-screen-scroll-top screen) 0))
+         (origin-column (if (ebb-screen-origin-mode screen)
+                            (ebb-screen-left-margin screen) 0))
+         (top (+ origin-row
+                 (1- (ebb-parse--param params offset 1))))
+         (left (+ origin-column
+                  (1- (ebb-parse--param params (1+ offset) 1))))
+         (bottom (+ origin-row
+                    (1- (ebb-parse--param params (+ offset 2) height))))
+         (right (+ origin-column
+                   (1- (ebb-parse--param params (+ offset 3) width)))))
+    (when (and (<= top bottom) (<= left right)
+               (< top height) (< left width)
+               (>= bottom 0) (>= right 0))
+      (list (ebb--clamp top 0 (1- height))
+            (ebb--clamp left 0 (1- width))
+            (ebb--clamp bottom 0 (1- height))
+            (ebb--clamp right 0 (1- width))))))
+
+(defun ebb-parse--dispatch-csi-intermediate (parser final-byte params)
+  "Handle CSI FINAL-BYTE sequences distinguished by intermediate bytes.
+Return non-nil when the sequence was handled."
+  (let ((intermediates (ebb-parser-intermediates parser))
+        (screen (ebb-parser-screen parser)))
+    (cond
+     ;; DECSTR - soft terminal reset.
+     ((and (= final-byte ?p) (string= intermediates "!"))
+      (ebb-screen-soft-reset screen)
+      (remhash screen ebb-parse--ansi-mode-states)
+      (remhash screen ebb-parse--dec-mode-states)
+      t)
+     ;; DECRQM - request ANSI or DEC private mode state.
+     ((and (= final-byte ?p) (string= intermediates "$"))
+      (let* ((mode (ebb-parse--param params 0 0))
+             (private (eql (ebb-parser-private parser) ??))
+             (level (or (gethash screen ebb-parse--conformance-levels) 65))
+             (status
+              (when (>= level 63)
+                (if private
+                    (cond
+                     ((= mode 8) 4)
+                     ((= mode 60) 4)
+                     ((= mode 1)
+                      (if (ebb-screen-keypad-mode screen) 1 2))
+                     ((= mode 3)
+                      (if (ebb-screen-column-mode-enabled-p screen) 1 2))
+                     ((= mode 6)
+                      (if (ebb-screen-origin-mode screen) 1 2))
+                     ((= mode 7)
+                      (if (ebb-screen-auto-wrap screen) 1 2))
+                     ((= mode 25)
+                      (if (ebb-screen-cursor-visible screen) 1 2))
+                     ((= mode 69)
+                      (if (ebb-screen-horizontal-margins-enabled-p screen) 1 2))
+                     ((memq mode '(4 5 18 19 35 42 66 67))
+                      (if (ebb-parse--recorded-mode
+                           ebb-parse--dec-mode-states screen mode) 1 2))
+                     (t 0))
+                  (cond
+                   ((memq mode '(2 4 12 20))
+                    (if (ebb-parse--recorded-mode
+                         ebb-parse--ansi-mode-states screen mode) 1 2))
+                   ((memq mode '(1 5 7 10 11 13 14 15 16 17 18 19)) 4)
+                   (t 0))))))
+        (when status
+          (ebb-parse--respond
+           parser
+           (format "\e[%s%d;%d$y" (if private "?" "") mode status))))
+      t)
+     ;; DECSCL - select conformance level.  Ebb always uses 7-bit replies, but
+     ;; changing the level still performs the specified terminal reset.
+     ((and (= final-byte ?p) (string= intermediates "\""))
+      (puthash screen (ebb-parse--param params 0 65)
+               ebb-parse--conformance-levels)
+      (remhash screen ebb-parse--ansi-mode-states)
+      (remhash screen ebb-parse--dec-mode-states)
+      (ebb-screen-reset screen)
+      (ebb-parse--emit parser 'reset)
+      t)
+     ;; DECSCA - select character protection attribute.
+     ((and (= final-byte ?q) (string= intermediates "\""))
+      (ebb-screen-set-dec-protection
+       screen (= (ebb-parse--param params 0 0) 1))
+      t)
+     ;; DECSNLS - set number of lines per screen.
+     ((and (= final-byte ?|) (string= intermediates "*"))
+      (puthash screen (ebb-parse--param params 0 (ebb-screen-height screen))
+               ebb-parse--page-lengths)
+      t)
+     ;; DECCRA - copy rectangular area.
+     ((and (= final-byte ?v) (string= intermediates "$"))
+      (when-let* ((source (ebb-parse--rect-coordinates screen params 0)))
+        (let* ((origin-row (if (ebb-screen-origin-mode screen)
+                               (ebb-screen-scroll-top screen) 0))
+               (origin-column (if (ebb-screen-origin-mode screen)
+                                  (ebb-screen-left-margin screen) 0))
+               (destination-top
+                (+ origin-row (1- (ebb-parse--param params 5 1))))
+               (destination-left
+                (+ origin-column (1- (ebb-parse--param params 6 1))))
+               (source-page (ebb-parse--param params 4 1))
+               (destination-page (ebb-parse--param params 7 1)))
+          (when (and (= source-page 1) (= destination-page 1))
+            (apply #'ebb-screen-copy-rect
+                   screen
+                   (append source
+                           (list destination-top destination-left))))))
+      t)
+     ;; DECERA and DECSERA - erase rectangular area.
+     ((and (memq final-byte '(?z ?{)) (string= intermediates "$"))
+      (when-let* ((rectangle (ebb-parse--rect-coordinates screen params 0)))
+        (apply #'ebb-screen-erase-rect
+               screen (append rectangle (list (= final-byte ?{)))))
+      t)
+     ;; DECFRA - fill rectangular area.
+     ((and (= final-byte ?x) (string= intermediates "$"))
+      (let ((char (ebb-parse--param params 0 0)))
+        (when (and (or (<= 32 char 126) (<= 160 char 255)))
+          (when-let* ((rectangle (ebb-parse--rect-coordinates screen params 1)))
+            (apply #'ebb-screen-fill-rect screen char rectangle))))
+      t)
+     ;; DECRQCRA - request checksum of rectangular area.
+     ((and (= final-byte ?y) (string= intermediates "*"))
+      (let* ((pid (if (> (length params) 0) (aref params 0) 0))
+             (rectangle (ebb-parse--rect-coordinates screen params 2))
+             (checksum (if rectangle
+                           (apply #'ebb-screen-checksum-rect screen rectangle)
+                         0)))
+        (ebb-parse--respond parser
+                           (format "\eP%d!~%04X\e\\" pid checksum)))
+      t)
+     (t nil))))
+
 (defun ebb-parse--dispatch-csi (parser final-byte)
   "Parse parameters and dispatch CSI sequence."
   (condition-case err
       (let ((param (ebb-parser-param-string parser)))
         (unless (ebb-parse--fast-csi parser final-byte param)
-          (let ((params (ebb-parse--parse-params param))
-                (handler (if (< final-byte 128)
-                             (aref ebb-parse--csi-dispatch final-byte)
-                           #'ebb-parse--csi-unknown)))
-            (funcall handler parser params))))
+          (let ((params (ebb-parse--parse-params param)))
+            (unless (and (not (string-empty-p
+                               (ebb-parser-intermediates parser)))
+                         (ebb-parse--dispatch-csi-intermediate
+                          parser final-byte params))
+              (let ((handler (if (< final-byte 128)
+                                 (aref ebb-parse--csi-dispatch final-byte)
+                               #'ebb-parse--csi-unknown)))
+                (funcall handler parser params))))))
     (error
      (ebb-parse--log "CSI dispatch error for %c: %S" final-byte err)))
   (setf (ebb-parser-state parser) :ground))
@@ -862,10 +1056,16 @@ only digits and semicolons."
 ;; CHA - Cursor Horizontal Absolute
 (defun ebb-parse--csi-cha (parser params)
   (let* ((screen (ebb-parser-screen parser))
-         (col (1- (ebb-parse--param params 0 1))))
+         (origin (and (ebb-screen-origin-mode screen)
+                      (ebb-screen-horizontal-margins-enabled-p screen)))
+         (min-x (if origin (ebb-screen-left-margin screen) 0))
+         (max-x (if origin
+                    (ebb-screen-right-margin screen)
+                  (1- (ebb-screen-line-width screen))))
+         (col (+ min-x (1- (ebb-parse--param params 0 1)))))
     (setf (ebb-screen-pending-wrap screen) nil)
     (setf (ebb-screen-cursor-x screen)
-          (ebb--clamp col 0 (1- (ebb-screen-width screen))))))
+          (ebb--clamp col min-x max-x))))
 
 ;; CUP - Cursor Position
 (defun ebb-parse--csi-cup (parser params)
@@ -880,13 +1080,19 @@ only digits and semicolons."
 
 ;; ED - Erase in Display
 (defun ebb-parse--csi-ed (parser params)
-  (ebb-screen-erase-in-display (ebb-parser-screen parser)
-                                 (ebb-parse--param params 0 0)))
+  (funcall (if (eql (ebb-parser-private parser) ??)
+               #'ebb-screen-dec-erase-in-display
+             #'ebb-screen-erase-in-display)
+           (ebb-parser-screen parser)
+           (ebb-parse--param params 0 0)))
 
 ;; EL - Erase in Line
 (defun ebb-parse--csi-el (parser params)
-  (ebb-screen-erase-in-line (ebb-parser-screen parser)
-                              (ebb-parse--param params 0 0)))
+  (funcall (if (eql (ebb-parser-private parser) ??)
+               #'ebb-screen-dec-erase-in-line
+             #'ebb-screen-erase-in-line)
+           (ebb-parser-screen parser)
+           (ebb-parse--param params 0 0)))
 
 ;; IL - Insert Line
 (defun ebb-parse--csi-il (parser params)
@@ -1007,12 +1213,17 @@ Pm=1: read, Pm=4: read maximum."
         ;; DECSET
         (dotimes (i (length params))
           (let ((mode (aref params i)))
+            (ebb-parse--record-mode
+             ebb-parse--dec-mode-states screen mode t)
             (ebb-screen-set-mode screen mode t)
             (ebb-parse--emit parser 'mode-set mode t)))
       ;; Standard SM
       (dotimes (i (length params))
-        (pcase (aref params i)
-          (4 (setf (ebb-screen-insert-mode screen) t)))))))
+        (let ((mode (aref params i)))
+          (ebb-parse--record-mode
+           ebb-parse--ansi-mode-states screen mode t)
+          (pcase mode
+            (4 (setf (ebb-screen-insert-mode screen) t))))))))
 
 ;; RM - Reset Mode
 (defun ebb-parse--csi-rm (parser params)
@@ -1021,12 +1232,17 @@ Pm=1: read, Pm=4: read maximum."
         ;; DECRST
         (dotimes (i (length params))
           (let ((mode (aref params i)))
+            (ebb-parse--record-mode
+             ebb-parse--dec-mode-states screen mode nil)
             (ebb-screen-set-mode screen mode nil)
             (ebb-parse--emit parser 'mode-set mode nil)))
       ;; Standard RM
       (dotimes (i (length params))
-        (pcase (aref params i)
-          (4 (setf (ebb-screen-insert-mode screen) nil)))))))
+        (let ((mode (aref params i)))
+          (ebb-parse--record-mode
+           ebb-parse--ansi-mode-states screen mode nil)
+          (pcase mode
+            (4 (setf (ebb-screen-insert-mode screen) nil))))))))
 
 ;; DECSTBM - Set Scrolling Region
 (defun ebb-parse--csi-decstbm (parser params)
@@ -1036,12 +1252,18 @@ Pm=1: read, Pm=4: read maximum."
          (bot (1- (ebb-parse--param params 1 h))))
     (ebb-screen-set-scroll-region screen top bot)))
 
-;; SCP - Save Cursor Position
+;; SCP / DECSLRM - Save Cursor Position or set left/right margins.
 (defun ebb-parse--csi-scp (parser params)
   (when (and (null (ebb-parser-private parser))
-             (string-empty-p (ebb-parser-intermediates parser))
-             (zerop (length params)))
-    (ebb-screen-save-cursor (ebb-parser-screen parser))))
+             (string-empty-p (ebb-parser-intermediates parser)))
+    (let ((screen (ebb-parser-screen parser)))
+      (if (ebb-screen-horizontal-margins-enabled-p screen)
+          (ebb-screen-set-horizontal-margins
+           screen
+           (1- (ebb-parse--param params 0 1))
+           (1- (ebb-parse--param params 1 (ebb-screen-width screen))))
+        (when (zerop (length params))
+          (ebb-screen-save-cursor screen))))))
 
 ;; RCP - Restore Cursor Position
 (defun ebb-parse--csi-rcp (parser params)
@@ -1062,20 +1284,46 @@ Pm=1: read, Pm=4: read maximum."
   (let ((screen (ebb-parser-screen parser)))
     (pcase (ebb-parse--param params 0 0)
       (5 (ebb-parse--respond parser "\e[0n"))
-      (6 (ebb-parse--respond
-          parser
-          (format "\e[%d;%dR"
-                  (1+ (ebb-screen-cursor-y screen))
-                  (1+ (ebb-screen-cursor-x screen))))))))
+      (6 (let ((row (ebb-screen-cursor-y screen))
+               (column (ebb-screen-cursor-x screen)))
+           (when (ebb-screen-origin-mode screen)
+             (setq row (- row (ebb-screen-scroll-top screen)))
+             (when (ebb-screen-horizontal-margins-enabled-p screen)
+               (setq column (- column (ebb-screen-left-margin screen)))))
+           (ebb-parse--respond
+            parser
+            (format "\e[%d;%dR" (1+ row) (1+ column))))))))
 
-;; Window manipulation (CSI t) -- mostly ignore, report minimal
+;; Window manipulation (CSI t) -- character-cell resize and size reporting.
 (defun ebb-parse--csi-winops (parser params)
   (let ((screen (ebb-parser-screen parser)))
     (pcase (ebb-parse--param params 0 0)
-      ;; Report terminal size in chars
+      ;; Resize text area in character cells.  A zero/omitted dimension keeps
+      ;; the current size, which is useful when no display maximum is known.
+      (8
+       (let ((height (ebb-parse--param
+                      params 1 (ebb-screen-height screen)))
+             (width (ebb-parse--param
+                     params 2 (ebb-screen-width screen))))
+         (when (and (> width 0) (> height 0))
+           (ebb-screen-resize screen width height)
+           (puthash screen height ebb-parse--page-lengths)
+           (ebb-parse--emit parser 'resize-request width height))))
+      ;; DECSLPP - set number of lines per page.
+      ((pred (lambda (value) (>= value 24)))
+       (puthash screen (ebb-parse--param params 0 24)
+                ebb-parse--page-lengths))
+      ;; Report terminal size in chars.
       (18 (ebb-parse--respond
            parser
            (format "\e[8;%d;%dt"
+                   (ebb-screen-height screen)
+                   (ebb-screen-width screen))))
+      ;; Report display size in chars.  Emacs does not expose a separate
+      ;; terminal display grid, so report the available model dimensions.
+      (19 (ebb-parse--respond
+           parser
+           (format "\e[9;%d;%dt"
                    (ebb-screen-height screen)
                    (ebb-screen-width screen))))
       (_ nil))))
@@ -1344,16 +1592,117 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
 
 ;;;; ---- DCS Dispatch ---------------------------------------------------
 
+(defun ebb-parse--sgr-color-status (color foreground &optional code)
+  "Return SGR parameters for COLOR.
+FOREGROUND selects the legacy foreground/background palette codes unless
+CODE is supplied, in which case CODE is used for extended colors."
+  (let ((base (or code (if foreground 38 48))))
+    (cond
+     ((integerp color)
+      (cond
+       ((and (null code) (< color 8))
+        (list (+ (if foreground 30 40) color)))
+       ((and (null code) (< color 16))
+        (list (+ (if foreground 90 100) (- color 8))))
+       (t (list base 5 color))))
+     ((and (listp color) (= (length color) 3))
+      (append (list base 2) color)))))
+
+(defun ebb-parse--sgr-status (screen)
+  "Return SCREEN's current rendition as a DECRQSS parameter string."
+  (let ((attr (ebb-screen-current-attr screen))
+        (params '("0")))
+    (when (ebb-attr-bold attr) (setq params (append params '("1"))))
+    (when (ebb-attr-faint attr) (setq params (append params '("2"))))
+    (when (ebb-attr-italic attr) (setq params (append params '("3"))))
+    (when (ebb-attr-underline attr)
+      (setq params
+            (append params
+                    (list (format "4:%d"
+                                  (pcase (ebb-attr-underline attr)
+                                    ('line 1) ('double 2) ('curly 3)
+                                    ('dotted 4) ('dashed 5)
+                                    (_ 1)))))))
+    (when (and (ebb-attr-font attr) (> (ebb-attr-font attr) 0))
+      (setq params (append params
+                           (list (number-to-string
+                                  (+ 10 (ebb-attr-font attr)))))))
+    (when (eq (ebb-attr-blink attr) 'slow)
+      (setq params (append params '("5"))))
+    (when (eq (ebb-attr-blink attr) 'fast)
+      (setq params (append params '("6"))))
+    (when (ebb-attr-inverse attr) (setq params (append params '("7"))))
+    (when (ebb-attr-conceal attr) (setq params (append params '("8"))))
+    (when (ebb-attr-crossed attr) (setq params (append params '("9"))))
+    (when (ebb-attr-fg attr)
+      (setq params (append params
+                           (mapcar #'number-to-string
+                                   (ebb-parse--sgr-color-status
+                                    (ebb-attr-fg attr) t)))))
+    (when (ebb-attr-bg attr)
+      (setq params (append params
+                           (mapcar #'number-to-string
+                                   (ebb-parse--sgr-color-status
+                                    (ebb-attr-bg attr) nil)))))
+    (when (ebb-attr-ul-color attr)
+      (setq params (append params
+                           (mapcar #'number-to-string
+                                   (ebb-parse--sgr-color-status
+                                    (ebb-attr-ul-color attr) nil 58)))))
+    (mapconcat #'identity params ";")))
+
+(defun ebb-parse--cursor-style-status (screen)
+  "Return SCREEN's cursor style as a DECSCUSR parameter."
+  (pcase (ebb-screen-cursor-style screen)
+    (:blinking-block 1)
+    (:block 2)
+    (:blinking-underline 3)
+    (:underline 4)
+    (:blinking-bar 5)
+    (:bar 6)
+    (_ 2)))
+
+(defun ebb-parse--decrqss-value (screen request)
+  "Return the DECRQSS status value for REQUEST on SCREEN."
+  (pcase request
+    ((or "$}" "*x" "$~")
+     (concat "0" request))
+    ("\"q" (format "%d\"q"
+                    (if (ebb-screen-dec-protection-enabled-p screen) 1 0)))
+    ("\"p" (format "%d;1\"p"
+                    (or (gethash screen ebb-parse--conformance-levels) 65)))
+    ("r" (format "%d;%dr"
+                 (1+ (ebb-screen-scroll-top screen))
+                 (1+ (ebb-screen-scroll-bottom screen))))
+    ("m" (concat (ebb-parse--sgr-status screen) "m"))
+    (" q" (format "%d q" (ebb-parse--cursor-style-status screen)))
+    ("s" (format "%d;%ds"
+                 (1+ (ebb-screen-left-margin screen))
+                 (1+ (ebb-screen-right-margin screen))))
+    ("t" (format "%dt"
+                 (or (gethash screen ebb-parse--page-lengths)
+                     (ebb-screen-height screen))))
+    ("*|" (format "%d*|"
+                  (or (gethash screen ebb-parse--page-lengths)
+                      (ebb-screen-height screen))))
+    (_ nil)))
+
 (defun ebb-parse--dispatch-dcs (parser)
   "Dispatch a completed DCS sequence."
   (condition-case err
       (let ((final (ebb-parser-dcs-final parser))
-            (body (ebb-parser-dcs-string parser)))
-        (pcase final
-          ;; Sixel graphics
-          (?q (ebb-parse--emit parser 'sixel body))
-          ;; Unknown
-          (_ (ebb-parse--log "Unknown DCS final %c" final))))
+            (body (ebb-parser-dcs-string parser))
+            (intermediates (ebb-parser-intermediates parser)))
+        (cond
+         ;; DECRQSS - request selection or setting status.
+         ((and (= final ?q) (string= intermediates "$"))
+          (if-let* ((value (ebb-parse--decrqss-value
+                            (ebb-parser-screen parser) body)))
+              (ebb-parse--respond parser (concat "\eP1$r" value "\e\\"))
+            (ebb-parse--respond parser "\eP0$r\e\\")))
+         ;; Sixel graphics.
+         ((= final ?q) (ebb-parse--emit parser 'sixel body))
+         (t (ebb-parse--log "Unknown DCS final %c" final))))
     (error
      (ebb-parse--log "DCS dispatch error: %S" err))))
 

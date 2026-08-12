@@ -397,7 +397,24 @@ Binds `screen' and `parser' in BODY."
     (should (= 16 (ebb-screen-cursor-x screen)))
     ;; Tab backward
     (ebb-screen-tab-backward screen 1)
+    (should (= 8 (ebb-screen-cursor-x screen)))
+    ;; A cursor beyond the right margin must not be pulled backward by HT.
+    (ebb-screen-set-horizontal-margin-mode screen t)
+    (ebb-screen-set-horizontal-margins screen 2 5)
+    (ebb-screen-cursor-goto screen 0 7)
+    (ebb-screen-tab-forward screen 1)
     (should (= 8 (ebb-screen-cursor-x screen)))))
+
+(ert-deftest ebb-test-reverse-wrap-modes-are-independent ()
+  "Resetting one reverse-wrap mode leaves the other mode enabled."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-screen-set-mode screen 1045 t)
+    (ebb-screen-set-mode screen 45 nil)
+    (should (eq 'extended (ebb--reverse-wrap-mode screen)))
+    (ebb-screen-set-mode screen 45 t)
+    (should (eq 'extended (ebb--reverse-wrap-mode screen)))
+    (ebb-screen-set-mode screen 1045 nil)
+    (should (eq 'inline (ebb--reverse-wrap-mode screen)))))
 
 (ert-deftest ebb-test-resize-clamps-cursor ()
   "Resize clamps cursor to new bounds."
@@ -990,6 +1007,45 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[3C")
     (should (equal '(8 . 1) (ebb-test-cursor screen)))))
 
+(ert-deftest ebb-test-selective-erase-protection ()
+  "ISO and DEC protection preserve cells for their selective erase forms."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "ab\eVc\eW\e[1;1H\e[3X")
+    (should (equal "  c" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[2Jab\e[1\"qc\e[0\"q\e[1;1H\e[?2K")
+    (should (equal "  c" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-horizontal-margin-state-moves-with-lines ()
+  "IL moves protected-cell metadata with cells inside horizontal margins."
+  (ebb-test-with-screen (:width 6 :height 4)
+    (ebb-test-output
+     parser "\e[?69h\e[2;5s\e[2;2H\e[1\"qA\e[0\"q\e[2;2H\e[L\e[?2J")
+    (should (equal " A" (ebb-test-display-line screen 2)))))
+
+(ert-deftest ebb-test-parse-dec-rectangular-operations ()
+  "DEC rectangular copy, fill, and selective erase preserve cursor state."
+  (ebb-test-with-screen (:width 8 :height 4)
+    (ebb-test-output parser "abcdefgh\r\nijklmnop\r\nqrstuvwx")
+    (ebb-test-output parser "\e[4;2H\e[1;2;2;4;1;3;5;1$v")
+    (should (equal "qrstbcdx" (ebb-test-display-line screen 2)))
+    (should (equal "    jkl" (ebb-test-display-line screen 3)))
+    (should (equal '(1 . 3) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[37;1;1;2;2$x")
+    (should (equal "%%cdefgh" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[1;1H\e[1\"qP\e[0\"qI\eVZ\eW\e[1;1;1;3${")
+    (should (equal "P  defgh" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[1;1;1;1$z")
+    (should (equal "   defgh" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-rectangle-operation-clears-wide-boundary ()
+  "A rectangle starting on a continuation cell clears the whole wide glyph."
+  (ebb-test-with-screen (:width 4 :height 2)
+    (ebb-test-output parser "界\e[37;1;2;1;2$x")
+    (let ((cells (ebb-line-cells (ebb-screen-get-line screen 0))))
+      (should (= 1 (ebb-cell-width (aref cells 0))))
+      (should (= 1 (ebb-cell-width (aref cells 1))))
+      (should (= ?% (ebb-cell-char (aref cells 1)))))))
+
 (ert-deftest ebb-test-parse-erase ()
   "Parser handles CSI J and CSI K."
   (ebb-test-with-screen (:width 10 :height 3)
@@ -1116,7 +1172,116 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[?3h")
     (should (= 132 (ebb-screen-width screen)))
     (should (equal '(0 . 0) (ebb-test-cursor screen)))
-    (should (equal "" (ebb-test-display-line screen 22)))))
+    (should (equal "" (ebb-test-display-line screen 22)))
+    (ebb-test-output parser "\ec")
+    (should (= 80 (ebb-screen-width screen)))))
+
+(ert-deftest ebb-test-parse-decrqm ()
+  "DECRQM reports supported ANSI and DEC mode state."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e[?7$p\e[?25$p")
+      (should (equal '("\e[?25;1$y" "\e[?7;1$y") responses))
+      (setq responses nil)
+      (ebb-test-output parser "\e[65;1\"p\e[4h\e[4$p")
+      (should (equal "\e[4;1$y" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\e[?69h\e[?69$p")
+      (should (equal "\e[?69;1$y" (car responses))))))
+
+(ert-deftest ebb-test-parse-decrqss ()
+  "DECRQSS reports current rendition and margin state."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser
+                       "\e[1;5;8;9;38;5;123;48;2;1;2;3m\eP$qm\e\\")
+      (should (equal "\eP1$r0;1;5;8;9;38;5;123;48;2;1;2;3m\e\\"
+                     (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\e[2;4r\eP$qr\e\\")
+      (should (equal "\eP1$r2;4r\e\\" (car responses)))
+      (setq responses nil)
+      (setf (ebb-screen-current-attr screen)
+            (make-ebb-attr :underline 'curly :font 1 :blink 'fast
+                           :conceal t :crossed t :fg 123 :bg '(1 2 3)
+                           :ul-color 4))
+      (ebb-test-output parser "\eP$qm\e\\")
+      (should (equal "\eP1$r0;4:3;11;6;8;9;38;5;123;48;2;1;2;3;58;5;4m\e\\"
+                     (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\eP$qbogus\e\\")
+      (should (equal "\eP0$r\e\\" (car responses))))))
+
+(ert-deftest ebb-test-parse-ris-clears-parser-owned-status ()
+  "RIS clears DECSCL and page-length state used by DECRQSS replies."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (puthash screen 61 ebb-parse--conformance-levels)
+      (puthash screen 27 ebb-parse--page-lengths)
+      (ebb-test-output parser "\ec")
+      (ebb-test-output parser "\eP$q\"p\e\\")
+      (should (equal "\eP1$r65;1\"p\e\\" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\eP$qt\e\\")
+      (should (equal "\eP1$r5t\e\\" (car responses))))))
+
+(ert-deftest ebb-test-parse-decrqcra ()
+  "DECRQCRA reports the DEC checksum for the requested rectangle."
+  (ebb-test-with-screen (:width 5 :height 3)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "A\e[7;0;1;1;1;1*y")
+      (should (equal "\eP7!~FFBF\e\\" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\e[8;0;1;2;1;2*y")
+      (should (equal "\eP8!~10000\e\\" (car responses)))
+      (setq responses nil)
+      (ebb-test-output
+       parser "\e[?69h\e[2;5s\e[2;3r\e[?6hB\e[9;0;1;1;1;1*y")
+      (should (equal "\eP9!~FFBE\e\\" (car responses))))))
+
+(ert-deftest ebb-test-aborted-dcs-clears-intermediates ()
+  "An aborted DCS does not leak its intermediates into the next CSI."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (ebb-test-output parser "\e[4h\eP!qignored\e[p")
+    (should (ebb-screen-insert-mode screen))))
+
+(ert-deftest ebb-test-parse-decstr ()
+  "DECSTR resets modes and saved cursor without clearing or moving."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (ebb-test-output parser "X\e[4h\e[2;4r\e[3;4H\e7\e[!p")
+    (should (equal "X" (ebb-test-display-line screen 0)))
+    (should (equal '(3 . 2) (ebb-test-cursor screen)))
+    (should-not (ebb-screen-insert-mode screen))
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 4 (ebb-screen-scroll-bottom screen)))
+    (ebb-test-output parser "\e8")
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-parse-decscl-resets-terminal ()
+  "DECSCL performs a full terminal reset."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "junk\e[3;3H\e[65;1\"p")
+    (should (equal "" (ebb-test-display-line screen 0)))
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-parse-winops-resize-characters ()
+  "CSI 8 t resizes the model and emits a synchronization event."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (let (events)
+      (setf (ebb-parser-emit-fn parser)
+            (lambda (type &rest args) (push (cons type args) events)))
+      (ebb-test-output parser "\e[8;25;80t")
+      (should (= 80 (ebb-screen-width screen)))
+      (should (= 25 (ebb-screen-height screen)))
+      (should (equal '(resize-request 80 25) (car events))))))
 
 (ert-deftest ebb-test-parse-sgr-basic ()
   "Parser handles basic SGR attributes."
@@ -1195,6 +1360,47 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e[2;4r")  ; scroll region rows 2-4 (1-indexed)
     (should (= 1 (ebb-screen-scroll-top screen)))   ; 0-indexed
     (should (= 3 (ebb-screen-scroll-bottom screen)))))
+
+(ert-deftest ebb-test-parse-horizontal-margins ()
+  "DECLRMM and DECSLRM constrain margin-aware cursor operations."
+  (ebb-test-with-screen (:width 20 :height 10)
+    (ebb-test-output parser "\e[?69h\e[5;10s")
+    (should (ebb-screen-horizontal-margins-enabled-p screen))
+    (should (= 4 (ebb-screen-left-margin screen)))
+    (should (= 9 (ebb-screen-right-margin screen)))
+    (ebb-test-output parser "\e[1;6H\e[99C")
+    (should (equal '(9 . 0) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[1;4H\r")
+    (should (equal '(0 . 0) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[1;6H\r")
+    (should (equal '(4 . 0) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[s")
+    (should (= 0 (ebb-screen-left-margin screen)))
+    (should (= 19 (ebb-screen-right-margin screen)))
+    (ebb-test-output parser "\e[?69l")
+    (should-not (ebb-screen-horizontal-margins-enabled-p screen))))
+
+(ert-deftest ebb-test-cursor-movement-respects-active-region ()
+  "Relative movement stops at a margin only when starting inside it."
+  (ebb-test-with-screen (:width 20 :height 10)
+    (ebb-test-output parser "\e[3;6r\e[4;1H\e[99B")
+    (should (equal '(0 . 5) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[8;1H\e[99B")
+    (should (equal '(0 . 9) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[?69h\e[5;10s\e[4;6H\e[99D")
+    (should (equal '(4 . 3) (ebb-test-cursor screen)))
+    (ebb-test-output parser "\e[4;3H\e[99D")
+    (should (equal '(0 . 3) (ebb-test-cursor screen)))))
+
+(ert-deftest ebb-test-origin-mode-reports-relative-horizontal-margins ()
+  "CPR reports coordinates relative to both margins in origin mode."
+  (ebb-test-with-screen (:width 20 :height 10)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e[3;8r\e[?69h\e[5;10s\e[?6h\e[2;3H\e[6n")
+      (should (equal '(6 . 3) (ebb-test-cursor screen)))
+      (should (equal "\e[2;3R" (car responses))))))
 
 (ert-deftest ebb-test-parse-origin-mode ()
   "DECOM makes cursor addressing relative to the scrolling region."
@@ -1804,6 +2010,16 @@ Binds `screen' and `parser' in BODY."
       (let ((s "hello"))
         (ebb-screen-write-string screen s 0 (length s)))
       (should-not (ebb--password-prompt-detected-p)))))
+
+(ert-deftest ebb-test-password-prompt-row-supports-unicode-cells ()
+  "Password detection handles a cell-backed row containing Unicode."
+  (let ((screen (ebb-screen-create 40 3)))
+    (with-temp-buffer
+      (setq-local ebb--screen screen)
+      (setq-local ebb--io 'fake)
+      (let ((s "λ [sudo] password for arthur: "))
+        (ebb-screen-write-string screen s 0 (length s)))
+      (should (ebb--password-prompt-detected-p)))))
 
 (ert-deftest ebb-test-password-prompt-send ()
   "Detected password prompt sends via source chain."
