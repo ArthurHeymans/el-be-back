@@ -611,6 +611,8 @@ only digits and semicolons."
           (?V (ebb-screen-set-iso-protection screen t))
           (?W (ebb-screen-set-iso-protection screen nil))
           (?c (ebb-screen-reset screen)
+              (remhash screen ebb-parse--conformance-levels)
+              (remhash screen ebb-parse--page-lengths)
               (remhash screen ebb-parse--ansi-mode-states)
               (remhash screen ebb-parse--dec-mode-states)
               (ebb-parse--emit parser 'reset))
@@ -819,7 +821,9 @@ only digits and semicolons."
                        (setq col (+ (* col 10) (- ch ?0)))
                      (setq row (+ (* row 10) (- ch ?0)))))
                   ((= ch ?\;)
-                   (setq in-col t))
+                   (if in-col
+                       (setq ok nil)
+                     (setq in-col t)))
                   (t
                    (setq ok nil))))
                (cl-incf i))
@@ -1588,41 +1592,64 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
 
 ;;;; ---- DCS Dispatch ---------------------------------------------------
 
-(defun ebb-parse--sgr-color-status (color foreground)
-  "Return SGR parameters for COLOR as foreground when FOREGROUND is non-nil."
-  (cond
-   ((integerp color)
+(defun ebb-parse--sgr-color-status (color foreground &optional code)
+  "Return SGR parameters for COLOR.
+FOREGROUND selects the legacy foreground/background palette codes unless
+CODE is supplied, in which case CODE is used for extended colors."
+  (let ((base (or code (if foreground 38 48))))
     (cond
-     ((< color 8) (list (+ (if foreground 30 40) color)))
-     ((< color 16) (list (+ (if foreground 90 100) (- color 8))))
-     (t (list (if foreground 38 48) 5 color))))
-   ((and (listp color) (= (length color) 3))
-    (append (list (if foreground 38 48) 2) color))))
+     ((integerp color)
+      (cond
+       ((and (null code) (< color 8))
+        (list (+ (if foreground 30 40) color)))
+       ((and (null code) (< color 16))
+        (list (+ (if foreground 90 100) (- color 8))))
+       (t (list base 5 color))))
+     ((and (listp color) (= (length color) 3))
+      (append (list base 2) color)))))
 
 (defun ebb-parse--sgr-status (screen)
   "Return SCREEN's current rendition as a DECRQSS parameter string."
   (let ((attr (ebb-screen-current-attr screen))
-        (params '(0)))
-    (when (ebb-attr-bold attr) (setq params (append params '(1))))
-    (when (ebb-attr-faint attr) (setq params (append params '(2))))
-    (when (ebb-attr-italic attr) (setq params (append params '(3))))
-    (when (ebb-attr-underline attr) (setq params (append params '(4))))
+        (params '("0")))
+    (when (ebb-attr-bold attr) (setq params (append params '("1"))))
+    (when (ebb-attr-faint attr) (setq params (append params '("2"))))
+    (when (ebb-attr-italic attr) (setq params (append params '("3"))))
+    (when (ebb-attr-underline attr)
+      (setq params
+            (append params
+                    (list (format "4:%d"
+                                  (pcase (ebb-attr-underline attr)
+                                    ('line 1) ('double 2) ('curly 3)
+                                    ('dotted 4) ('dashed 5)
+                                    (_ 1)))))))
+    (when (and (ebb-attr-font attr) (> (ebb-attr-font attr) 0))
+      (setq params (append params
+                           (list (number-to-string
+                                  (+ 10 (ebb-attr-font attr)))))))
     (when (eq (ebb-attr-blink attr) 'slow)
-      (setq params (append params '(5))))
+      (setq params (append params '("5"))))
     (when (eq (ebb-attr-blink attr) 'fast)
-      (setq params (append params '(6))))
-    (when (ebb-attr-inverse attr) (setq params (append params '(7))))
-    (when (ebb-attr-conceal attr) (setq params (append params '(8))))
-    (when (ebb-attr-crossed attr) (setq params (append params '(9))))
+      (setq params (append params '("6"))))
+    (when (ebb-attr-inverse attr) (setq params (append params '("7"))))
+    (when (ebb-attr-conceal attr) (setq params (append params '("8"))))
+    (when (ebb-attr-crossed attr) (setq params (append params '("9"))))
     (when (ebb-attr-fg attr)
       (setq params (append params
-                           (ebb-parse--sgr-color-status
-                            (ebb-attr-fg attr) t))))
+                           (mapcar #'number-to-string
+                                   (ebb-parse--sgr-color-status
+                                    (ebb-attr-fg attr) t)))))
     (when (ebb-attr-bg attr)
       (setq params (append params
-                           (ebb-parse--sgr-color-status
-                            (ebb-attr-bg attr) nil))))
-    (mapconcat #'number-to-string params ";")))
+                           (mapcar #'number-to-string
+                                   (ebb-parse--sgr-color-status
+                                    (ebb-attr-bg attr) nil)))))
+    (when (ebb-attr-ul-color attr)
+      (setq params (append params
+                           (mapcar #'number-to-string
+                                   (ebb-parse--sgr-color-status
+                                    (ebb-attr-ul-color attr) nil 58)))))
+    (mapconcat #'identity params ";")))
 
 (defun ebb-parse--cursor-style-status (screen)
   "Return SCREEN's cursor style as a DECSCUSR parameter."

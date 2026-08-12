@@ -1205,8 +1205,31 @@ Binds `screen' and `parser' in BODY."
       (ebb-test-output parser "\e[2;4r\eP$qr\e\\")
       (should (equal "\eP1$r2;4r\e\\" (car responses)))
       (setq responses nil)
+      (setf (ebb-screen-current-attr screen)
+            (make-ebb-attr :underline 'curly :font 1 :blink 'fast
+                           :conceal t :crossed t :fg 123 :bg '(1 2 3)
+                           :ul-color 4))
+      (ebb-test-output parser "\eP$qm\e\\")
+      (should (equal "\eP1$r0;4:3;11;6;8;9;38;5;123;48;2;1;2;3;58;5;4m\e\\"
+                     (car responses)))
+      (setq responses nil)
       (ebb-test-output parser "\eP$qbogus\e\\")
       (should (equal "\eP0$r\e\\" (car responses))))))
+
+(ert-deftest ebb-test-parse-ris-clears-parser-owned-status ()
+  "RIS clears DECSCL and page-length state used by DECRQSS replies."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (puthash screen 61 ebb-parse--conformance-levels)
+      (puthash screen 27 ebb-parse--page-lengths)
+      (ebb-test-output parser "\ec")
+      (ebb-test-output parser "\eP$q\"p\e\\")
+      (should (equal "\eP1$r65;1\"p\e\\" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\eP$qt\e\\")
+      (should (equal "\eP1$r5t\e\\" (car responses))))))
 
 (ert-deftest ebb-test-parse-decrqcra ()
   "DECRQCRA reports the DEC checksum for the requested rectangle."
