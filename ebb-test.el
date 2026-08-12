@@ -1988,6 +1988,16 @@ Binds `screen' and `parser' in BODY."
         (ebb-screen-write-string screen s 0 (length s)))
       (should-not (ebb--password-prompt-detected-p)))))
 
+(ert-deftest ebb-test-password-prompt-row-supports-unicode-cells ()
+  "Password detection handles a cell-backed row containing Unicode."
+  (let ((screen (ebb-screen-create 40 3)))
+    (with-temp-buffer
+      (setq-local ebb--screen screen)
+      (setq-local ebb--io 'fake)
+      (let ((s "λ [sudo] password for arthur: "))
+        (ebb-screen-write-string screen s 0 (length s)))
+      (should (ebb--password-prompt-detected-p)))))
+
 (ert-deftest ebb-test-password-prompt-send ()
   "Detected password prompt sends via source chain."
   (let ((screen (ebb-screen-create 40 3))

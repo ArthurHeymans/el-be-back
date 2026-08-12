@@ -383,13 +383,17 @@ normal terminal input handling or appear in `view-lossage'."
     (let* ((y (ebb-screen-cursor-y ebb--screen))
            (line (ebb-screen-get-line ebb--screen y))
            (width (ebb-screen-width ebb--screen))
-           (text (or (ebb-line-text line)
-                     (and (ebb-line-cells line)
-                          (let ((cells (ebb-line-cells line))
-                                (out (make-string width ?\s)))
-                            (dotimes (i (min width (length cells)))
-                              (aset out i (ebb-cell-char (aref cells i))))
-                            out)))))
+           (text
+            (or (ebb-line-text line)
+                (and (ebb-line-cells line)
+                     (let ((cells (ebb-line-cells line)))
+                       ;; `aset' cannot populate a string with non-ASCII
+                       ;; character codes.  Build the row through `string'
+                       ;; so cell-backed Unicode remains valid text.
+                       (apply #'string
+                              (cl-loop for i below (min width (length cells))
+                                       collect (ebb-cell-char
+                                                (aref cells i)))))))))
       (when text
         (let ((row (string-trim-right text)))
           (and (not (string-empty-p row)) row))))))
