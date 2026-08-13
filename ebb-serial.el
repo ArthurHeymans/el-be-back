@@ -273,8 +273,6 @@ Emacs does not currently expose a portable serial-break primitive."
   (unless (eq major-mode 'ebb-mode)
     (ebb-mode))
   (ebb-serial-mode 1)
-  (add-hook 'window-size-change-functions
-            #'ebb-serial--resize-terminal-to-window nil t)
   (ebb-serial--install-mode-line)
   (setq ebb-serial--port port)
   (unless (ebb-serial--live-process-p)
@@ -600,7 +598,8 @@ values accepted by `serial-process-configure'."
         (ebb-serial--open-process)))
     (pop-to-buffer-same-window buffer)
     (with-current-buffer buffer
-      (ebb-serial--resize-terminal-to-window))))
+      (ebb-serial--resize-terminal-to-window))
+    buffer))
 
 ;;;###autoload
 (defun ebb-serial-reconnect ()

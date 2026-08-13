@@ -162,6 +162,15 @@
         (should (stringp (ebb-serial-codec-decode state chunk)))))
     (should (stringp (ebb-serial-codec-flush state)))))
 
+(ert-deftest ebb-serial-setup-uses-shared-resize-hook ()
+  (ebb-serial-tests--require-ebb-serial)
+  (with-temp-buffer
+    (ebb-serial--setup-buffer "/tmp/ebb-serial-test-port" 115200)
+    (should (memq #'ebb--window-size-change
+                  window-size-change-functions))
+    (should-not (memq #'ebb-serial--resize-terminal-to-window
+                      window-size-change-functions))))
+
 (ert-deftest ebb-serial-reuses-live-process-and-reconfigures-speed ()
   (ebb-serial-tests--require-ebb-serial)
   (let* ((port "/tmp/ebb-serial-test-port")
@@ -193,7 +202,7 @@
                      (lambda (&rest _) nil))
                     ((symbol-function 'ebb-serial--resize-terminal-to-window)
                      (lambda (&rest _) nil)))
-            (ebb-serial port 115200))
+            (should (eq (ebb-serial port 115200) buffer)))
           (with-current-buffer buffer
             (should (eq ebb-serial--process process))
             (should (equal ebb-serial--speed 115200)))
