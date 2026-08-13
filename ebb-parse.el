@@ -208,10 +208,20 @@ Returns the number of characters consumed."
          ((>= ch #x3fff80)
           (ebb-parse--process-char parser #xfffd)
           (cl-incf i))
-         ;; C1 bytes are controls, not printable characters.  The parser does
-         ;; not currently implement their 8-bit forms, so ignore them just as
-         ;; it ignores unsupported C0 controls.
+         ;; C1 bytes are 8-bit controls.  Only ST (U+009C) is implemented: it
+         ;; terminates a pending control string, mirroring the 7-bit ST
+         ;; (ESC \).  Other 8-bit C1 forms are consumed without effect.
          ((and (>= ch #x80) (<= ch #x9f))
+          (when (= ch #x9c)
+            (pcase (ebb-parser-state parser)
+              (:osc-string (ebb-parse--dispatch-osc parser))
+              (:dcs-passthrough (ebb-parse--dispatch-dcs parser)))
+            ;; An ESC inside a string defers the dispatch to the terminator;
+            ;; complete the pending string here, as the 7-bit ST (ESC \\) does.
+            (when (ebb-parser-string-state parser)
+              (ebb-parse--complete-string parser))
+            (setf (ebb-parser-state parser) :ground
+                  (ebb-parser-string-state parser) nil))
           (cl-incf i))
          (t
           ;; The common case for terminal output is a run of printable text while
@@ -461,11 +471,17 @@ only digits and semicolons."
       (unless inside-dcs
         (setf (ebb-parser-intermediates parser) ""))))
 
+   ;; CAN and SUB abort any in-progress escape sequence, control sequence,
+   ;; or control string and return to the ground state.
+   ((memq ch '(?\x18 ?\x1a))
+    (unless (eq (ebb-parser-state parser) :ground)
+      (ebb-parse-cancel-sequence parser)))
+
    ;; C0 controls (0x00-0x1F) handled inline in most states
    ((and (< ch ?\s)
          (memq (ebb-parser-state parser)
                '(:ground :escape :escape-intermediate
-                 :csi-entry :csi-param :csi-intermediate)))
+                 :csi-entry :csi-param :csi-intermediate :csi-ignored)))
     (ebb-parse--dispatch-c0 parser ch))
 
    ;; DEL -- ignore
@@ -481,6 +497,7 @@ only digits and semicolons."
       (:csi-entry         (ebb-parse--csi-entry parser ch))
       (:csi-param         (ebb-parse--csi-param parser ch))
       (:csi-intermediate  (ebb-parse--csi-intermediate parser ch))
+      (:csi-ignored       (ebb-parse--csi-ignored parser ch))
       (:osc-string        (ebb-parse--osc-string parser ch))
       (:dcs-entry         (ebb-parse--dcs-entry parser ch))
       (:dcs-param         (ebb-parse--dcs-param parser ch))
@@ -675,7 +692,18 @@ only digits and semicolons."
           (concat (ebb-parser-intermediates parser) (string ch))))
    ((and (>= ch ?@) (<= ch ?~))
     (ebb-parse--dispatch-csi parser ch))
+   ;; A parameter byte after an intermediate byte makes the sequence
+   ;; malformed; consume it (and the remaining bytes) without effect.
+   ((and (>= ch ?0) (<= ch ??))
+    (setf (ebb-parser-state parser) :csi-ignored))
    (t (setf (ebb-parser-state parser) :ground))))
+
+(defun ebb-parse--csi-ignored (parser ch)
+  "Consume the remainder of a malformed CSI sequence.
+The sequence ends at the first final byte; C0 controls and ESC are handled
+in process-char."
+  (when (and (>= ch ?@) (<= ch ?~))
+    (setf (ebb-parser-state parser) :ground)))
 
 ;;;; ---- State: OSC String ----------------------------------------------
 
@@ -687,6 +715,8 @@ only digits and semicolons."
     (ebb-parse--dispatch-osc parser)
     (setf (ebb-parser-state parser) :ground))
    ;; ESC handled in process-char
+   ;; C0 controls are discarded while the OSC string continues.
+   ((< ch ?\s) nil)
    ;; Accumulate (limit length for safety)
    ((< (length (ebb-parser-osc-string parser)) 65536)
     (setf (ebb-parser-osc-string parser)
@@ -706,6 +736,8 @@ only digits and semicolons."
    ((and (>= ch ?@) (<= ch ?~))
     (setf (ebb-parser-dcs-final parser) ch)
     (setf (ebb-parser-state parser) :dcs-passthrough))
+   ;; C0 controls are ignored in the DCS header and the state is preserved.
+   ((< ch ?\s) nil)
    (t (setf (ebb-parser-state parser) :ground))))
 
 (defun ebb-parse--dcs-param (parser ch)
@@ -720,6 +752,8 @@ only digits and semicolons."
    ((and (>= ch ?@) (<= ch ?~))
     (setf (ebb-parser-dcs-final parser) ch)
     (setf (ebb-parser-state parser) :dcs-passthrough))
+   ;; C0 controls are ignored in the DCS header and the state is preserved.
+   ((< ch ?\s) nil)
    (t (setf (ebb-parser-state parser) :ground))))
 
 (defun ebb-parse--dcs-passthrough (parser ch)
@@ -791,7 +825,6 @@ only digits and semicolons."
     (aset tbl ?l #'ebb-parse--csi-rm)
     (aset tbl ?m #'ebb-parse--csi-sgr)
     (aset tbl ?n #'ebb-parse--csi-dsr)
-    (aset tbl ?q #'ebb-parse--csi-decscusr)
     (aset tbl ?r #'ebb-parse--csi-decstbm)
     (aset tbl ?s #'ebb-parse--csi-scp)
     (aset tbl ?t #'ebb-parse--csi-winops)
@@ -949,6 +982,10 @@ Return non-nil when the sequence was handled."
       (ebb-screen-set-dec-protection
        screen (= (ebb-parse--param params 0 0) 1))
       t)
+     ;; DECSCUSR - set cursor style.
+     ((and (= final-byte ?q) (string= intermediates " "))
+      (ebb-parse--csi-decscusr parser params)
+      t)
      ;; DECSNLS - set number of lines per screen.
      ((and (= final-byte ?|) (string= intermediates "*"))
       (puthash screen (ebb-parse--param params 0 (ebb-screen-height screen))
@@ -1004,14 +1041,20 @@ Return non-nil when the sequence was handled."
       (let ((param (ebb-parser-param-string parser)))
         (unless (ebb-parse--fast-csi parser final-byte param)
           (let ((params (ebb-parse--parse-params param)))
-            (unless (and (not (string-empty-p
-                               (ebb-parser-intermediates parser)))
-                         (ebb-parse--dispatch-csi-intermediate
-                          parser final-byte params))
-              (let ((handler (if (< final-byte 128)
-                                 (aref ebb-parse--csi-dispatch final-byte)
-                               #'ebb-parse--csi-unknown)))
-                (funcall handler parser params))))))
+            (if (string-empty-p (ebb-parser-intermediates parser))
+                (let ((handler (if (< final-byte 128)
+                                   (aref ebb-parse--csi-dispatch final-byte)
+                                 #'ebb-parse--csi-unknown)))
+                  (funcall handler parser params))
+              ;; Unrecognized intermediate + final-byte combinations are
+              ;; ignored, per the DEC parser's csi-ignored state.  They must
+              ;; not fall through to the plain final-byte table.
+              (unless (ebb-parse--dispatch-csi-intermediate
+                       parser final-byte params)
+                (ebb-parse--log
+                 "Unknown CSI intermediate sequence [%s%c]"
+                 (ebb-parser-intermediates parser)
+                 final-byte))))))
     (error
      (ebb-parse--log "CSI dispatch error for %c: %S" final-byte err)))
   (setf (ebb-parser-state parser) :ground))
@@ -1246,11 +1289,14 @@ Pm=1: read, Pm=4: read maximum."
 
 ;; DECSTBM - Set Scrolling Region
 (defun ebb-parse--csi-decstbm (parser params)
-  (let* ((screen (ebb-parser-screen parser))
-         (h (ebb-screen-height screen))
-         (top (1- (ebb-parse--param params 0 1)))
-         (bot (1- (ebb-parse--param params 1 h))))
-    (ebb-screen-set-scroll-region screen top bot)))
+  ;; DECSTBM is CSI Pt;Pb r without a private marker; CSI ? Ps r is the
+  ;; xterm-specific XTRESTORE extension, which Ebb does not implement.
+  (when (null (ebb-parser-private parser))
+    (let* ((screen (ebb-parser-screen parser))
+           (h (ebb-screen-height screen))
+           (top (1- (ebb-parse--param params 0 1)))
+           (bot (1- (ebb-parse--param params 1 h))))
+      (ebb-screen-set-scroll-region screen top bot))))
 
 ;; SCP / DECSLRM - Save Cursor Position or set left/right margins.
 (defun ebb-parse--csi-scp (parser params)
