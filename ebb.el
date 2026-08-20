@@ -31,6 +31,7 @@
 (require 'ebb-shell)
 
 (declare-function notifications-notify "notifications")
+(defvar xterm-store-paste-on-kill-ring)
 
 ;;;; ---- Customization --------------------------------------------------
 
@@ -360,6 +361,21 @@ sequences."
   "Yank-pop: replace the last yank with the next kill ring entry."
   (interactive)
   (ebb-yank 'rotate))
+
+(defun ebb-xterm-paste (event)
+  "Forward an xterm-paste EVENT to the terminal process.
+The normal `xterm-paste' command inserts into the renderer-owned buffer,
+so the child process never receives the pasted text."
+  (interactive "e")
+  (unless (eq (car-safe event) 'xterm-paste)
+    (error "This command must be bound to an xterm-paste event"))
+  (when-let* ((text (nth 1 event)))
+    (when (bound-and-true-p xterm-store-paste-on-kill-ring)
+      ;; This is incoming clipboard data, not a new copy operation.  Avoid
+      ;; sending it back through `interprogram-cut-function'.
+      (let ((interprogram-cut-function nil))
+        (kill-new text)))
+    (ebb-paste-string text)))
 
 (defun ebb-send-password (&optional password)
   "Read PASSWORD from the minibuffer and send it to the terminal.

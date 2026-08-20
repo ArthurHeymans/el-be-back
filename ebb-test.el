@@ -15,6 +15,8 @@
 (require 'ebb-input)
 (require 'ebb)
 
+(defvar xterm-store-paste-on-kill-ring)
+
 ;;;; ---- Test Helpers ---------------------------------------------------
 
 (defmacro ebb-test-with-screen (spec &rest body)
@@ -2277,6 +2279,36 @@ Binds `screen' and `parser' in BODY."
     (should (equal (list "\e[200~bracketed\e[201~" "plain" "\C-c"
                          "\e[1;6A" "\e[A" (unibyte-string 0 255 ?x))
                    sent))))
+
+(ert-deftest ebb-test-yank-paste-bindings ()
+  "Yank commands and host-terminal paste events route through Ebb."
+  (should (eq (lookup-key ebb-semi-char-mode-map (kbd "C-y")) #'ebb-yank))
+  (should (eq (lookup-key ebb-semi-char-mode-map (kbd "S-<insert>")) #'ebb-yank))
+  (should (eq (lookup-key ebb-semi-char-mode-map [remap yank]) #'ebb-yank))
+  (should (eq (lookup-key ebb-mode-map [xterm-paste]) #'ebb-xterm-paste))
+  (should (eq (lookup-key ebb-mode-map [XF86Paste]) #'ebb-yank)))
+
+(ert-deftest ebb-test-xterm-paste-forwards-to-process ()
+  "An xterm-paste event is sent to the child and optionally saved as a kill."
+  (let ((kill-ring nil)
+        (kill-ring-yank-pointer nil)
+        (xterm-store-paste-on-kill-ring t)
+        clipboard-writes
+        sent)
+    (with-temp-buffer
+      (setq major-mode 'ebb-mode)
+      (setq-local ebb--screen (ebb-screen-create 10 3))
+      (setq-local ebb--io (make-ebb-io :process 'fake))
+      (setf (ebb-screen-bracketed-paste ebb--screen) t)
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'ebb-io-send)
+                 (lambda (_io string) (setq sent string)))
+                (interprogram-cut-function
+                 (lambda (text) (push text clipboard-writes))))
+        (ebb-xterm-paste '(xterm-paste "hello"))))
+    (should (equal sent "\e[200~hello\e[201~"))
+    (should (equal (car kill-ring) "hello"))
+    (should-not clipboard-writes)))
 
 (ert-deftest ebb-test-public-input-api-requires-running-terminal ()
   "Public input commands reject non-terminal and stopped terminal buffers."

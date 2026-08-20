@@ -18,6 +18,7 @@
 (declare-function ebb-quoted-input "ebb")
 (declare-function ebb-yank "ebb")
 (declare-function ebb-yank-pop "ebb")
+(declare-function ebb-xterm-paste "ebb")
 (declare-function ebb-mouse-input "ebb")
 (declare-function ebb-char-mode "ebb")
 (declare-function ebb-semi-char-mode "ebb")
@@ -518,6 +519,8 @@ paste from the kill ring."
                 ,@ebb-semi-char-non-bound-keys))))
     (define-key map (kbd "C-q") #'ebb-quoted-input)
     (define-key map (kbd "C-y") #'ebb-yank)
+    (define-key map (kbd "S-<insert>") #'ebb-yank)
+    (define-key map [remap yank] #'ebb-yank)
     (define-key map (kbd "M-y") #'ebb-yank-pop)
     (when self-interrupt
       ;; C-c C-c sends literal C-c to terminal
@@ -561,6 +564,10 @@ paste from the kill ring."
 
 (defvar ebb-mode-map
   (let ((map (make-sparse-keymap)))
+    ;; Clipboard and host-terminal paste events.
+    (define-key map [XF86Paste] #'ebb-yank)
+    (define-key map [XF86Copy] #'kill-ring-save)
+    (define-key map [xterm-paste] #'ebb-xterm-paste)
     ;; Mode switching
     (define-key map (kbd "C-c M-d") #'ebb-char-mode)
     (define-key map (kbd "C-c C-j") #'ebb-semi-char-mode)
