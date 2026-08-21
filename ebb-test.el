@@ -2153,9 +2153,7 @@ Binds `screen' and `parser' in BODY."
                           :pending-chunks chunks
                           :pending-tail chunks
                           :pending-offset 4
-                          :first-chunk-time (current-time)
-                          :throughput-bytes 2000000
-                          :binary-flood t))
+                          :first-chunk-time (current-time)))
          sent)
     (setf (ebb-parser-state parser) :osc-string
           (ebb-parser-osc-parts parser) (list "l" "a" "i" "t" "r" "a" "p")
@@ -2169,7 +2167,6 @@ Binds `screen' and `parser' in BODY."
     (should-not (ebb-io-pending-tail io))
     (should (zerop (ebb-io-pending-offset io)))
     (should-not (ebb-io-first-chunk-time io))
-    (should-not (ebb-io-binary-flood io))
     (should (eq :ground (ebb-parser-state parser)))
     (should-not (ebb-parser-osc-parts parser))
     (should (zerop (ebb-parser-osc-length parser)))))
@@ -2792,23 +2789,6 @@ Binds `screen' and `parser' in BODY."
           (ebb-io--process-pending io t)
           (ebb-io--process-pending io t))
         (should (equal '(2 1) counts))))))
-
-(ert-deftest ebb-test-io-binary-flood-does-not-drop-output ()
-  "Flood mode still parses pending terminal output."
-  (let* ((screen (ebb-screen-create 10 2))
-         (parser (ebb-parse-create screen)))
-    (with-temp-buffer
-      (let* ((render (ebb-render-create screen (current-buffer)))
-             (io (make-ebb-io :screen screen :parser parser :render render
-                                :buffer (current-buffer) :chunk-size 10)))
-        ;; Force the next chunk over the flood threshold, then ensure parsing
-        ;; still happens instead of skipping bytes.
-        (setf (ebb-io-throughput-time io) (float-time))
-        (setf (ebb-io-throughput-bytes io) 1048576)
-        (ebb-io--enqueue-output io "OK")
-        (ebb-io--process-pending io t)
-        (should (ebb-io-binary-flood io))
-        (should (equal "OK" (ebb-test-display-line screen 0)))))))
 
 (ert-deftest ebb-test-io-sentinel-emits-in-terminal-buffer ()
   "Process exit events run with the terminal buffer current."

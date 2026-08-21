@@ -38,10 +38,6 @@
   (max-latency 0.033)     ; seconds: max delay (~30fps)
   (first-chunk-time nil)  ; float time of first unrendered chunk
   (render-timer nil)      ; pending render timer
-  ;; Throughput monitoring
-  (throughput-time nil)
-  (throughput-bytes 0)
-  (binary-flood nil)
   ;; Error reporting
   (last-processing-error nil)
   (processing-error-count 0))
@@ -159,11 +155,6 @@ This is the supported entry point for non-PTY transports."
                      (offset (ebb-io-pending-offset io))
                      (remaining (- (length bytes) offset))
                      (chunk-size (min remaining budget)))
-                ;; Binary flood detection
-                (ebb-io--update-throughput io chunk-size)
-                ;; Even in flood mode, never silently drop terminal output.
-                ;; The flag is diagnostic/throttling state; parsing remains
-                ;; lossless unless a future user option explicitly suppresses it.
                 (let ((consumed (ebb-parse-bytes
                                  (ebb-io-parser io)
                                  bytes offset (+ offset chunk-size))))
@@ -204,21 +195,6 @@ Repeated identical failures are rate-limited to avoid flooding *Messages*."
              error-data)))
 
 (add-hook 'ebb-io-processing-error-functions #'ebb-io--report-processing-error)
-
-;;;; ---- Binary Flood Detection -----------------------------------------
-
-(defun ebb-io--update-throughput (io chunk-bytes)
-  "Track throughput and detect binary floods."
-  (let ((now (float-time)))
-    (when (or (null (ebb-io-throughput-time io))
-              (> (- now (ebb-io-throughput-time io)) 1.0))
-      ;; Reset window
-      (setf (ebb-io-throughput-time io) now)
-      (setf (ebb-io-throughput-bytes io) 0))
-    (cl-incf (ebb-io-throughput-bytes io) chunk-bytes)
-    ;; Flood if > 1MB/sec
-    (setf (ebb-io-binary-flood io)
-          (> (ebb-io-throughput-bytes io) 1048576))))
 
 ;;;; ---- Command Building -----------------------------------------------
 
@@ -501,10 +477,7 @@ Ebb through `ebb-io--filter'."
         (ebb-io-pending-chunks io) nil
         (ebb-io-pending-tail io) nil
         (ebb-io-pending-offset io) 0
-        (ebb-io-first-chunk-time io) nil
-        (ebb-io-throughput-time io) nil
-        (ebb-io-throughput-bytes io) 0
-        (ebb-io-binary-flood io) nil)
+        (ebb-io-first-chunk-time io) nil)
   (when (ebb-io-parser io)
     (ebb-parse-cancel-sequence (ebb-io-parser io))))
 
