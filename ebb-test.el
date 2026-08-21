@@ -2091,7 +2091,10 @@ Binds `screen' and `parser' in BODY."
         (let ((s "Password: "))
           (ebb-screen-write-string screen s 0 (length s)))
         (ebb--prompt-password))
-      (should (equal '("secret\r") sent))
+      ;; The newline is sent separately and `clear-string' wipes the
+      ;; only string holding the secret after it has been sent.
+      (should (equal "\r" (car sent)))
+      (should (equal (make-string 6 ?\0) (cadr sent)))
       (should-not ebb--password-mode-p)
       (should (eql 0 ebb--password-handled-y)))))
 

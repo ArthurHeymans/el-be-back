@@ -434,8 +434,11 @@ normal terminal input handling or appear in `view-lossage'."
                    'ebb-password-prompt-functions row))
       (setq ebb--password-prompt-active nil)
       (when (and pwd ebb--io)
-        ;; Send before clear-string; process-send-string may keep the string.
-        (ebb-io-send ebb--io (concat pwd "\r"))
+        ;; Send password and newline separately so `clear-string' wipes
+        ;; the only string holding the secret; a concatenation would
+        ;; keep an uncleared copy behind.
+        (ebb-io-send ebb--io pwd)
+        (ebb-io-send ebb--io "\r")
         (clear-string pwd))
       (setq ebb--password-handled-y y
             ebb--password-mode-p nil)
