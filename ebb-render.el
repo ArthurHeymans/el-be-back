@@ -1225,7 +1225,9 @@ hint at the live terminal position."
   (let* ((screen (ebb-render-state-screen render))
          (h (ebb-screen-height screen)))
     (setf (ebb-screen-dirty-lines screen)
-          (number-sequence 0 (1- h)))))
+          (number-sequence 0 (1- h))
+          (ebb-screen-dirty-map screen) (make-vector h t)
+          (ebb-screen-dirty-count screen) h)))
 
 ;;;; ---- Full Re-render (for resize) ------------------------------------
 
