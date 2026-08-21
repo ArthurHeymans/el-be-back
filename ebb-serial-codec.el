@@ -40,8 +40,8 @@ Unicode code point."
 (cl-defstruct (ebb-serial-codec-state
                (:constructor ebb-serial-codec--make-state))
   "State for streaming UTF-8 decoding."
-  (pending "" :type string)
-  (invalid-byte-policy ebb-serial-invalid-byte-policy :type symbol))
+  (pending "")
+  (invalid-byte-policy ebb-serial-invalid-byte-policy))
 
 (defun ebb-serial-codec-make-state (&optional invalid-byte-policy)
   "Return a new serial decoder state.
