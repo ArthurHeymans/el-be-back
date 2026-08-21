@@ -2405,15 +2405,6 @@ Binds `screen' and `parser' in BODY."
   (should (equal '(bar . 2) (ebb-render--cursor-type-for-style :bar)))
   (should (equal '(hbar . 2) (ebb-render--cursor-type-for-style :underline))))
 
-(ert-deftest ebb-test-render-cursor-blink-check ()
-  "Cursor blink detection works."
-  (should (ebb-render--cursor-blink-p :blinking-block))
-  (should (ebb-render--cursor-blink-p :blinking-bar))
-  (should (ebb-render--cursor-blink-p :blinking-underline))
-  (should-not (ebb-render--cursor-blink-p :block))
-  (should-not (ebb-render--cursor-blink-p :bar))
-  (should-not (ebb-render--cursor-blink-p :underline)))
-
 (ert-deftest ebb-test-render-cursor-only-refresh ()
   "Pure cursor movement updates the rendered cursor overlay."
   (let* ((screen (ebb-screen-create 5 3))

@@ -1147,10 +1147,6 @@ styled cell is present."
     (:blinking-bar '(bar . 2))
     (_ 'box)))
 
-(defun ebb-render--cursor-blink-p (style)
-  "Return non-nil if cursor STYLE should blink."
-  (memq style '(:blinking-block :blinking-underline :blinking-bar)))
-
 (defun ebb-render--update-cursor (render)
   "Update the cursor overlay position and visibility.
 
@@ -1197,10 +1193,7 @@ hint at the live terminal position."
             (dolist (win (get-buffer-window-list nil nil t))
               (set-window-point win pos)
               (when viewport-reset
-                (set-window-start win display-begin t))))
-          (if (ebb-render--cursor-blink-p style)
-              (blink-cursor-mode 1)
-            (blink-cursor-mode -1)))))))
+                (set-window-start win display-begin t)))))))))
 
 ;;;; ---- Invalidation ---------------------------------------------------
 
