@@ -134,7 +134,7 @@ A string KEY is committed input text from an input method."
                          ebb-input--arrow-keys-app
                        ebb-input--arrow-keys-normal))
              (base-seq (cdr (assq basic arrows))))
-        (if (and mods (not (equal mods nil)))
+        (if mods
             ;; Modified arrow: ESC [ 1 ; mod A
             (let ((mod-code (ebb-input--modifier-code mods))
                   (final (aref base-seq (1- (length base-seq)))))
@@ -144,7 +144,7 @@ A string KEY is committed input text from an input method."
      ;; ---- Function keys ----
      ((assq basic ebb-input--function-keys)
       (let ((base-seq (cdr (assq basic ebb-input--function-keys))))
-        (if (and mods (not (equal mods nil)))
+        (if mods
             ;; Modified: insert modifier before final char/~
             (ebb-input--add-modifier base-seq mods)
           base-seq)))
@@ -152,7 +152,7 @@ A string KEY is committed input text from an input method."
      ;; ---- Special keys (Insert, Delete, Home, End, Page*) ----
      ((assq basic ebb-input--special-keys)
       (let ((base-seq (cdr (assq basic ebb-input--special-keys))))
-        (if (and mods (not (equal mods nil)))
+        (if mods
             (ebb-input--add-modifier base-seq mods)
           base-seq)))
 
@@ -167,7 +167,7 @@ A string KEY is committed input text from an input method."
      ;; ---- Delete / Deletechar ----
      ((memq basic '(delete deletechar))
       (let ((base "\e[3~"))
-        (if (and mods (not (equal mods nil)))
+        (if mods
             (ebb-input--add-modifier base mods)
           base)))
 
