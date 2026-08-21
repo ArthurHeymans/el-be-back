@@ -345,11 +345,14 @@ N defaults to 1, E defaults to `last-command-event'."
       (when seq
         (ebb-io-send ebb--io seq)))))
 
-(defun ebb-yank ()
+(defun ebb-yank (&optional rotate)
   "Yank (paste) from the kill ring into the terminal.
-If bracketed paste mode is active, wraps in bracketed paste sequences."
+With ROTATE non-nil, replace the last yank with the next kill ring
+entry.  If bracketed paste mode is active, wraps in bracketed paste
+sequences."
   (interactive)
   (when ebb--io
+    (when rotate (current-kill 1))
     (let ((text (current-kill 0)))
       (when text
         (ebb-paste-string text)))))
@@ -357,11 +360,7 @@ If bracketed paste mode is active, wraps in bracketed paste sequences."
 (defun ebb-yank-pop ()
   "Yank-pop: replace the last yank with the next kill ring entry."
   (interactive)
-  (when ebb--io
-    (current-kill 1)
-    (let ((text (current-kill 0)))
-      (when text
-        (ebb-paste-string text)))))
+  (ebb-yank 'rotate))
 
 (defun ebb-send-password (&optional password)
   "Read PASSWORD from the minibuffer and send it to the terminal.
