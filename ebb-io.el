@@ -356,7 +356,10 @@ Returns the path to the temporary file."
 (defun ebb-io--fish-setup-confd (integration-script)
   "Install a fish conf.d snippet that sources INTEGRATION-SCRIPT.
 Fish automatically sources all .fish files in ~/.config/fish/conf.d/
-on startup.  We create a symlink there pointing to our integration script."
+on startup.  We create a small sourcing script there (not a symlink,
+to handle the case where the integration dir moves between Emacs
+sessions).  The snippet is permanent and sources the integration
+script only while EBB_SHELL_INTEGRATION_DIR is set."
   (ignore integration-script)
   (let* ((confd-dir (expand-file-name "fish/conf.d"
                                        (or (getenv "XDG_CONFIG_HOME")
