@@ -198,7 +198,12 @@ If the parameter is a sub-parameter list, return the first element."
 
 (defun ebb-parse-bytes (parser string &optional start end)
   "Parse STRING from START to END through PARSER.
-Returns the number of characters consumed."
+Returns the number of characters consumed.
+
+STRING must be a decoded multibyte string, as produced by the UTF-8
+process decoder or `ebb-serial-codec-decode'.  Raw unibyte bytes are
+interpreted as Latin-1 text with 8-bit C1 controls, which corrupts
+unibyte UTF-8 whose continuation bytes fall below #xa0."
   (let ((i (or start 0))
         (e (or end (length string)))
         (multibyte (multibyte-string-p string))
