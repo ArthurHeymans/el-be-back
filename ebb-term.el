@@ -360,6 +360,15 @@ half of the physical screen columns."
   (prog1 (gethash screen ebb--viewport-reset-screens)
     (remhash screen ebb--viewport-reset-screens)))
 
+;;;; ---- Cell copying helper (used by erase) ----------------------------
+
+(defun copy-ebb-cell (cell)
+  "Return a shallow copy of CELL."
+  (make-ebb-cell :char (ebb-cell-char cell)
+                   :combining (ebb-cell-combining cell)
+                   :width (ebb-cell-width cell)
+                   :attr (ebb-cell-attr cell)))
+
 ;;;; ---- DEC Special Graphics Character Set ------------------------------
 
 (defconst ebb--dec-graphics-map
@@ -3607,15 +3616,6 @@ blank cells contribute zero, matching the original xterm/DEC checksum mode."
 (defun ebb-screen-scrollback-lines (screen)
   "Return current-width physical history rows, oldest first."
   (ebb-screen-scrollback-lines-raw screen))
-
-;;;; ---- Cell copying helper (used by erase) ----------------------------
-
-(defun copy-ebb-cell (cell)
-  "Return a shallow copy of CELL."
-  (make-ebb-cell :char (ebb-cell-char cell)
-                   :combining (ebb-cell-combining cell)
-                   :width (ebb-cell-width cell)
-                   :attr (ebb-cell-attr cell)))
 
 (provide 'ebb-term)
 ;;; ebb-term.el ends here
