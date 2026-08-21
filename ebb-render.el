@@ -1196,9 +1196,12 @@ hint at the live terminal position."
             (setq-local cursor-type nil)
             (goto-char pos)
             (dolist (win (get-buffer-window-list nil nil t))
-              (set-window-point win pos)
-              (when viewport-reset
-                (set-window-start win display-begin t)))))))))
+              (set-window-point win pos)))
+        ;; A pending viewport reset must not be swallowed by emacs
+        ;; input mode, where window-point is left to point.
+        (when viewport-reset
+          (dolist (win (get-buffer-window-list nil nil t))
+            (set-window-start win display-begin t))))))))
 
 ;;;; ---- Invalidation ---------------------------------------------------
 
