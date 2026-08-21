@@ -1367,7 +1367,7 @@ Pm=1: read, Pm=4: read maximum."
            (puthash screen height ebb-parse--page-lengths)
            (ebb-parse--emit parser 'resize-request width height))))
       ;; DECSLPP - set number of lines per page.
-      ((pred (lambda (value) (>= value 24)))
+      ((and value (guard (>= value 24)))
        (puthash screen (ebb-parse--param params 0 24)
                 ebb-parse--page-lengths))
       ;; Report terminal size in chars.
