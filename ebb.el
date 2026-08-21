@@ -1185,7 +1185,9 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
 (defun ebb-other-window (&optional program)
   "Start a terminal in another window."
   (interactive)
-  (let ((buf (ebb program)))
+  ;; `ebb' displays in the selected window; undo that display before
+  ;; switching so the terminal only ever shows up in the other window.
+  (let ((buf (save-window-excursion (ebb program))))
     (when buf
       (switch-to-buffer-other-window buf))))
 
