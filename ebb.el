@@ -667,15 +667,8 @@ Called after each render.  Debounced so short-lived matches don't flash."
      (when ebb-show-title
        (ebb--set-title (car args))))
     ('cwd
-     (let ((path (ebb--cwd-to-path (car args) (cadr args))))
-       ;; Remote: trust the shell's report; a `file-directory-p' here
-       ;; would open a synchronous TRAMP connection on every cd.
-       (when (and path (if (file-remote-p path) t (file-directory-p path)))
-         (setq default-directory (file-name-as-directory path)
-               list-buffers-directory default-directory)
-         (when ebb-buffer-name-function
-           (ebb--rename-managed
-            (funcall ebb-buffer-name-function ebb--title))))))
+     (ebb--set-shell-cwd
+      (ebb--cwd-to-path (car args) (cadr args))))
     ('cursor-style
      ;; Could update cursor display here
      nil)
@@ -965,6 +958,19 @@ Called after each render.  Debounced so short-lived matches don't flash."
       (yes-or-no-p "Terminal process is running.  Kill buffer? ")))
 
 ;;;; ---- Entry Points ---------------------------------------------------
+
+(defun ebb--set-shell-cwd (path)
+  "Adopt the shell-reported working directory PATH.
+Remote reports are trusted; a local path must exist (a synchronous
+TRAMP `file-directory-p' would open a connection on every cd).
+Also updates `list-buffers-directory' and renames the buffer when
+`ebb-buffer-name-function' is set."
+  (when (and path (if (file-remote-p path) t (file-directory-p path)))
+    (setq default-directory (file-name-as-directory path)
+          list-buffers-directory default-directory)
+    (when ebb-buffer-name-function
+      (ebb--rename-managed
+       (funcall ebb-buffer-name-function ebb--title)))))
 
 (defun ebb--buffers ()
   "Return live Ebb buffers sorted by name."
