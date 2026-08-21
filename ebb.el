@@ -758,8 +758,11 @@ Called after each render.  Debounced so short-lived matches don't flash."
              (not (cl-some (lambda (buf)
                              (and (not (eq buf (current-buffer)))
                                   (buffer-live-p buf)
-                                  (eq (buffer-local-value 'major-mode buf)
-                                      'ebb-mode)))
+                                  (or (eq (buffer-local-value 'major-mode buf)
+                                          'ebb-mode)
+                                      ;; Inline Eshell terminals keep the
+                                      ;; model in ordinary Eshell buffers.
+                                      (buffer-local-value 'ebb--io buf))))
                            (buffer-list))))
     (remove-function after-focus-change-function #'ebb--focus-change)
     (setq ebb--focus-change-installed nil)))
