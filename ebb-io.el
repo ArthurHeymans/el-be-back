@@ -453,10 +453,18 @@ local paths), and TERM is chosen by an on-remote probe; see
     (setf (ebb-io-process io) proc)
     (setf (ebb-io-buffer io) buffer)
     ;; Remember the temporary bash integration rcfile so the sentinel
-    ;; can delete it once the shell exits.
+    ;; can delete it once the shell exits.  Only files Ebb itself
+    ;; created are cleaned up; a user-supplied --rcfile is left alone.
     (let ((pos (seq-position cmd "--rcfile")))
       (when pos
-        (process-put proc 'ebb-bashrc (nth (1+ pos) cmd))))
+        (let ((rcfile (nth (1+ pos) cmd)))
+          (when (and (stringp rcfile)
+                     (string-prefix-p "ebb-bashrc-"
+                                      (file-name-nondirectory rcfile))
+                     (string-prefix-p
+                      (file-name-as-directory temporary-file-directory)
+                      rcfile))
+            (process-put proc 'ebb-bashrc rcfile)))))
     proc))
 
 (defun ebb-io-attach (io process buffer)
@@ -469,14 +477,14 @@ Ebb through `ebb-io--filter'."
         (lambda (string) (ebb-io-send io string)))
   process)
 
-(defun ebb-io--sentinel (io _proc event)
+(defun ebb-io--sentinel (io proc event)
   "Handle process state changes."
   (when (string-match-p "\\(finished\\|exited\\|killed\\|deleted\\)" event)
-    ;; Delete the temporary bash integration rcfile, if any.
-    (let ((process (ebb-io-process io)))
-      (when-let* ((rcfile (and (processp process)
-                               (process-get process 'ebb-bashrc))))
-        (ignore-errors (delete-file rcfile))))
+    ;; Delete the temporary bash integration rcfile, if any.  Read it
+    ;; from PROC, not from IO, whose process slot may already be nil.
+    (when-let* ((rcfile (and (processp proc)
+                             (process-get proc 'ebb-bashrc))))
+      (ignore-errors (delete-file rcfile)))
     (when (buffer-live-p (ebb-io-buffer io))
       (with-current-buffer (ebb-io-buffer io)
         (when (ebb-io-render-timer io)
