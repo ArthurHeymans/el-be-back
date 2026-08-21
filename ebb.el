@@ -663,8 +663,9 @@ Called after each render.  Debounced so short-lived matches don't flash."
      (when ebb-show-title
        (ebb--set-title (car args))))
     ('cwd
-     (ebb--set-shell-cwd
-      (ebb--cwd-to-path (car args) (cadr args))))
+     (when ebb-enable-directory-tracking
+       (ebb--set-shell-cwd
+        (ebb--cwd-to-path (car args) (cadr args)))))
     ('cursor-style
      ;; Could update cursor display here
      nil)
