@@ -451,6 +451,11 @@ local paths), and TERM is chosen by an on-remote probe; see
     ;; Store
     (setf (ebb-io-process io) proc)
     (setf (ebb-io-buffer io) buffer)
+    ;; Remember the temporary bash integration rcfile so the sentinel
+    ;; can delete it once the shell exits.
+    (let ((pos (seq-position cmd "--rcfile")))
+      (when pos
+        (process-put proc 'ebb-bashrc (nth (1+ pos) cmd))))
     proc))
 
 (defun ebb-io-attach (io process buffer)
@@ -466,6 +471,11 @@ Ebb through `ebb-io--filter'."
 (defun ebb-io--sentinel (io _proc event)
   "Handle process state changes."
   (when (string-match-p "\\(finished\\|exited\\|killed\\|deleted\\)" event)
+    ;; Delete the temporary bash integration rcfile, if any.
+    (let ((process (ebb-io-process io)))
+      (when-let* ((rcfile (and (processp process)
+                               (process-get process 'ebb-bashrc))))
+        (ignore-errors (delete-file rcfile))))
     (when (buffer-live-p (ebb-io-buffer io))
       (with-current-buffer (ebb-io-buffer io)
         (when (ebb-io-render-timer io)
