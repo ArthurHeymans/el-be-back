@@ -424,7 +424,12 @@ state are reconciled independently so metadata-only updates are visible."
                 (save-excursion
                   (ebb-render-goto-anchor render window-anchor t)
                   (set-window-start saved-window (point) t)))))
-          (run-hook-with-args 'ebb-render-after-refresh-hook render)))
+          ;; Hook errors must not leave the dirty state set, or every
+          ;; subsequent refresh would re-render the same rows forever.
+          (condition-case hook-error
+              (run-hook-with-args 'ebb-render-after-refresh-hook render)
+            (error (message "[ebb] after-refresh hook error: %S"
+                            hook-error)))))
       (ebb-screen-clear-dirty screen))))
 
 ;;;; ---- Scrollback Rendering -------------------------------------------
