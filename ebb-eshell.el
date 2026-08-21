@@ -57,15 +57,8 @@
     map))
 
 (defun ebb-eshell--semi-char-map ()
-  (let ((map (ebb-input-make-keymap
-              #'ebb-self-input '(:ascii :arrow :navigation)
-              `([?\C-c] [?\C-q] [?\C-y] [?\e ?y]
-                ,@ebb-semi-char-non-bound-keys))))
-    (define-key map [?\C-q] #'ebb-quoted-input)
-    (define-key map [?\C-y] #'ebb-yank)
-    (define-key map [?\M-y] #'ebb-yank-pop)
-    (define-key map (kbd "C-c C-e") #'ebb-eshell-emacs-mode)
-    map))
+  (ebb-input-make-semi-char-map '(:ascii :arrow :navigation)
+                                  #'ebb-eshell-emacs-mode))
 
 (defvar ebb-eshell-semi-char-mode-map
   (ignore-errors (ebb-eshell--semi-char-map)))
@@ -104,37 +97,34 @@
                                     ebb-eshell-char-mode-map
                                     ebb-eshell--char-mode))
 
+(defun ebb-eshell--switch-input-mode (mode &optional read-only)
+  "Enable the inline terminal minor modes for MODE.
+READ-ONLY also toggles the buffer's read-only state (emacs mode is
+read-only; the terminal modes are writable)."
+  (ebb-eshell--semi-char-mode (if (eq mode 'semi-char) 1 -1))
+  (ebb-eshell--char-mode (if (eq mode 'char) 1 -1))
+  (setq ebb-eshell--input-mode mode
+        ebb--input-mode mode)
+  (when read-only
+    (setq buffer-read-only (eq mode 'emacs)))
+  (force-mode-line-update))
+
 (defun ebb-eshell-emacs-mode ()
   "Switch the inline terminal to normal Eshell keybindings."
   (interactive)
-  (ebb-eshell--semi-char-mode -1)
-  (ebb-eshell--char-mode -1)
-  (setq ebb-eshell--input-mode 'emacs
-        ebb--input-mode 'emacs
-        buffer-read-only t)
-  (force-mode-line-update))
+  (ebb-eshell--switch-input-mode 'emacs t))
 
 (defun ebb-eshell-semi-char-mode ()
   "Switch the inline terminal to semi-char keybindings."
   (interactive)
   (when ebb-eshell--io
-    (setq buffer-read-only nil)
-    (ebb-eshell--char-mode -1)
-    (ebb-eshell--semi-char-mode 1)
-    (setq ebb-eshell--input-mode 'semi-char
-          ebb--input-mode 'semi-char)
-    (force-mode-line-update)))
+    (ebb-eshell--switch-input-mode 'semi-char t)))
 
 (defun ebb-eshell-char-mode ()
   "Switch the inline terminal to char keybindings."
   (interactive)
   (when ebb-eshell--io
-    (setq buffer-read-only nil)
-    (ebb-eshell--semi-char-mode -1)
-    (ebb-eshell--char-mode 1)
-    (setq ebb-eshell--input-mode 'char
-          ebb--input-mode 'char)
-    (force-mode-line-update)))
+    (ebb-eshell--switch-input-mode 'char t)))
 
 ;;;; Inline terminal lifecycle
 

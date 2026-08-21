@@ -222,32 +222,28 @@ Options: `char', `semi-char', `emacs'."
   (when ebb--render
     (ebb-render--update-cursor ebb--render)))
 
+(defun ebb--switch-input-mode (mode)
+  "Enable the minor modes for input MODE and record it."
+  (ebb--semi-char-mode (if (eq mode 'semi-char) 1 -1))
+  (ebb--char-mode (if (eq mode 'char) 1 -1))
+  (setq ebb--input-mode mode)
+  (ebb--refresh-input-cursor)
+  (force-mode-line-update))
+
 (defun ebb-semi-char-mode ()
   "Switch to semi-char input mode."
   (interactive)
-  (ebb--char-mode -1)
-  (ebb--semi-char-mode 1)
-  (setq ebb--input-mode 'semi-char)
-  (ebb--refresh-input-cursor)
-  (force-mode-line-update))
+  (ebb--switch-input-mode 'semi-char))
 
 (defun ebb-char-mode ()
   "Switch to char input mode (all keys to terminal)."
   (interactive)
-  (ebb--semi-char-mode -1)
-  (ebb--char-mode 1)
-  (setq ebb--input-mode 'char)
-  (ebb--refresh-input-cursor)
-  (force-mode-line-update))
+  (ebb--switch-input-mode 'char))
 
 (defun ebb-emacs-mode ()
   "Switch to Emacs input mode (normal Emacs keys)."
   (interactive)
-  (ebb--semi-char-mode -1)
-  (ebb--char-mode -1)
-  (setq ebb--input-mode 'emacs)
-  (ebb--refresh-input-cursor)
-  (force-mode-line-update))
+  (ebb--switch-input-mode 'emacs))
 
 ;;;; ---- Self-Input Command ---------------------------------------------
 

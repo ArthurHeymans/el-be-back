@@ -498,19 +498,30 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
 
 ;;;; ---- Semi-Char Keymap -----------------------------------------------
 
-(defun ebb--prepare-semi-char-mode-map ()
-  "Build the semi-char mode keymap."
+(defun ebb-input-make-semi-char-map (categories emacs-mode-command
+                                                 &optional self-interrupt)
+  "Build a semi-char mode keymap for CATEGORIES.
+CATEGORIES passes to `ebb-input-make-keymap'.  EMACS-MODE-COMMAND is
+bound to C-c C-e to leave terminal input.  With SELF-INTERRUPT,
+C-c C-c sends a literal C-c to the terminal.  C-q quotes, and C-y/M-y
+paste from the kill ring."
   (let ((map (ebb-input-make-keymap
-              #'ebb-self-input '(:ascii :arrow :navigation :function)
+              #'ebb-self-input categories
               `([?\C-c] [?\C-q] [?\C-y] [?\e ?y]
                 ,@ebb-semi-char-non-bound-keys))))
-    ;; Overrides
     (define-key map (kbd "C-q") #'ebb-quoted-input)
     (define-key map (kbd "C-y") #'ebb-yank)
     (define-key map (kbd "M-y") #'ebb-yank-pop)
-    ;; C-c C-c sends literal C-c to terminal
-    (define-key map (kbd "C-c C-c") #'ebb-self-input)
+    (when self-interrupt
+      ;; C-c C-c sends literal C-c to terminal
+      (define-key map (kbd "C-c C-c") #'ebb-self-input))
+    (define-key map (kbd "C-c C-e") emacs-mode-command)
     map))
+
+(defun ebb--prepare-semi-char-mode-map ()
+  "Build the semi-char mode keymap."
+  (ebb-input-make-semi-char-map '(:ascii :arrow :navigation :function)
+                                  #'ebb-emacs-mode t))
 
 (defvar ebb-semi-char-mode-map
   (ignore-errors (ebb--prepare-semi-char-mode-map))
