@@ -1324,6 +1324,22 @@ Binds `screen' and `parser' in BODY."
            (attr (ebb-cell-attr cell)))
       (should (= 196 (ebb-attr-fg attr))))))
 
+(ert-deftest ebb-test-parse-sgr-256color-truncated ()
+  "A truncated 256-color sequence does not read padded parameters."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e[38;5mR\e[0m")
+    (let* ((line (ebb-screen-get-line screen 0))
+           (cell (aref (ebb-line-cells line) 0))
+           (attr (ebb-cell-attr cell)))
+      ;; Default attribute: no foreground was set from the padded zeros.
+      (should (or (null attr) (null (ebb-attr-fg attr)))))))
+
+(ert-deftest ebb-test-parse-cup-extra-semicolon ()
+  "CUP with a second semicolon falls back to the generic parser."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "A\e[1;2;3HB")
+    (should (equal "AB" (ebb-test-display-line screen 0)))))
+
 (ert-deftest ebb-test-parse-sgr-256color-followed-by-reset ()
   "A palette color does not consume a following SGR parameter."
   (ebb-test-with-screen (:width 20 :height 6)

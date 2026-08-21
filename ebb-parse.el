@@ -320,15 +320,20 @@ of the simple forms handled here."
             (let ((screen (ebb-parser-screen parser)))
               (cond
                ((= c ?H)
-                (when-let* ((coords (ebb-parse--cup-coords string start j)))
-                  (ebb-screen-cursor-goto screen
-                                            (1- (if (zerop (car coords))
-                                                    1
-                                                  (car coords)))
-                                            (1- (if (zerop (cdr coords))
-                                                    1
-                                                  (cdr coords))))
-                  (throw 'done (1+ j))))
+                ;; Malformed parameters (e.g. a second semicolon) fall
+                ;; back to the generic parser; consuming nothing here
+                ;; would leave the scan loop spinning on this byte.
+                (if-let* ((coords (ebb-parse--cup-coords string start j)))
+                    (progn
+                      (ebb-screen-cursor-goto screen
+                                              (1- (if (zerop (car coords))
+                                                      1
+                                                    (car coords)))
+                                              (1- (if (zerop (cdr coords))
+                                                      1
+                                                    (cdr coords))))
+                      (throw 'done (1+ j)))
+                  (throw 'done nil)))
                ((and (= c ?J)
                      (= (- j start) 1)
                      (= (aref string start) ?2))
@@ -375,8 +380,9 @@ only digits and semicolons."
             (cl-incf i))
           (let ((idx 0))
             (while (< idx count)
-              (setq idx (+ idx (ebb-parse--sgr-step screen params idx))))
-              t)))))))
+              (setq idx (+ idx (ebb-parse--sgr-step
+                                screen params idx count))))
+            t)))))))
 
 (defun ebb-parse--fast-simple-sgr-at (screen string start end)
   "Handle the shortest and most frequent SGR forms in STRING[START, END)."
@@ -1326,10 +1332,12 @@ Pm=1: read, Pm=4: read maximum."
         (`(2 ,_color-space ,r ,g ,b)
          (ebb-screen-set-attr screen property (list r g b)))))))
 
-(defun ebb-parse--set-semicolon-sgr-color (screen params index attribute)
+(defun ebb-parse--set-semicolon-sgr-color (screen params index attribute
+                                                 &optional count)
   "Set SCREEN's ATTRIBUTE from semicolon-form PARAMS at INDEX.
-Return the number of additional parameters consumed."
-  (let ((len (length params)))
+COUNT bounds PARAMS when the vector is padded past its parsed
+length.  Return the number of additional parameters consumed."
+  (let ((len (or count (length params))))
     (if (>= (1+ index) len)
         0
       (let ((sub (aref params (1+ index))))
@@ -1363,11 +1371,13 @@ Return the number of additional parameters consumed."
     ((or 38 48 58)
      (ebb-parse--set-colon-sgr-color screen param))))
 
-(defun ebb-parse--sgr-step (screen params index)
+(defun ebb-parse--sgr-step (screen params index &optional count)
   "Apply the SGR parameter PARAMS[INDEX] on SCREEN.
-Returns the total number of entries consumed, which is more than one
-for extended color forms (38/48/58).  Colon sub-parameter lists are
-handled here too, so this is the single dispatch point for SGR."
+COUNT bounds PARAMS when the vector is padded past its parsed
+length.  Returns the total number of entries consumed, which is more
+than one for extended color forms (38/48/58).  Colon sub-parameter
+lists are handled here too, so this is the single dispatch point for
+SGR."
   (let ((param (aref params index)))
     (cond
      ((listp param)
@@ -1376,7 +1386,8 @@ handled here too, so this is the single dispatch point for SGR."
      ((memq param '(38 48 58))
       (+ 1 (ebb-parse--set-semicolon-sgr-color
             screen params index
-            (pcase param (38 :fg) (48 :bg) (58 :ul-color)))))
+            (pcase param (38 :fg) (48 :bg) (58 :ul-color))
+            count)))
      (t
       (ebb-parse--apply-simple-sgr screen param)
       1))))
