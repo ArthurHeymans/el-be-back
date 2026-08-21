@@ -375,82 +375,8 @@ only digits and semicolons."
             (cl-incf i))
           (let ((idx 0))
             (while (< idx count)
-              (let ((p (aref params idx)))
-                (cond
-                 ((= p 0)  (ebb-screen-reset-attr screen))
-                 ((= p 1)  (ebb-screen-set-attr screen :bold t))
-                 ((= p 2)  (ebb-screen-set-attr screen :faint t))
-                 ((= p 3)  (ebb-screen-set-attr screen :italic t))
-                 ((= p 4)  (ebb-screen-set-attr screen :underline 'line))
-                 ((= p 5)  (ebb-screen-set-attr screen :blink 'slow))
-                 ((= p 6)  (ebb-screen-set-attr screen :blink 'fast))
-                 ((= p 7)  (ebb-screen-set-attr screen :inverse t))
-                 ((= p 8)  (ebb-screen-set-attr screen :conceal t))
-                 ((= p 9)  (ebb-screen-set-attr screen :crossed t))
-                 ((and (>= p 10) (<= p 19))
-                  (ebb-screen-set-attr screen :font (- p 10)))
-                 ((= p 21) (ebb-screen-set-attr screen :underline 'double))
-                 ((= p 22) (ebb-screen-set-attr screen :bold nil)
-                            (ebb-screen-set-attr screen :faint nil))
-                 ((= p 23) (ebb-screen-set-attr screen :italic nil))
-                 ((= p 24) (ebb-screen-set-attr screen :underline nil))
-                 ((= p 25) (ebb-screen-set-attr screen :blink nil))
-                 ((= p 27) (ebb-screen-set-attr screen :inverse nil))
-                 ((= p 28) (ebb-screen-set-attr screen :conceal nil))
-                 ((= p 29) (ebb-screen-set-attr screen :crossed nil))
-                 ((and (>= p 30) (<= p 37))
-                  (ebb-screen-set-attr screen :fg (- p 30)))
-                 ((= p 38)
-                  (cond
-                   ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (ebb-screen-set-attr screen :fg (aref params (+ idx 2)))
-                    (cl-incf idx 2))
-                   ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (ebb-screen-set-attr
-                     screen :fg
-                     (list (aref params (+ idx 2))
-                           (aref params (+ idx 3))
-                           (aref params (+ idx 4))))
-                    (cl-incf idx 4))
-                   (t (throw 'fallback nil))))
-                 ((= p 39) (ebb-screen-set-attr screen :fg nil))
-                 ((and (>= p 40) (<= p 47))
-                  (ebb-screen-set-attr screen :bg (- p 40)))
-                 ((= p 48)
-                  (cond
-                   ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (ebb-screen-set-attr screen :bg (aref params (+ idx 2)))
-                    (cl-incf idx 2))
-                   ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (ebb-screen-set-attr
-                     screen :bg
-                     (list (aref params (+ idx 2))
-                           (aref params (+ idx 3))
-                           (aref params (+ idx 4))))
-                    (cl-incf idx 4))
-                   (t (throw 'fallback nil))))
-                 ((= p 49) (ebb-screen-set-attr screen :bg nil))
-                 ((= p 58)
-                  (cond
-                   ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (ebb-screen-set-attr screen :ul-color (aref params (+ idx 2)))
-                    (cl-incf idx 2))
-                   ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (ebb-screen-set-attr
-                     screen :ul-color
-                     (list (aref params (+ idx 2))
-                           (aref params (+ idx 3))
-                           (aref params (+ idx 4))))
-                    (cl-incf idx 4))
-                   (t (throw 'fallback nil))))
-                 ((= p 59) (ebb-screen-set-attr screen :ul-color nil))
-                 ((and (>= p 90) (<= p 97))
-                  (ebb-screen-set-attr screen :fg (+ 8 (- p 90))))
-                 ((and (>= p 100) (<= p 107))
-                  (ebb-screen-set-attr screen :bg (+ 8 (- p 100))))
-                 (t (throw 'fallback nil))))
-              (cl-incf idx)))
-          t))))))
+              (setq idx (+ idx (ebb-parse--sgr-step screen params idx))))
+              t)))))))
 
 (defun ebb-parse--fast-simple-sgr-at (screen string start end)
   "Handle the shortest and most frequent SGR forms in STRING[START, END)."
@@ -1437,6 +1363,24 @@ Return the number of additional parameters consumed."
     ((or 38 48 58)
      (ebb-parse--set-colon-sgr-color screen param))))
 
+(defun ebb-parse--sgr-step (screen params index)
+  "Apply the SGR parameter PARAMS[INDEX] on SCREEN.
+Returns the total number of entries consumed, which is more than one
+for extended color forms (38/48/58).  Colon sub-parameter lists are
+handled here too, so this is the single dispatch point for SGR."
+  (let ((param (aref params index)))
+    (cond
+     ((listp param)
+      (ebb-parse--apply-colon-sgr screen param)
+      1)
+     ((memq param '(38 48 58))
+      (+ 1 (ebb-parse--set-semicolon-sgr-color
+            screen params index
+            (pcase param (38 :fg) (48 :bg) (58 :ul-color)))))
+     (t
+      (ebb-parse--apply-simple-sgr screen param)
+      1))))
+
 (defun ebb-parse--apply-simple-sgr (screen param)
   "Apply non-extended numeric SGR PARAM to SCREEN."
   (cond
@@ -1479,19 +1423,8 @@ Private CSI sequences ending in `m' are not SGR and are ignored."
           (ebb-screen-reset-attr screen)
         (let ((i 0))
           (while (< i len)
-            (let ((param (aref params i)))
-              (cond
-               ((listp param)
-                (ebb-parse--apply-colon-sgr screen param))
-               ((memq param '(38 48 58))
-                (cl-incf
-                 i
-                 (ebb-parse--set-semicolon-sgr-color
-                  screen params i
-                  (pcase param (38 :fg) (48 :bg) (58 :ul-color)))))
-               (t
-                (ebb-parse--apply-simple-sgr screen param))))
-            (cl-incf i)))))))
+            (setq i (+ i (ebb-parse--sgr-step screen params i)))))))))
+
 
 ;;;; ---- OSC Helpers ----------------------------------------------------
 
