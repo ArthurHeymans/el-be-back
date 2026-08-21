@@ -488,7 +488,9 @@ Unibyte strings are always sent unchanged.  Sending an interrupt discards
 queued output so the interrupted program's prompt is not stuck behind it."
   (when-let* ((proc (ebb-io-process io)))
     (when (process-live-p proc)
-      (when (string-search "\C-c" string)
+      ;; Only a bare interrupt discards queued output; pasted text that
+      ;; merely contains ^C must pass through untouched.
+      (when (string= string "\C-c")
         (ebb-io--prepare-interrupt io))
       (let ((coding (ebb-io-input-coding-system io)))
         (process-send-string
