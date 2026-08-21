@@ -283,6 +283,28 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
               (cl-incf i)))))))
     (- i (or start 0))))
 
+(defsubst ebb-parse--cup-coords (string start end)
+  "Parse row;col digits in STRING[START, END) as (ROW . COL).
+Return nil when the region contains a second semicolon or any
+non-parameter byte."
+  (let ((row 0)
+        (col 0)
+        (in-col nil)
+        (ok t)
+        (k start))
+    (while (and ok (< k end))
+      (let ((ch (aref string k)))
+        (cond
+         ((and (>= ch ?0) (<= ch ?9))
+          (if in-col
+              (setq col (+ (* col 10) (- ch ?0)))
+            (setq row (+ (* row 10) (- ch ?0)))))
+         ((= ch ?\;)
+          (if in-col (setq ok nil) (setq in-col t)))
+         (t (setq ok nil))))
+      (cl-incf k))
+    (and ok (cons row col))))
+
 (defun ebb-parse--fast-csi-at (parser string start end)
   "Handle a common CSI beginning at START, returning the next index.
 START is the first byte after ESC [.  Return nil when the sequence is not one
@@ -298,23 +320,14 @@ of the simple forms handled here."
             (let ((screen (ebb-parser-screen parser)))
               (cond
                ((= c ?H)
-                (let ((row 0)
-                      (col 0)
-                      (in-col nil)
-                      (k start))
-                  (while (< k j)
-                    (let ((p (aref string k)))
-                      (if (= p ?\;)
-                          (if in-col
-                              (throw 'done nil)
-                            (setq in-col t))
-                        (if in-col
-                            (setq col (+ (* col 10) (- p ?0)))
-                          (setq row (+ (* row 10) (- p ?0))))))
-                    (cl-incf k))
+                (when-let* ((coords (ebb-parse--cup-coords string start j)))
                   (ebb-screen-cursor-goto screen
-                                            (1- (if (zerop row) 1 row))
-                                            (1- (if (zerop col) 1 col)))
+                                            (1- (if (zerop (car coords))
+                                                    1
+                                                  (car coords)))
+                                            (1- (if (zerop (cdr coords))
+                                                    1
+                                                  (cdr coords))))
                   (throw 'done (1+ j))))
                ((and (= c ?J)
                      (= (- j start) 1)
@@ -851,31 +864,16 @@ in process-char."
          (cond
           ;; TUI repaint streams are dominated by row/column addressing.
           ((= final-byte ?H)
-           (let ((row 0)
-                 (col 0)
-                 (in-col nil)
-                 (ok t)
-                 (i 0)
-                 (len (length param)))
-             (while (and ok (< i len))
-               (let ((ch (aref param i)))
-                 (cond
-                  ((and (>= ch ?0) (<= ch ?9))
-                   (if in-col
-                       (setq col (+ (* col 10) (- ch ?0)))
-                     (setq row (+ (* row 10) (- ch ?0)))))
-                  ((= ch ?\;)
-                   (if in-col
-                       (setq ok nil)
-                     (setq in-col t)))
-                  (t
-                   (setq ok nil))))
-               (cl-incf i))
-             (when ok
-               (ebb-screen-cursor-goto screen
-                                         (1- (if (zerop row) 1 row))
-                                         (1- (if (zerop col) 1 col)))
-               t)))
+           (when-let* ((coords (ebb-parse--cup-coords
+                                param 0 (length param))))
+             (ebb-screen-cursor-goto screen
+                                     (1- (if (zerop (car coords))
+                                             1
+                                           (car coords)))
+                                     (1- (if (zerop (cdr coords))
+                                             1
+                                           (cdr coords))))
+             t))
           ;; Full-screen clear is common at frame start.
           ((and (= final-byte ?J)
                 (= (length param) 1)
