@@ -1334,9 +1334,6 @@ Local paths omit the hostname; remote TRAMP paths keep the host."
                ebb--progress))
    " "))
 
-;; Add to mode-line
-(put 'ebb--input-mode 'risky-local-variable t)
-
 (add-hook 'ebb-io-after-render-functions #'ebb--detect-password-prompt)
 
 (require 'ebb-eshell)
