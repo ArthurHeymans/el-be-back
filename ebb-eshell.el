@@ -181,25 +181,15 @@
 (defun ebb-eshell--setup (process)
   "Attach a Ebb terminal to Eshell PROCESS at its output marker."
   (unless ebb-eshell--io
-    (let* ((window (or (get-buffer-window (current-buffer)) (selected-window)))
-           (width (max 10 (window-max-chars-per-line window)))
-           (height (max 3 (window-body-height window)))
-           (start (if (marker-buffer (process-mark process))
+    (let* ((start (if (marker-buffer (process-mark process))
                       (process-mark process) (point-max)))
-           (screen (ebb-screen-create width height)))
-      (setf (ebb-screen-scrollback-max screen) ebb-scrollback-lines)
-      (setq-local ebb--screen screen)
-      (setq-local ebb--render
-                  (ebb-render-create screen (current-buffer) start start))
-      (setq-local ebb--parser
-                  (ebb-parse-create screen nil #'ebb-eshell--event))
-      (setq-local ebb--io
-                  (make-ebb-io :screen screen :parser ebb--parser
-                                 :render ebb--render :buffer (current-buffer)
-                                 :chunk-size ebb-chunk-size
-                                 :min-latency ebb-minimum-latency
-                                 :max-latency ebb-maximum-latency))
-      (setq-local ebb-eshell--io ebb--io)
+           (io (ebb-io-create-terminal (current-buffer)
+                                         #'ebb-eshell--event start start)))
+      (setq-local ebb--screen (ebb-io-screen io))
+      (setq-local ebb--render (ebb-io-render io))
+      (setq-local ebb--parser (ebb-io-parser io))
+      (setq-local ebb--io io)
+      (setq-local ebb-eshell--io io)
       ;; Avoid terminal OSC directory/title state changing the Eshell buffer.
       (setq-local ebb-enable-directory-tracking nil)
       (setq-local ebb-buffer-name-function nil)

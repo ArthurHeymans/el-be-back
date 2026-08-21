@@ -1139,28 +1139,11 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
     (with-current-buffer buf
       (ebb-mode)
       (setq ebb--session-id (buffer-name buf))
-      ;; Determine initial size from a window
-      (let* ((win (or (get-buffer-window buf)
-                      (selected-window)))
-             (width (max (window-max-chars-per-line win) 10))
-             (height (max (window-body-height win) 3)))
-        ;; Create screen model
-        (setq ebb--screen (ebb-screen-create width height))
-        (setf (ebb-screen-scrollback-max ebb--screen) ebb-scrollback-lines)
-        ;; Create renderer
-        (setq ebb--render (ebb-render-create ebb--screen buf))
-        ;; Create parser
-        (setq ebb--parser (ebb-parse-create ebb--screen nil
-                                                #'ebb--handle-event))
-        ;; Create I/O
-        (setq ebb--io (make-ebb-io
-                         :screen ebb--screen
-                         :parser ebb--parser
-                         :render ebb--render
-                         :buffer buf
-                         :chunk-size ebb-chunk-size
-                         :min-latency ebb-minimum-latency
-                         :max-latency ebb-maximum-latency))
+      ;; Create the screen/render/parser/I/O stack
+      (setq ebb--io (ebb-io-create-terminal buf #'ebb--handle-event)
+            ebb--screen (ebb-io-screen ebb--io)
+            ebb--render (ebb-io-render ebb--io)
+            ebb--parser (ebb-io-parser ebb--io))
         ;; Start process with shell integration env vars
         (ebb-io-start ebb--io shell buf
                         (ebb-shell-env-vars))
@@ -1176,7 +1159,7 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
         (pcase ebb-default-input-mode
           ('char (ebb-char-mode))
           ('emacs (ebb-emacs-mode))
-          (_ (ebb-semi-char-mode)))))
+          (_ (ebb-semi-char-mode))))
     ;; Display buffer
     (pop-to-buffer-same-window buf)
     ;; Resize to match actual window

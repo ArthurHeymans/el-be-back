@@ -196,6 +196,28 @@ Repeated identical failures are rate-limited to avoid flooding *Messages*."
 
 (add-hook 'ebb-io-processing-error-functions #'ebb-io--report-processing-error)
 
+;;;; ---- Stack Construction ---------------------------------------------
+
+(defun ebb-io-create-terminal (buffer event-handler &optional begin end)
+  "Create a screen, renderer, parser, and I/O instance for BUFFER.
+EVENT-HANDLER receives parser events.  When BEGIN and END are
+non-nil, the render region is restricted to that buffer region
+(used by the inline Eshell terminal).  The screen is sized from a
+window currently displaying BUFFER, else the selected window."
+  (let* ((window (or (get-buffer-window buffer) (selected-window)))
+         (width (max (window-max-chars-per-line window) 10))
+         (height (max (window-body-height window) 3))
+         (screen (ebb-screen-create width height)))
+    (setf (ebb-screen-scrollback-max screen) ebb-scrollback-lines)
+    (make-ebb-io
+     :screen screen
+     :parser (ebb-parse-create screen nil event-handler)
+     :render (ebb-render-create screen buffer begin end)
+     :buffer buffer
+     :chunk-size ebb-chunk-size
+     :min-latency ebb-minimum-latency
+     :max-latency ebb-maximum-latency)))
+
 ;;;; ---- Command Building -----------------------------------------------
 
 (defun ebb-io--detect-shell (shell-command)

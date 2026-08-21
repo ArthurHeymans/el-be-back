@@ -246,27 +246,15 @@ Emacs does not currently expose a portable serial-break primitive."
 (defun ebb-serial--ensure-terminal ()
   "Ensure the current buffer has a Ebb terminal stack."
   (unless ebb--io
-    (let* ((window (or (get-buffer-window (current-buffer))
-                       (selected-window)))
-           (width (max (window-max-chars-per-line window) 10))
-           (height (max (window-body-height window) 3)))
-      (setq ebb--screen (ebb-screen-create width height))
-      (setf (ebb-screen-scrollback-max ebb--screen) ebb-scrollback-lines)
-      (setq ebb--render (ebb-render-create ebb--screen (current-buffer)))
-      (setq ebb--parser
-            (ebb-parse-create ebb--screen nil #'ebb--handle-event))
-      (setq ebb--io
-            (make-ebb-io
-             :screen ebb--screen
-             :parser ebb--parser
-             :render ebb--render
-             :buffer (current-buffer)
-             :input-coding-system ebb-serial-default-coding-system
-             :chunk-size ebb-chunk-size
-             :min-latency ebb-minimum-latency
-             :max-latency ebb-maximum-latency))
-      (ebb-serial--select-default-input-mode)
-      (ebb-render-refresh ebb--render))))
+    (setq ebb--io (ebb-io-create-terminal (current-buffer)
+                                            #'ebb--handle-event)
+          ebb--screen (ebb-io-screen ebb--io)
+          ebb--render (ebb-io-render ebb--io)
+          ebb--parser (ebb-io-parser ebb--io))
+    (setf (ebb-io-input-coding-system ebb--io)
+          ebb-serial-default-coding-system)
+    (ebb-serial--select-default-input-mode)
+    (ebb-render-refresh ebb--render)))
 
 (defun ebb-serial--setup-buffer (port speed)
   "Set up the current buffer for serial PORT at SPEED."
