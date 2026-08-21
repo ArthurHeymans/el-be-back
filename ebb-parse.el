@@ -36,8 +36,10 @@
   (private nil)          ; ?/>/= prefix char or nil
   (intermediates "")     ; ESC/CSI intermediate bytes (space etc.)
   ;; String collection
-  (osc-string "")
-  (dcs-string "")
+  (osc-parts nil)        ; reversed single-char chunks of the OSC payload
+  (osc-length 0)
+  (dcs-parts nil)        ; reversed single-char chunks of the DCS body
+  (dcs-length 0)
   (dcs-params "")
   (dcs-final 0)
   ;; State for ESC inside string sequences
@@ -183,8 +185,10 @@ If the parameter is a sub-parameter list, return the first element."
         (ebb-parser-param-string parser) ""
         (ebb-parser-private parser) nil
         (ebb-parser-intermediates parser) ""
-        (ebb-parser-osc-string parser) ""
-        (ebb-parser-dcs-string parser) ""
+        (ebb-parser-osc-parts parser) nil
+        (ebb-parser-osc-length parser) 0
+        (ebb-parser-dcs-parts parser) nil
+        (ebb-parser-dcs-length parser) 0
         (ebb-parser-dcs-params parser) ""
         (ebb-parser-dcs-final parser) 0
         (ebb-parser-string-state parser) nil
@@ -549,13 +553,15 @@ only digits and semicolons."
    ;; OSC
    ((= ch ?\])
     (setf (ebb-parser-string-state parser) nil)
-    (setf (ebb-parser-osc-string parser) "")
+    (setf (ebb-parser-osc-parts parser) nil
+          (ebb-parser-osc-length parser) 0)
     (setf (ebb-parser-state parser) :osc-string))
    ;; DCS
    ((= ch ?P)
     (setf (ebb-parser-string-state parser) nil)
     (setf (ebb-parser-dcs-params parser) "")
-    (setf (ebb-parser-dcs-string parser) "")
+    (setf (ebb-parser-dcs-parts parser) nil
+          (ebb-parser-dcs-length parser) 0)
     (setf (ebb-parser-intermediates parser) "")
     (setf (ebb-parser-state parser) :dcs-entry))
    ;; Charset designation
@@ -718,9 +724,9 @@ in process-char."
    ;; C0 controls are discarded while the OSC string continues.
    ((< ch ?\s) nil)
    ;; Accumulate (limit length for safety)
-   ((< (length (ebb-parser-osc-string parser)) 65536)
-    (setf (ebb-parser-osc-string parser)
-          (concat (ebb-parser-osc-string parser) (string ch))))))
+   ((< (ebb-parser-osc-length parser) 65536)
+    (push (string ch) (ebb-parser-osc-parts parser))
+    (cl-incf (ebb-parser-osc-length parser)))))
 
 ;;;; ---- State: DCS Entry/Param/Passthrough -----------------------------
 
@@ -759,9 +765,9 @@ in process-char."
 (defun ebb-parse--dcs-passthrough (parser ch)
   "Accumulate DCS body.  ESC handled in process-char for ST."
   ;; Just accumulate (limit for safety)
-  (when (< (length (ebb-parser-dcs-string parser)) 1048576)
-    (setf (ebb-parser-dcs-string parser)
-          (concat (ebb-parser-dcs-string parser) (string ch)))))
+  (when (< (ebb-parser-dcs-length parser) 1048576)
+    (push (string ch) (ebb-parser-dcs-parts parser))
+    (cl-incf (ebb-parser-dcs-length parser))))
 
 ;;;; ---- State: Charset Designate ---------------------------------------
 
@@ -1558,7 +1564,11 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
 (defun ebb-parse--dispatch-osc (parser)
   "Dispatch a completed OSC sequence."
   (condition-case err
-      (let* ((str (ebb-parser-osc-string parser))
+      (let* ((str (apply #'concat
+                         (nreverse
+                          (prog1
+                              (ebb-parser-osc-parts parser)
+                            (setf (ebb-parser-osc-parts parser) nil)))))
              (screen (ebb-parser-screen parser)))
         (if (string-match "\\`\\([0-9]+\\)\\(?:;\\(\\(?:.\\|\n\\)*\\)\\)?\\'" str)
             (let ((num (string-to-number (match-string 1 str)))
@@ -1737,7 +1747,11 @@ CODE is supplied, in which case CODE is used for extended colors."
   "Dispatch a completed DCS sequence."
   (condition-case err
       (let ((final (ebb-parser-dcs-final parser))
-            (body (ebb-parser-dcs-string parser))
+            (body (apply #'concat
+                         (nreverse
+                          (prog1
+                              (ebb-parser-dcs-parts parser)
+                            (setf (ebb-parser-dcs-parts parser) nil)))))
             (intermediates (ebb-parser-intermediates parser)))
         (cond
          ;; DECRQSS - request selection or setting status.

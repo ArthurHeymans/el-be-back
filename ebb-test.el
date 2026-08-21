@@ -2155,7 +2155,8 @@ Binds `screen' and `parser' in BODY."
                           :binary-flood t))
          sent)
     (setf (ebb-parser-state parser) :osc-string
-          (ebb-parser-osc-string parser) "partial")
+          (ebb-parser-osc-parts parser) (list "l" "a" "i" "t" "r" "a" "p")
+          (ebb-parser-osc-length parser) 7)
     (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
               ((symbol-function 'process-send-string)
                (lambda (_process string) (setq sent string))))
@@ -2167,7 +2168,8 @@ Binds `screen' and `parser' in BODY."
     (should-not (ebb-io-first-chunk-time io))
     (should-not (ebb-io-binary-flood io))
     (should (eq :ground (ebb-parser-state parser)))
-    (should (string-empty-p (ebb-parser-osc-string parser)))))
+    (should-not (ebb-parser-osc-parts parser))
+    (should (zerop (ebb-parser-osc-length parser)))))
 
 (ert-deftest ebb-test-io-process-uses-binary-writes ()
   "PTY output is decoded as UTF-8 while input remains byte-preserving."
