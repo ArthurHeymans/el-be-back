@@ -22,6 +22,8 @@
 (declare-function ebb-yank "ebb")
 (declare-function ebb-yank-pop "ebb")
 (declare-function ebb--mouse-mode "ebb")
+(declare-function ebb--ensure-focus-change-hook "ebb")
+(declare-function ebb--maybe-remove-focus-change-hook "ebb")
 (declare-function ebb-shell-cleanup "ebb-shell")
 (declare-function eshell-gather-process-output "esh-proc" (command args))
 (declare-function eshell-interactive-output-p "esh-io" (&optional index handles))
@@ -188,6 +190,8 @@ read-only; the terminal modes are writable)."
                   (ebb-render-state-region-end ebb--render))
       (setq-local eshell-output-filter-functions '(ebb-eshell--output-filter))
       (add-hook 'window-size-change-functions #'ebb-eshell--resize nil t)
+      ;; Inline terminals honor DEC mode 1004 focus reporting too.
+      (ebb--ensure-focus-change-hook)
       (ebb-eshell--running-mode 1)
       (ebb-eshell-semi-char-mode))))
 
@@ -212,6 +216,8 @@ read-only; the terminal modes are writable)."
       (ebb-eshell--char-mode -1)
       (ebb-eshell--running-mode -1)
       (ebb--mouse-mode -1)
+      ;; Drop the global focus hook if no other terminal remains.
+      (ebb--maybe-remove-focus-change-hook)
       (setq-local ebb-eshell--io nil)
       (setq-local ebb--io nil)
       (setq-local ebb--screen nil)
