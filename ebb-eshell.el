@@ -22,6 +22,7 @@
 (declare-function ebb-yank "ebb")
 (declare-function ebb-yank-pop "ebb")
 (declare-function ebb--mouse-mode "ebb")
+(declare-function ebb--refresh-input-cursor "ebb")
 (declare-function ebb--ensure-focus-change-hook "ebb")
 (declare-function ebb--maybe-remove-focus-change-hook "ebb")
 (declare-function ebb-shell-cleanup "ebb-shell")
@@ -107,6 +108,7 @@ read-only; the terminal modes are writable)."
   (ebb-eshell--char-mode (if (eq mode 'char) 1 -1))
   (setq ebb-eshell--input-mode mode
         ebb--input-mode mode)
+  (ebb--refresh-input-cursor)
   (when read-only
     (setq buffer-read-only (eq mode 'emacs)))
   (force-mode-line-update))

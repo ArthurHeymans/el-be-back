@@ -424,6 +424,9 @@ state are reconciled independently so metadata-only updates are visible."
                 (save-excursion
                   (ebb-render-goto-anchor render window-anchor t)
                   (set-window-start saved-window (point) t)))))
+          ;; Apply the reset only after saved windows have been restored,
+          ;; so restoration cannot move windows away from display-begin.
+          (ebb-render--apply-viewport-reset render)
           ;; Hook errors must not leave the dirty state set, or every
           ;; subsequent refresh would re-render the same rows forever.
           (condition-case hook-error
@@ -1167,8 +1170,7 @@ hint at the live terminal position."
          (cy (ebb-screen-cursor-y screen))
          (visible (ebb-screen-cursor-visible screen))
          (style (ebb-screen-cursor-style screen))
-         (emacs-mode (eq (bound-and-true-p ebb--input-mode) 'emacs))
-         (viewport-reset (ebb-screen-take-viewport-reset screen)))
+         (emacs-mode (eq (bound-and-true-p ebb--input-mode) 'emacs)))
     (when ov
       (if (not visible)
           (progn
@@ -1196,12 +1198,18 @@ hint at the live terminal position."
             (setq-local cursor-type nil)
             (goto-char pos)
             (dolist (win (get-buffer-window-list nil nil t))
-              (set-window-point win pos)))
-        ;; A pending viewport reset must not be swallowed by emacs
-        ;; input mode, where window-point is left to point.
-        (when viewport-reset
-          (dolist (win (get-buffer-window-list nil nil t))
-            (set-window-start win display-begin t))))))))
+              (set-window-point win pos))))))))
+
+(defun ebb-render--apply-viewport-reset (render)
+  "Apply a pending viewport reset, moving windows to RENDER's display start.
+
+Must run after any point/window-start restoration so that restoring a
+saved window start cannot override the reset, and regardless of cursor
+visibility."
+  (when (ebb-screen-take-viewport-reset (ebb-render-state-screen render))
+    (let ((display-begin (ebb-render-state-display-begin render)))
+      (dolist (win (get-buffer-window-list nil nil t))
+        (set-window-start win display-begin t)))))
 
 ;;;; ---- Invalidation ---------------------------------------------------
 
@@ -1340,7 +1348,8 @@ Used after resize when the display area size has changed."
                          render (cdr entry))))
                   (set-window-start (car entry) position t)
                 (set-window-start
-                 (car entry) (ebb-render-state-display-begin render) t)))))))))
+                 (car entry) (ebb-render-state-display-begin render) t))))
+          (ebb-render--apply-viewport-reset render))))))
 
 (defun ebb-render-resize-height (render)
   "Rebuild only RENDER's viewport after a height-only terminal resize."
@@ -1368,6 +1377,7 @@ Used after resize when the display area size has changed."
                 (when (< row (1- height)) (insert "\n"))))
             (set-marker-insertion-type display-begin t))
           (ebb-render--update-cursor render)
+          (ebb-render--apply-viewport-reset render)
           (ebb-screen-clear-dirty screen)
           (ebb-screen-clear-scrollback-dirty screen))))))
 
