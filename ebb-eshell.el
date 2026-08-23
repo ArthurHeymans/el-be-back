@@ -22,6 +22,9 @@
 (declare-function ebb-yank "ebb")
 (declare-function ebb-yank-pop "ebb")
 (declare-function ebb--mouse-mode "ebb")
+(declare-function ebb--refresh-input-cursor "ebb")
+(declare-function ebb--ensure-focus-change-hook "ebb")
+(declare-function ebb--maybe-remove-focus-change-hook "ebb")
 (declare-function ebb-shell-cleanup "ebb-shell")
 (declare-function eshell-gather-process-output "esh-proc" (command args))
 (declare-function eshell-interactive-output-p "esh-io" (&optional index handles))
@@ -57,15 +60,8 @@
     map))
 
 (defun ebb-eshell--semi-char-map ()
-  (let ((map (ebb-input-make-keymap
-              #'ebb-self-input '(:ascii :arrow :navigation)
-              `([?\C-c] [?\C-q] [?\C-y] [?\e ?y]
-                ,@ebb-semi-char-non-bound-keys))))
-    (define-key map [?\C-q] #'ebb-quoted-input)
-    (define-key map [?\C-y] #'ebb-yank)
-    (define-key map [?\M-y] #'ebb-yank-pop)
-    (define-key map (kbd "C-c C-e") #'ebb-eshell-emacs-mode)
-    map))
+  (ebb-input-make-semi-char-map '(:ascii :arrow :navigation)
+                                  #'ebb-eshell-emacs-mode))
 
 (defvar ebb-eshell-semi-char-mode-map
   (ignore-errors (ebb-eshell--semi-char-map)))
@@ -104,37 +100,35 @@
                                     ebb-eshell-char-mode-map
                                     ebb-eshell--char-mode))
 
+(defun ebb-eshell--switch-input-mode (mode &optional read-only)
+  "Enable the inline terminal minor modes for MODE.
+READ-ONLY also toggles the buffer's read-only state (emacs mode is
+read-only; the terminal modes are writable)."
+  (ebb-eshell--semi-char-mode (if (eq mode 'semi-char) 1 -1))
+  (ebb-eshell--char-mode (if (eq mode 'char) 1 -1))
+  (setq ebb-eshell--input-mode mode
+        ebb--input-mode mode)
+  (ebb--refresh-input-cursor)
+  (when read-only
+    (setq buffer-read-only (eq mode 'emacs)))
+  (force-mode-line-update))
+
 (defun ebb-eshell-emacs-mode ()
   "Switch the inline terminal to normal Eshell keybindings."
   (interactive)
-  (ebb-eshell--semi-char-mode -1)
-  (ebb-eshell--char-mode -1)
-  (setq ebb-eshell--input-mode 'emacs
-        ebb--input-mode 'emacs
-        buffer-read-only t)
-  (force-mode-line-update))
+  (ebb-eshell--switch-input-mode 'emacs t))
 
 (defun ebb-eshell-semi-char-mode ()
   "Switch the inline terminal to semi-char keybindings."
   (interactive)
   (when ebb-eshell--io
-    (setq buffer-read-only nil)
-    (ebb-eshell--char-mode -1)
-    (ebb-eshell--semi-char-mode 1)
-    (setq ebb-eshell--input-mode 'semi-char
-          ebb--input-mode 'semi-char)
-    (force-mode-line-update)))
+    (ebb-eshell--switch-input-mode 'semi-char t)))
 
 (defun ebb-eshell-char-mode ()
   "Switch the inline terminal to char keybindings."
   (interactive)
   (when ebb-eshell--io
-    (setq buffer-read-only nil)
-    (ebb-eshell--semi-char-mode -1)
-    (ebb-eshell--char-mode 1)
-    (setq ebb-eshell--input-mode 'char
-          ebb--input-mode 'char)
-    (force-mode-line-update)))
+    (ebb-eshell--switch-input-mode 'char t)))
 
 ;;;; Inline terminal lifecycle
 
@@ -181,25 +175,15 @@
 (defun ebb-eshell--setup (process)
   "Attach a Ebb terminal to Eshell PROCESS at its output marker."
   (unless ebb-eshell--io
-    (let* ((window (or (get-buffer-window (current-buffer)) (selected-window)))
-           (width (max 10 (window-max-chars-per-line window)))
-           (height (max 3 (window-body-height window)))
-           (start (if (marker-buffer (process-mark process))
+    (let* ((start (if (marker-buffer (process-mark process))
                       (process-mark process) (point-max)))
-           (screen (ebb-screen-create width height)))
-      (setf (ebb-screen-scrollback-max screen) ebb-scrollback-lines)
-      (setq-local ebb--screen screen)
-      (setq-local ebb--render
-                  (ebb-render-create screen (current-buffer) start start))
-      (setq-local ebb--parser
-                  (ebb-parse-create screen nil #'ebb-eshell--event))
-      (setq-local ebb--io
-                  (make-ebb-io :screen screen :parser ebb--parser
-                                 :render ebb--render :buffer (current-buffer)
-                                 :chunk-size ebb-chunk-size
-                                 :min-latency ebb-minimum-latency
-                                 :max-latency ebb-maximum-latency))
-      (setq-local ebb-eshell--io ebb--io)
+           (io (ebb-io-create-terminal (current-buffer)
+                                         #'ebb-eshell--event start start)))
+      (setq-local ebb--screen (ebb-io-screen io))
+      (setq-local ebb--render (ebb-io-render io))
+      (setq-local ebb--parser (ebb-io-parser io))
+      (setq-local ebb--io io)
+      (setq-local ebb-eshell--io io)
       ;; Avoid terminal OSC directory/title state changing the Eshell buffer.
       (setq-local ebb-enable-directory-tracking nil)
       (setq-local ebb-buffer-name-function nil)
@@ -208,6 +192,8 @@
                   (ebb-render-state-region-end ebb--render))
       (setq-local eshell-output-filter-functions '(ebb-eshell--output-filter))
       (add-hook 'window-size-change-functions #'ebb-eshell--resize nil t)
+      ;; Inline terminals honor DEC mode 1004 focus reporting too.
+      (ebb--ensure-focus-change-hook)
       (ebb-eshell--running-mode 1)
       (ebb-eshell-semi-char-mode))))
 
@@ -232,6 +218,8 @@
       (ebb-eshell--char-mode -1)
       (ebb-eshell--running-mode -1)
       (ebb--mouse-mode -1)
+      ;; Drop the global focus hook if no other terminal remains.
+      (ebb--maybe-remove-focus-change-hook)
       (setq-local ebb-eshell--io nil)
       (setq-local ebb--io nil)
       (setq-local ebb--screen nil)

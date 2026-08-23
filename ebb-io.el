@@ -38,10 +38,6 @@
   (max-latency 0.033)     ; seconds: max delay (~30fps)
   (first-chunk-time nil)  ; float time of first unrendered chunk
   (render-timer nil)      ; pending render timer
-  ;; Throughput monitoring
-  (throughput-time nil)
-  (throughput-bytes 0)
-  (binary-flood nil)
   ;; Error reporting
   (last-processing-error nil)
   (processing-error-count 0))
@@ -159,11 +155,6 @@ This is the supported entry point for non-PTY transports."
                      (offset (ebb-io-pending-offset io))
                      (remaining (- (length bytes) offset))
                      (chunk-size (min remaining budget)))
-                ;; Binary flood detection
-                (ebb-io--update-throughput io chunk-size)
-                ;; Even in flood mode, never silently drop terminal output.
-                ;; The flag is diagnostic/throttling state; parsing remains
-                ;; lossless unless a future user option explicitly suppresses it.
                 (let ((consumed (ebb-parse-bytes
                                  (ebb-io-parser io)
                                  bytes offset (+ offset chunk-size))))
@@ -205,20 +196,27 @@ Repeated identical failures are rate-limited to avoid flooding *Messages*."
 
 (add-hook 'ebb-io-processing-error-functions #'ebb-io--report-processing-error)
 
-;;;; ---- Binary Flood Detection -----------------------------------------
+;;;; ---- Stack Construction ---------------------------------------------
 
-(defun ebb-io--update-throughput (io chunk-bytes)
-  "Track throughput and detect binary floods."
-  (let ((now (float-time)))
-    (when (or (null (ebb-io-throughput-time io))
-              (> (- now (ebb-io-throughput-time io)) 1.0))
-      ;; Reset window
-      (setf (ebb-io-throughput-time io) now)
-      (setf (ebb-io-throughput-bytes io) 0))
-    (cl-incf (ebb-io-throughput-bytes io) chunk-bytes)
-    ;; Flood if > 1MB/sec
-    (setf (ebb-io-binary-flood io)
-          (> (ebb-io-throughput-bytes io) 1048576))))
+(defun ebb-io-create-terminal (buffer event-handler &optional begin end)
+  "Create a screen, renderer, parser, and I/O instance for BUFFER.
+EVENT-HANDLER receives parser events.  When BEGIN and END are
+non-nil, the render region is restricted to that buffer region
+(used by the inline Eshell terminal).  The screen is sized from a
+window currently displaying BUFFER, else the selected window."
+  (let* ((window (or (get-buffer-window buffer) (selected-window)))
+         (width (max (window-max-chars-per-line window) 10))
+         (height (max (window-body-height window) 3))
+         (screen (ebb-screen-create width height)))
+    (setf (ebb-screen-scrollback-max screen) ebb-scrollback-lines)
+    (make-ebb-io
+     :screen screen
+     :parser (ebb-parse-create screen nil event-handler)
+     :render (ebb-render-create screen buffer begin end)
+     :buffer buffer
+     :chunk-size ebb-chunk-size
+     :min-latency ebb-minimum-latency
+     :max-latency ebb-maximum-latency)))
 
 ;;;; ---- Command Building -----------------------------------------------
 
@@ -356,7 +354,10 @@ Returns the path to the temporary file."
 (defun ebb-io--fish-setup-confd (integration-script)
   "Install a fish conf.d snippet that sources INTEGRATION-SCRIPT.
 Fish automatically sources all .fish files in ~/.config/fish/conf.d/
-on startup.  We create a symlink there pointing to our integration script."
+on startup.  We create a small sourcing script there (not a symlink,
+to handle the case where the integration dir moves between Emacs
+sessions).  The snippet is permanent and sources the integration
+script only while EBB_SHELL_INTEGRATION_DIR is set."
   (ignore integration-script)
   (let* ((confd-dir (expand-file-name "fish/conf.d"
                                        (or (getenv "XDG_CONFIG_HOME")
@@ -451,6 +452,19 @@ local paths), and TERM is chosen by an on-remote probe; see
     ;; Store
     (setf (ebb-io-process io) proc)
     (setf (ebb-io-buffer io) buffer)
+    ;; Remember the temporary bash integration rcfile so the sentinel
+    ;; can delete it once the shell exits.  Only files Ebb itself
+    ;; created are cleaned up; a user-supplied --rcfile is left alone.
+    (let ((pos (seq-position cmd "--rcfile")))
+      (when pos
+        (let ((rcfile (nth (1+ pos) cmd)))
+          (when (and (stringp rcfile)
+                     (string-prefix-p "ebb-bashrc-"
+                                      (file-name-nondirectory rcfile))
+                     (string-prefix-p
+                      (file-name-as-directory temporary-file-directory)
+                      rcfile))
+            (process-put proc 'ebb-bashrc rcfile)))))
     proc))
 
 (defun ebb-io-attach (io process buffer)
@@ -463,9 +477,14 @@ Ebb through `ebb-io--filter'."
         (lambda (string) (ebb-io-send io string)))
   process)
 
-(defun ebb-io--sentinel (io _proc event)
+(defun ebb-io--sentinel (io proc event)
   "Handle process state changes."
   (when (string-match-p "\\(finished\\|exited\\|killed\\|deleted\\)" event)
+    ;; Delete the temporary bash integration rcfile, if any.  Read it
+    ;; from PROC, not from IO, whose process slot may already be nil.
+    (when-let* ((rcfile (and (processp proc)
+                             (process-get proc 'ebb-bashrc))))
+      (ignore-errors (delete-file rcfile)))
     (when (buffer-live-p (ebb-io-buffer io))
       (with-current-buffer (ebb-io-buffer io)
         (when (ebb-io-render-timer io)
@@ -488,10 +507,7 @@ Ebb through `ebb-io--filter'."
         (ebb-io-pending-chunks io) nil
         (ebb-io-pending-tail io) nil
         (ebb-io-pending-offset io) 0
-        (ebb-io-first-chunk-time io) nil
-        (ebb-io-throughput-time io) nil
-        (ebb-io-throughput-bytes io) 0
-        (ebb-io-binary-flood io) nil)
+        (ebb-io-first-chunk-time io) nil)
   (when (ebb-io-parser io)
     (ebb-parse-cancel-sequence (ebb-io-parser io))))
 
@@ -502,7 +518,9 @@ Unibyte strings are always sent unchanged.  Sending an interrupt discards
 queued output so the interrupted program's prompt is not stuck behind it."
   (when-let* ((proc (ebb-io-process io)))
     (when (process-live-p proc)
-      (when (string-search "\C-c" string)
+      ;; Only a bare interrupt discards queued output; pasted text that
+      ;; merely contains ^C must pass through untouched.
+      (when (string= string "\C-c")
         (ebb-io--prepare-interrupt io))
       (let ((coding (ebb-io-input-coding-system io)))
         (process-send-string

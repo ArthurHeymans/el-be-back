@@ -32,6 +32,7 @@
 
 (declare-function ebb-emacs-mode "ebb")
 (declare-function ebb--cwd-to-path "ebb")
+(declare-function ebb--set-shell-cwd "ebb")
 (defvar ebb-buffer-name-function)
 (defvar ebb--render)
 (defvar ebb--screen)
@@ -236,16 +237,8 @@ remote hosts keep/build a TRAMP path.  Renames the buffer when
     (let ((path (ebb--cwd-to-path
                  (ebb-shell--base64-decode (cadr args))
                  (ebb-shell--base64-decode (car args)))))
-      ;; Remote: trust the shell's report; `file-directory-p' would open
-      ;; a synchronous TRAMP connection on every cd.
-      (when (and path (if (file-remote-p path) t (file-directory-p path)))
-        (setq default-directory (file-name-as-directory path))
-        (when (and (fboundp 'ebb-buffer-name-function)
-                   ebb-buffer-name-function
-                   (fboundp 'ebb--rename-managed))
-          (ebb--rename-managed
-           (funcall ebb-buffer-name-function
-                    (bound-and-true-p ebb--title))))))))
+      (when (fboundp 'ebb--set-shell-cwd)
+        (ebb--set-shell-cwd path)))))
 
 (defun ebb-shell--set-command (args)
   "Handle command text (F sequence).

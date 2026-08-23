@@ -360,6 +360,15 @@ half of the physical screen columns."
   (prog1 (gethash screen ebb--viewport-reset-screens)
     (remhash screen ebb--viewport-reset-screens)))
 
+;;;; ---- Cell copying helper (used by erase) ----------------------------
+
+(defun copy-ebb-cell (cell)
+  "Return a shallow copy of CELL."
+  (make-ebb-cell :char (ebb-cell-char cell)
+                   :combining (ebb-cell-combining cell)
+                   :width (ebb-cell-width cell)
+                   :attr (ebb-cell-attr cell)))
+
 ;;;; ---- DEC Special Graphics Character Set ------------------------------
 
 (defconst ebb--dec-graphics-map
@@ -1660,29 +1669,23 @@ for wide/non-ASCII/insert-mode cases."
             (let ((cells (ebb--line-ensure-cells
                           line (ebb-screen-width screen))))
               (unless default-attr
-                (setf (ebb-line-text line) nil)
-                (setf (ebb-line-attr-runs line) nil)
-        (setf (ebb-line-uniform-attr line) nil))
+                (setf (ebb-line-text line) nil
+                      (ebb-line-attr-runs line) nil
+                      (ebb-line-uniform-attr line) nil))
               ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
-              (if default-attr
-                  (while (and (< i ascii-end)
-                              (= (ebb-cell-width (aref cells (+ cx (- i start-i)))) 1))
-                    (let* ((col (+ cx (- i start-i)))
-                           (cell (aref cells col))
-                           (ch (aref string i)))
-                      (setf (ebb-cell-char cell) ch)
-                      (setf (ebb-cell-combining cell) nil)
-                      (setf (ebb-cell-width cell) 1)
-                      (setf (ebb-cell-attr cell) nil))
-                    (cl-incf i))
+              ;; The two loops differ only in the attribute stored on each cell.
+              (let ((cell-attr (if default-attr nil attr-template)))
                 (while (and (< i ascii-end)
-                            (= (ebb-cell-width (aref cells (+ cx (- i start-i)))) 1))
-                  (let* ((cell (aref cells (+ cx (- i start-i))))
+                            (= (ebb-cell-width
+                                (aref cells (+ cx (- i start-i))))
+                               1))
+                  (let* ((col (+ cx (- i start-i)))
+                         (cell (aref cells col))
                          (ch (aref string i)))
                     (setf (ebb-cell-char cell) ch)
                     (setf (ebb-cell-combining cell) nil)
                     (setf (ebb-cell-width cell) 1)
-                    (setf (ebb-cell-attr cell) attr-template))
+                    (setf (ebb-cell-attr cell) cell-attr))
                   (cl-incf i))))))
           (if (= i start-i)
               ;; Could not use the fast row writer for this byte.
@@ -3613,15 +3616,6 @@ blank cells contribute zero, matching the original xterm/DEC checksum mode."
 (defun ebb-screen-scrollback-lines (screen)
   "Return current-width physical history rows, oldest first."
   (ebb-screen-scrollback-lines-raw screen))
-
-;;;; ---- Cell copying helper (used by erase) ----------------------------
-
-(defun copy-ebb-cell (cell)
-  "Return a shallow copy of CELL."
-  (make-ebb-cell :char (ebb-cell-char cell)
-                   :combining (ebb-cell-combining cell)
-                   :width (ebb-cell-width cell)
-                   :attr (ebb-cell-attr cell)))
 
 (provide 'ebb-term)
 ;;; ebb-term.el ends here

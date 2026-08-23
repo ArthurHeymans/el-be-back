@@ -246,27 +246,15 @@ Emacs does not currently expose a portable serial-break primitive."
 (defun ebb-serial--ensure-terminal ()
   "Ensure the current buffer has a Ebb terminal stack."
   (unless ebb--io
-    (let* ((window (or (get-buffer-window (current-buffer))
-                       (selected-window)))
-           (width (max (window-max-chars-per-line window) 10))
-           (height (max (window-body-height window) 3)))
-      (setq ebb--screen (ebb-screen-create width height))
-      (setf (ebb-screen-scrollback-max ebb--screen) ebb-scrollback-lines)
-      (setq ebb--render (ebb-render-create ebb--screen (current-buffer)))
-      (setq ebb--parser
-            (ebb-parse-create ebb--screen nil #'ebb--handle-event))
-      (setq ebb--io
-            (make-ebb-io
-             :screen ebb--screen
-             :parser ebb--parser
-             :render ebb--render
-             :buffer (current-buffer)
-             :input-coding-system ebb-serial-default-coding-system
-             :chunk-size ebb-chunk-size
-             :min-latency ebb-minimum-latency
-             :max-latency ebb-maximum-latency))
-      (ebb-serial--select-default-input-mode)
-      (ebb-render-refresh ebb--render))))
+    (setq ebb--io (ebb-io-create-terminal (current-buffer)
+                                            #'ebb--handle-event)
+          ebb--screen (ebb-io-screen ebb--io)
+          ebb--render (ebb-io-render ebb--io)
+          ebb--parser (ebb-io-parser ebb--io))
+    (setf (ebb-io-input-coding-system ebb--io)
+          ebb-serial-default-coding-system)
+    (ebb-serial--select-default-input-mode)
+    (ebb-render-refresh ebb--render)))
 
 (defun ebb-serial--setup-buffer (port speed)
   "Set up the current buffer for serial PORT at SPEED."
@@ -399,6 +387,30 @@ values accepted by `serial-process-configure'."
                                    ebb-serial--stopbits
                                    ebb-serial--flowcontrol))
 
+(defun ebb-serial--read-parity ()
+  "Read parity as a symbol from the minibuffer."
+  (pcase (ebb-serial--read-choice
+          "Parity" '("none" "odd" "even")
+          (pcase ebb-serial--parity
+            ('odd "odd")
+            ('even "even")
+            (_ "none")))
+    ("odd" 'odd)
+    ("even" 'even)
+    (_ nil)))
+
+(defun ebb-serial--read-flowcontrol ()
+  "Read flow control as a symbol from the minibuffer."
+  (pcase (ebb-serial--read-choice
+          "Flow control" '("none" "hw" "sw")
+          (pcase ebb-serial--flowcontrol
+            ('hw "hw")
+            ('sw "sw")
+            (_ "none")))
+    ("hw" 'hw)
+    ("sw" 'sw)
+    (_ nil)))
+
 (defun ebb-serial-set-framing (bytesize parity stopbits)
   "Configure serial BYTESIZE, PARITY, and STOPBITS."
   (interactive
@@ -406,15 +418,7 @@ values accepted by `serial-process-configure'."
           (ebb-serial--read-choice
            "Byte size" '("8" "7")
            (number-to-string (or ebb-serial--bytesize 8))))
-         (pcase (ebb-serial--read-choice
-                 "Parity" '("none" "odd" "even")
-                 (pcase ebb-serial--parity
-                   ('odd "odd")
-                   ('even "even")
-                   (_ "none")))
-           ("odd" 'odd)
-           ("even" 'even)
-           (_ nil))
+         (ebb-serial--read-parity)
          (string-to-number
           (ebb-serial--read-choice
            "Stop bits" '("1" "2")
@@ -428,15 +432,7 @@ values accepted by `serial-process-configure'."
 (defun ebb-serial-set-flowcontrol (flowcontrol)
   "Configure serial FLOWCONTROL."
   (interactive
-   (list (pcase (ebb-serial--read-choice
-                 "Flow control" '("none" "hw" "sw")
-                 (pcase ebb-serial--flowcontrol
-                   ('hw "hw")
-                   ('sw "sw")
-                   (_ "none")))
-           ("hw" 'hw)
-           ("sw" 'sw)
-           (_ nil))))
+   (list (ebb-serial--read-flowcontrol)))
   (ebb-serial--apply-configuration ebb-serial--speed
                                    ebb-serial--bytesize
                                    ebb-serial--parity
@@ -635,37 +631,18 @@ When a serial process is live, SPEED, BYTESIZE, PARITY, STOPBITS,
 and FLOWCONTROL are passed to `serial-process-configure'.  When the
 buffer is disconnected, store the settings for the next reconnect."
   (interactive
-   (let ((speed (read-number "Speed: " ebb-serial--speed))
-         (bytesize (string-to-number
-                    (ebb-serial--read-choice
-                     "Byte size" '("8" "7")
-                     (number-to-string (or ebb-serial--bytesize 8)))))
-         (parity (ebb-serial--read-choice
-                  "Parity" '("none" "odd" "even")
-                  (pcase ebb-serial--parity
-                    ('odd "odd")
-                    ('even "even")
-                    (_ "none"))))
-         (stopbits (string-to-number
-                    (ebb-serial--read-choice
-                     "Stop bits" '("1" "2")
-                     (number-to-string (or ebb-serial--stopbits 1)))))
-         (flowcontrol (ebb-serial--read-choice
-                       "Flow control" '("none" "hw" "sw")
-                       (pcase ebb-serial--flowcontrol
-                         ('hw "hw")
-                         ('sw "sw")
-                         (_ "none")))))
-     (list speed bytesize
-           (pcase parity
-             ("odd" 'odd)
-             ("even" 'even)
-             (_ nil))
-           stopbits
-           (pcase flowcontrol
-             ("hw" 'hw)
-             ("sw" 'sw)
-             (_ nil)))))
+   (let ((speed (read-number "Speed: " ebb-serial--speed)))
+     (pcase-let* ((bytesize (string-to-number
+                             (ebb-serial--read-choice
+                              "Byte size" '("8" "7")
+                              (number-to-string (or ebb-serial--bytesize 8)))))
+                  (parity (ebb-serial--read-parity))
+                  (stopbits (string-to-number
+                             (ebb-serial--read-choice
+                              "Stop bits" '("1" "2")
+                              (number-to-string (or ebb-serial--stopbits 1)))))
+                  (flowcontrol (ebb-serial--read-flowcontrol)))
+       (list speed bytesize parity stopbits flowcontrol))))
   (unless ebb-serial--port
     (user-error "This buffer is not an ebb-serial buffer"))
   (ebb-serial--apply-configuration speed bytesize parity stopbits flowcontrol))

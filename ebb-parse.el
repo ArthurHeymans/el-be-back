@@ -36,8 +36,10 @@
   (private nil)          ; ?/>/= prefix char or nil
   (intermediates "")     ; ESC/CSI intermediate bytes (space etc.)
   ;; String collection
-  (osc-string "")
-  (dcs-string "")
+  (osc-parts nil)        ; reversed single-char chunks of the OSC payload
+  (osc-length 0)
+  (dcs-parts nil)        ; reversed single-char chunks of the DCS body
+  (dcs-length 0)
   (dcs-params "")
   (dcs-final 0)
   ;; State for ESC inside string sequences
@@ -183,8 +185,10 @@ If the parameter is a sub-parameter list, return the first element."
         (ebb-parser-param-string parser) ""
         (ebb-parser-private parser) nil
         (ebb-parser-intermediates parser) ""
-        (ebb-parser-osc-string parser) ""
-        (ebb-parser-dcs-string parser) ""
+        (ebb-parser-osc-parts parser) nil
+        (ebb-parser-osc-length parser) 0
+        (ebb-parser-dcs-parts parser) nil
+        (ebb-parser-dcs-length parser) 0
         (ebb-parser-dcs-params parser) ""
         (ebb-parser-dcs-final parser) 0
         (ebb-parser-string-state parser) nil
@@ -194,7 +198,12 @@ If the parameter is a sub-parameter list, return the first element."
 
 (defun ebb-parse-bytes (parser string &optional start end)
   "Parse STRING from START to END through PARSER.
-Returns the number of characters consumed."
+Returns the number of characters consumed.
+
+STRING must be a decoded multibyte string, as produced by the UTF-8
+process decoder or `ebb-serial-codec-decode'.  Raw unibyte bytes are
+interpreted as Latin-1 text with 8-bit C1 controls, which corrupts
+unibyte UTF-8 whose continuation bytes fall below #xa0."
   (let ((i (or start 0))
         (e (or end (length string)))
         (multibyte (multibyte-string-p string))
@@ -274,6 +283,28 @@ Returns the number of characters consumed."
               (cl-incf i)))))))
     (- i (or start 0))))
 
+(defsubst ebb-parse--cup-coords (string start end)
+  "Parse row;col digits in STRING[START, END) as (ROW . COL).
+Return nil when the region contains a second semicolon or any
+non-parameter byte."
+  (let ((row 0)
+        (col 0)
+        (in-col nil)
+        (ok t)
+        (k start))
+    (while (and ok (< k end))
+      (let ((ch (aref string k)))
+        (cond
+         ((and (>= ch ?0) (<= ch ?9))
+          (if in-col
+              (setq col (+ (* col 10) (- ch ?0)))
+            (setq row (+ (* row 10) (- ch ?0)))))
+         ((= ch ?\;)
+          (if in-col (setq ok nil) (setq in-col t)))
+         (t (setq ok nil))))
+      (cl-incf k))
+    (and ok (cons row col))))
+
 (defun ebb-parse--fast-csi-at (parser string start end)
   "Handle a common CSI beginning at START, returning the next index.
 START is the first byte after ESC [.  Return nil when the sequence is not one
@@ -289,24 +320,20 @@ of the simple forms handled here."
             (let ((screen (ebb-parser-screen parser)))
               (cond
                ((= c ?H)
-                (let ((row 0)
-                      (col 0)
-                      (in-col nil)
-                      (k start))
-                  (while (< k j)
-                    (let ((p (aref string k)))
-                      (if (= p ?\;)
-                          (if in-col
-                              (throw 'done nil)
-                            (setq in-col t))
-                        (if in-col
-                            (setq col (+ (* col 10) (- p ?0)))
-                          (setq row (+ (* row 10) (- p ?0))))))
-                    (cl-incf k))
-                  (ebb-screen-cursor-goto screen
-                                            (1- (if (zerop row) 1 row))
-                                            (1- (if (zerop col) 1 col)))
-                  (throw 'done (1+ j))))
+                ;; Malformed parameters (e.g. a second semicolon) fall
+                ;; back to the generic parser; consuming nothing here
+                ;; would leave the scan loop spinning on this byte.
+                (if-let* ((coords (ebb-parse--cup-coords string start j)))
+                    (progn
+                      (ebb-screen-cursor-goto screen
+                                              (1- (if (zerop (car coords))
+                                                      1
+                                                    (car coords)))
+                                              (1- (if (zerop (cdr coords))
+                                                      1
+                                                    (cdr coords))))
+                      (throw 'done (1+ j)))
+                  (throw 'done nil)))
                ((and (= c ?J)
                      (= (- j start) 1)
                      (= (aref string start) ?2))
@@ -353,82 +380,9 @@ only digits and semicolons."
             (cl-incf i))
           (let ((idx 0))
             (while (< idx count)
-              (let ((p (aref params idx)))
-                (cond
-                 ((= p 0)  (ebb-screen-reset-attr screen))
-                 ((= p 1)  (ebb-screen-set-attr screen :bold t))
-                 ((= p 2)  (ebb-screen-set-attr screen :faint t))
-                 ((= p 3)  (ebb-screen-set-attr screen :italic t))
-                 ((= p 4)  (ebb-screen-set-attr screen :underline 'line))
-                 ((= p 5)  (ebb-screen-set-attr screen :blink 'slow))
-                 ((= p 6)  (ebb-screen-set-attr screen :blink 'fast))
-                 ((= p 7)  (ebb-screen-set-attr screen :inverse t))
-                 ((= p 8)  (ebb-screen-set-attr screen :conceal t))
-                 ((= p 9)  (ebb-screen-set-attr screen :crossed t))
-                 ((and (>= p 10) (<= p 19))
-                  (ebb-screen-set-attr screen :font (- p 10)))
-                 ((= p 21) (ebb-screen-set-attr screen :underline 'double))
-                 ((= p 22) (ebb-screen-set-attr screen :bold nil)
-                            (ebb-screen-set-attr screen :faint nil))
-                 ((= p 23) (ebb-screen-set-attr screen :italic nil))
-                 ((= p 24) (ebb-screen-set-attr screen :underline nil))
-                 ((= p 25) (ebb-screen-set-attr screen :blink nil))
-                 ((= p 27) (ebb-screen-set-attr screen :inverse nil))
-                 ((= p 28) (ebb-screen-set-attr screen :conceal nil))
-                 ((= p 29) (ebb-screen-set-attr screen :crossed nil))
-                 ((and (>= p 30) (<= p 37))
-                  (ebb-screen-set-attr screen :fg (- p 30)))
-                 ((= p 38)
-                  (cond
-                   ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (ebb-screen-set-attr screen :fg (aref params (+ idx 2)))
-                    (cl-incf idx 2))
-                   ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (ebb-screen-set-attr
-                     screen :fg
-                     (list (aref params (+ idx 2))
-                           (aref params (+ idx 3))
-                           (aref params (+ idx 4))))
-                    (cl-incf idx 4))
-                   (t (throw 'fallback nil))))
-                 ((= p 39) (ebb-screen-set-attr screen :fg nil))
-                 ((and (>= p 40) (<= p 47))
-                  (ebb-screen-set-attr screen :bg (- p 40)))
-                 ((= p 48)
-                  (cond
-                   ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (ebb-screen-set-attr screen :bg (aref params (+ idx 2)))
-                    (cl-incf idx 2))
-                   ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (ebb-screen-set-attr
-                     screen :bg
-                     (list (aref params (+ idx 2))
-                           (aref params (+ idx 3))
-                           (aref params (+ idx 4))))
-                    (cl-incf idx 4))
-                   (t (throw 'fallback nil))))
-                 ((= p 49) (ebb-screen-set-attr screen :bg nil))
-                 ((= p 58)
-                  (cond
-                   ((and (< (+ idx 2) count) (= (aref params (1+ idx)) 5))
-                    (ebb-screen-set-attr screen :ul-color (aref params (+ idx 2)))
-                    (cl-incf idx 2))
-                   ((and (< (+ idx 4) count) (= (aref params (1+ idx)) 2))
-                    (ebb-screen-set-attr
-                     screen :ul-color
-                     (list (aref params (+ idx 2))
-                           (aref params (+ idx 3))
-                           (aref params (+ idx 4))))
-                    (cl-incf idx 4))
-                   (t (throw 'fallback nil))))
-                 ((= p 59) (ebb-screen-set-attr screen :ul-color nil))
-                 ((and (>= p 90) (<= p 97))
-                  (ebb-screen-set-attr screen :fg (+ 8 (- p 90))))
-                 ((and (>= p 100) (<= p 107))
-                  (ebb-screen-set-attr screen :bg (+ 8 (- p 100))))
-                 (t (throw 'fallback nil))))
-              (cl-incf idx)))
-          t))))))
+              (setq idx (+ idx (ebb-parse--sgr-step
+                                screen params idx count))))
+            t)))))))
 
 (defun ebb-parse--fast-simple-sgr-at (screen string start end)
   "Handle the shortest and most frequent SGR forms in STRING[START, END)."
@@ -549,13 +503,15 @@ only digits and semicolons."
    ;; OSC
    ((= ch ?\])
     (setf (ebb-parser-string-state parser) nil)
-    (setf (ebb-parser-osc-string parser) "")
+    (setf (ebb-parser-osc-parts parser) nil
+          (ebb-parser-osc-length parser) 0)
     (setf (ebb-parser-state parser) :osc-string))
    ;; DCS
    ((= ch ?P)
     (setf (ebb-parser-string-state parser) nil)
     (setf (ebb-parser-dcs-params parser) "")
-    (setf (ebb-parser-dcs-string parser) "")
+    (setf (ebb-parser-dcs-parts parser) nil
+          (ebb-parser-dcs-length parser) 0)
     (setf (ebb-parser-intermediates parser) "")
     (setf (ebb-parser-state parser) :dcs-entry))
    ;; Charset designation
@@ -718,9 +674,9 @@ in process-char."
    ;; C0 controls are discarded while the OSC string continues.
    ((< ch ?\s) nil)
    ;; Accumulate (limit length for safety)
-   ((< (length (ebb-parser-osc-string parser)) 65536)
-    (setf (ebb-parser-osc-string parser)
-          (concat (ebb-parser-osc-string parser) (string ch))))))
+   ((< (ebb-parser-osc-length parser) 65536)
+    (push (string ch) (ebb-parser-osc-parts parser))
+    (cl-incf (ebb-parser-osc-length parser)))))
 
 ;;;; ---- State: DCS Entry/Param/Passthrough -----------------------------
 
@@ -759,9 +715,9 @@ in process-char."
 (defun ebb-parse--dcs-passthrough (parser ch)
   "Accumulate DCS body.  ESC handled in process-char for ST."
   ;; Just accumulate (limit for safety)
-  (when (< (length (ebb-parser-dcs-string parser)) 1048576)
-    (setf (ebb-parser-dcs-string parser)
-          (concat (ebb-parser-dcs-string parser) (string ch)))))
+  (when (< (ebb-parser-dcs-length parser) 1048576)
+    (push (string ch) (ebb-parser-dcs-parts parser))
+    (cl-incf (ebb-parser-dcs-length parser))))
 
 ;;;; ---- State: Charset Designate ---------------------------------------
 
@@ -840,31 +796,16 @@ in process-char."
          (cond
           ;; TUI repaint streams are dominated by row/column addressing.
           ((= final-byte ?H)
-           (let ((row 0)
-                 (col 0)
-                 (in-col nil)
-                 (ok t)
-                 (i 0)
-                 (len (length param)))
-             (while (and ok (< i len))
-               (let ((ch (aref param i)))
-                 (cond
-                  ((and (>= ch ?0) (<= ch ?9))
-                   (if in-col
-                       (setq col (+ (* col 10) (- ch ?0)))
-                     (setq row (+ (* row 10) (- ch ?0)))))
-                  ((= ch ?\;)
-                   (if in-col
-                       (setq ok nil)
-                     (setq in-col t)))
-                  (t
-                   (setq ok nil))))
-               (cl-incf i))
-             (when ok
-               (ebb-screen-cursor-goto screen
-                                         (1- (if (zerop row) 1 row))
-                                         (1- (if (zerop col) 1 col)))
-               t)))
+           (when-let* ((coords (ebb-parse--cup-coords
+                                param 0 (length param))))
+             (ebb-screen-cursor-goto screen
+                                     (1- (if (zerop (car coords))
+                                             1
+                                           (car coords)))
+                                     (1- (if (zerop (cdr coords))
+                                             1
+                                           (cdr coords))))
+             t))
           ;; Full-screen clear is common at frame start.
           ((and (= final-byte ?J)
                 (= (length param) 1)
@@ -1356,7 +1297,7 @@ Pm=1: read, Pm=4: read maximum."
            (puthash screen height ebb-parse--page-lengths)
            (ebb-parse--emit parser 'resize-request width height))))
       ;; DECSLPP - set number of lines per page.
-      ((pred (lambda (value) (>= value 24)))
+      ((and value (guard (>= value 24)))
        (puthash screen (ebb-parse--param params 0 24)
                 ebb-parse--page-lengths))
       ;; Report terminal size in chars.
@@ -1391,10 +1332,12 @@ Pm=1: read, Pm=4: read maximum."
         (`(2 ,_color-space ,r ,g ,b)
          (ebb-screen-set-attr screen property (list r g b)))))))
 
-(defun ebb-parse--set-semicolon-sgr-color (screen params index attribute)
+(defun ebb-parse--set-semicolon-sgr-color (screen params index attribute
+                                                 &optional count)
   "Set SCREEN's ATTRIBUTE from semicolon-form PARAMS at INDEX.
-Return the number of additional parameters consumed."
-  (let ((len (length params)))
+COUNT bounds PARAMS when the vector is padded past its parsed
+length.  Return the number of additional parameters consumed."
+  (let ((len (or count (length params))))
     (if (>= (1+ index) len)
         0
       (let ((sub (aref params (1+ index))))
@@ -1427,6 +1370,27 @@ Return the number of additional parameters consumed."
         (_ 'line))))
     ((or 38 48 58)
      (ebb-parse--set-colon-sgr-color screen param))))
+
+(defun ebb-parse--sgr-step (screen params index &optional count)
+  "Apply the SGR parameter PARAMS[INDEX] on SCREEN.
+COUNT bounds PARAMS when the vector is padded past its parsed
+length.  Returns the total number of entries consumed, which is more
+than one for extended color forms (38/48/58).  Colon sub-parameter
+lists are handled here too, so this is the single dispatch point for
+SGR."
+  (let ((param (aref params index)))
+    (cond
+     ((listp param)
+      (ebb-parse--apply-colon-sgr screen param)
+      1)
+     ((memq param '(38 48 58))
+      (+ 1 (ebb-parse--set-semicolon-sgr-color
+            screen params index
+            (pcase param (38 :fg) (48 :bg) (58 :ul-color))
+            count)))
+     (t
+      (ebb-parse--apply-simple-sgr screen param)
+      1))))
 
 (defun ebb-parse--apply-simple-sgr (screen param)
   "Apply non-extended numeric SGR PARAM to SCREEN."
@@ -1470,19 +1434,8 @@ Private CSI sequences ending in `m' are not SGR and are ignored."
           (ebb-screen-reset-attr screen)
         (let ((i 0))
           (while (< i len)
-            (let ((param (aref params i)))
-              (cond
-               ((listp param)
-                (ebb-parse--apply-colon-sgr screen param))
-               ((memq param '(38 48 58))
-                (cl-incf
-                 i
-                 (ebb-parse--set-semicolon-sgr-color
-                  screen params i
-                  (pcase param (38 :fg) (48 :bg) (58 :ul-color)))))
-               (t
-                (ebb-parse--apply-simple-sgr screen param))))
-            (cl-incf i)))))))
+            (setq i (+ i (ebb-parse--sgr-step screen params i)))))))))
+
 
 ;;;; ---- OSC Helpers ----------------------------------------------------
 
@@ -1558,7 +1511,11 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
 (defun ebb-parse--dispatch-osc (parser)
   "Dispatch a completed OSC sequence."
   (condition-case err
-      (let* ((str (ebb-parser-osc-string parser))
+      (let* ((str (apply #'concat
+                         (nreverse
+                          (prog1
+                              (ebb-parser-osc-parts parser)
+                            (setf (ebb-parser-osc-parts parser) nil)))))
              (screen (ebb-parser-screen parser)))
         (if (string-match "\\`\\([0-9]+\\)\\(?:;\\(\\(?:.\\|\n\\)*\\)\\)?\\'" str)
             (let ((num (string-to-number (match-string 1 str)))
@@ -1737,7 +1694,11 @@ CODE is supplied, in which case CODE is used for extended colors."
   "Dispatch a completed DCS sequence."
   (condition-case err
       (let ((final (ebb-parser-dcs-final parser))
-            (body (ebb-parser-dcs-string parser))
+            (body (apply #'concat
+                         (nreverse
+                          (prog1
+                              (ebb-parser-dcs-parts parser)
+                            (setf (ebb-parser-dcs-parts parser) nil)))))
             (intermediates (ebb-parser-intermediates parser)))
         (cond
          ;; DECRQSS - request selection or setting status.

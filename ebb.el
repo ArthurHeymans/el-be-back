@@ -222,32 +222,28 @@ Options: `char', `semi-char', `emacs'."
   (when ebb--render
     (ebb-render--update-cursor ebb--render)))
 
+(defun ebb--switch-input-mode (mode)
+  "Enable the minor modes for input MODE and record it."
+  (ebb--semi-char-mode (if (eq mode 'semi-char) 1 -1))
+  (ebb--char-mode (if (eq mode 'char) 1 -1))
+  (setq ebb--input-mode mode)
+  (ebb--refresh-input-cursor)
+  (force-mode-line-update))
+
 (defun ebb-semi-char-mode ()
   "Switch to semi-char input mode."
   (interactive)
-  (ebb--char-mode -1)
-  (ebb--semi-char-mode 1)
-  (setq ebb--input-mode 'semi-char)
-  (ebb--refresh-input-cursor)
-  (force-mode-line-update))
+  (ebb--switch-input-mode 'semi-char))
 
 (defun ebb-char-mode ()
   "Switch to char input mode (all keys to terminal)."
   (interactive)
-  (ebb--semi-char-mode -1)
-  (ebb--char-mode 1)
-  (setq ebb--input-mode 'char)
-  (ebb--refresh-input-cursor)
-  (force-mode-line-update))
+  (ebb--switch-input-mode 'char))
 
 (defun ebb-emacs-mode ()
   "Switch to Emacs input mode (normal Emacs keys)."
   (interactive)
-  (ebb--semi-char-mode -1)
-  (ebb--char-mode -1)
-  (setq ebb--input-mode 'emacs)
-  (ebb--refresh-input-cursor)
-  (force-mode-line-update))
+  (ebb--switch-input-mode 'emacs))
 
 ;;;; ---- Self-Input Command ---------------------------------------------
 
@@ -345,11 +341,14 @@ N defaults to 1, E defaults to `last-command-event'."
       (when seq
         (ebb-io-send ebb--io seq)))))
 
-(defun ebb-yank ()
+(defun ebb-yank (&optional rotate)
   "Yank (paste) from the kill ring into the terminal.
-If bracketed paste mode is active, wraps in bracketed paste sequences."
+With ROTATE non-nil, replace the last yank with the next kill ring
+entry.  If bracketed paste mode is active, wraps in bracketed paste
+sequences."
   (interactive)
   (when ebb--io
+    (when rotate (current-kill 1))
     (let ((text (current-kill 0)))
       (when text
         (ebb-paste-string text)))))
@@ -357,11 +356,7 @@ If bracketed paste mode is active, wraps in bracketed paste sequences."
 (defun ebb-yank-pop ()
   "Yank-pop: replace the last yank with the next kill ring entry."
   (interactive)
-  (when ebb--io
-    (current-kill 1)
-    (let ((text (current-kill 0)))
-      (when text
-        (ebb-paste-string text)))))
+  (ebb-yank 'rotate))
 
 (defun ebb-send-password (&optional password)
   "Read PASSWORD from the minibuffer and send it to the terminal.
@@ -434,8 +429,11 @@ normal terminal input handling or appear in `view-lossage'."
                    'ebb-password-prompt-functions row))
       (setq ebb--password-prompt-active nil)
       (when (and pwd ebb--io)
-        ;; Send before clear-string; process-send-string may keep the string.
-        (ebb-io-send ebb--io (concat pwd "\r"))
+        ;; Send password and newline separately so `clear-string' wipes
+        ;; the only string holding the secret; a concatenation would
+        ;; keep an uncleared copy behind.
+        (ebb-io-send ebb--io pwd)
+        (ebb-io-send ebb--io "\r")
         (clear-string pwd))
       (setq ebb--password-handled-y y
             ebb--password-mode-p nil)
@@ -665,15 +663,9 @@ Called after each render.  Debounced so short-lived matches don't flash."
      (when ebb-show-title
        (ebb--set-title (car args))))
     ('cwd
-     (let ((path (ebb--cwd-to-path (car args) (cadr args))))
-       ;; Remote: trust the shell's report; a `file-directory-p' here
-       ;; would open a synchronous TRAMP connection on every cd.
-       (when (and path (if (file-remote-p path) t (file-directory-p path)))
-         (setq default-directory (file-name-as-directory path)
-               list-buffers-directory default-directory)
-         (when ebb-buffer-name-function
-           (ebb--rename-managed
-            (funcall ebb-buffer-name-function ebb--title))))))
+     (when ebb-enable-directory-tracking
+       (ebb--set-shell-cwd
+        (ebb--cwd-to-path (car args) (cadr args)))))
     ('cursor-style
      ;; Could update cursor display here
      nil)
@@ -755,8 +747,11 @@ Called after each render.  Debounced so short-lived matches don't flash."
              (not (cl-some (lambda (buf)
                              (and (not (eq buf (current-buffer)))
                                   (buffer-live-p buf)
-                                  (eq (buffer-local-value 'major-mode buf)
-                                      'ebb-mode)))
+                                  (or (eq (buffer-local-value 'major-mode buf)
+                                          'ebb-mode)
+                                      ;; Inline Eshell terminals keep the
+                                      ;; model in ordinary Eshell buffers.
+                                      (buffer-local-value 'ebb--io buf))))
                            (buffer-list))))
     (remove-function after-focus-change-function #'ebb--focus-change)
     (setq ebb--focus-change-installed nil)))
@@ -961,6 +956,19 @@ Called after each render.  Debounced so short-lived matches don't flash."
 
 ;;;; ---- Entry Points ---------------------------------------------------
 
+(defun ebb--set-shell-cwd (path)
+  "Adopt the shell-reported working directory PATH.
+Remote reports are trusted; a local path must exist (a synchronous
+TRAMP `file-directory-p' would open a connection on every cd).
+Also updates `list-buffers-directory' and renames the buffer when
+`ebb-buffer-name-function' is set."
+  (when (and path (if (file-remote-p path) t (file-directory-p path)))
+    (setq default-directory (file-name-as-directory path)
+          list-buffers-directory default-directory)
+    (when ebb-buffer-name-function
+      (ebb--rename-managed
+       (funcall ebb-buffer-name-function ebb--title)))))
+
 (defun ebb--buffers ()
   "Return live Ebb buffers sorted by name."
   (sort (seq-filter (lambda (buffer)
@@ -1128,28 +1136,11 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
     (with-current-buffer buf
       (ebb-mode)
       (setq ebb--session-id (buffer-name buf))
-      ;; Determine initial size from a window
-      (let* ((win (or (get-buffer-window buf)
-                      (selected-window)))
-             (width (max (window-max-chars-per-line win) 10))
-             (height (max (window-body-height win) 3)))
-        ;; Create screen model
-        (setq ebb--screen (ebb-screen-create width height))
-        (setf (ebb-screen-scrollback-max ebb--screen) ebb-scrollback-lines)
-        ;; Create renderer
-        (setq ebb--render (ebb-render-create ebb--screen buf))
-        ;; Create parser
-        (setq ebb--parser (ebb-parse-create ebb--screen nil
-                                                #'ebb--handle-event))
-        ;; Create I/O
-        (setq ebb--io (make-ebb-io
-                         :screen ebb--screen
-                         :parser ebb--parser
-                         :render ebb--render
-                         :buffer buf
-                         :chunk-size ebb-chunk-size
-                         :min-latency ebb-minimum-latency
-                         :max-latency ebb-maximum-latency))
+      ;; Create the screen/render/parser/I/O stack
+      (setq ebb--io (ebb-io-create-terminal buf #'ebb--handle-event)
+            ebb--screen (ebb-io-screen ebb--io)
+            ebb--render (ebb-io-render ebb--io)
+            ebb--parser (ebb-io-parser ebb--io))
         ;; Start process with shell integration env vars
         (ebb-io-start ebb--io shell buf
                         (ebb-shell-env-vars))
@@ -1165,7 +1156,7 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
         (pcase ebb-default-input-mode
           ('char (ebb-char-mode))
           ('emacs (ebb-emacs-mode))
-          (_ (ebb-semi-char-mode)))))
+          (_ (ebb-semi-char-mode))))
     ;; Display buffer
     (pop-to-buffer-same-window buf)
     ;; Resize to match actual window
@@ -1182,7 +1173,9 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
 (defun ebb-other-window (&optional program)
   "Start a terminal in another window."
   (interactive)
-  (let ((buf (ebb program)))
+  ;; `ebb' displays in the selected window; undo that display before
+  ;; switching so the terminal only ever shows up in the other window.
+  (let ((buf (save-window-excursion (ebb program))))
     (when buf
       (switch-to-buffer-other-window buf))))
 
@@ -1330,9 +1323,6 @@ Local paths omit the hostname; remote TRAMP paths keep the host."
                     (propertize "🔒Password" 'face 'warning))
                ebb--progress))
    " "))
-
-;; Add to mode-line
-(put 'ebb--input-mode 'risky-local-variable t)
 
 (add-hook 'ebb-io-after-render-functions #'ebb--detect-password-prompt)
 

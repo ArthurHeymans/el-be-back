@@ -134,7 +134,7 @@ A string KEY is committed input text from an input method."
                          ebb-input--arrow-keys-app
                        ebb-input--arrow-keys-normal))
              (base-seq (cdr (assq basic arrows))))
-        (if (and mods (not (equal mods nil)))
+        (if mods
             ;; Modified arrow: ESC [ 1 ; mod A
             (let ((mod-code (ebb-input--modifier-code mods))
                   (final (aref base-seq (1- (length base-seq)))))
@@ -144,7 +144,7 @@ A string KEY is committed input text from an input method."
      ;; ---- Function keys ----
      ((assq basic ebb-input--function-keys)
       (let ((base-seq (cdr (assq basic ebb-input--function-keys))))
-        (if (and mods (not (equal mods nil)))
+        (if mods
             ;; Modified: insert modifier before final char/~
             (ebb-input--add-modifier base-seq mods)
           base-seq)))
@@ -152,7 +152,7 @@ A string KEY is committed input text from an input method."
      ;; ---- Special keys (Insert, Delete, Home, End, Page*) ----
      ((assq basic ebb-input--special-keys)
       (let ((base-seq (cdr (assq basic ebb-input--special-keys))))
-        (if (and mods (not (equal mods nil)))
+        (if mods
             (ebb-input--add-modifier base-seq mods)
           base-seq)))
 
@@ -167,7 +167,7 @@ A string KEY is committed input text from an input method."
      ;; ---- Delete / Deletechar ----
      ((memq basic '(delete deletechar))
       (let ((base "\e[3~"))
-        (if (and mods (not (equal mods nil)))
+        (if mods
             (ebb-input--add-modifier base mods)
           base)))
 
@@ -498,19 +498,30 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
 
 ;;;; ---- Semi-Char Keymap -----------------------------------------------
 
-(defun ebb--prepare-semi-char-mode-map ()
-  "Build the semi-char mode keymap."
+(defun ebb-input-make-semi-char-map (categories emacs-mode-command
+                                                 &optional self-interrupt)
+  "Build a semi-char mode keymap for CATEGORIES.
+CATEGORIES passes to `ebb-input-make-keymap'.  EMACS-MODE-COMMAND is
+bound to C-c C-e to leave terminal input.  With SELF-INTERRUPT,
+C-c C-c sends a literal C-c to the terminal.  C-q quotes, and C-y/M-y
+paste from the kill ring."
   (let ((map (ebb-input-make-keymap
-              #'ebb-self-input '(:ascii :arrow :navigation :function)
+              #'ebb-self-input categories
               `([?\C-c] [?\C-q] [?\C-y] [?\e ?y]
                 ,@ebb-semi-char-non-bound-keys))))
-    ;; Overrides
     (define-key map (kbd "C-q") #'ebb-quoted-input)
     (define-key map (kbd "C-y") #'ebb-yank)
     (define-key map (kbd "M-y") #'ebb-yank-pop)
-    ;; C-c C-c sends literal C-c to terminal
-    (define-key map (kbd "C-c C-c") #'ebb-self-input)
+    (when self-interrupt
+      ;; C-c C-c sends literal C-c to terminal
+      (define-key map (kbd "C-c C-c") #'ebb-self-input))
+    (define-key map (kbd "C-c C-e") emacs-mode-command)
     map))
+
+(defun ebb--prepare-semi-char-mode-map ()
+  "Build the semi-char mode keymap."
+  (ebb-input-make-semi-char-map '(:ascii :arrow :navigation :function)
+                                  #'ebb-emacs-mode t))
 
 (defvar ebb-semi-char-mode-map
   (ignore-errors (ebb--prepare-semi-char-mode-map))

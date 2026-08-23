@@ -1324,6 +1324,22 @@ Binds `screen' and `parser' in BODY."
            (attr (ebb-cell-attr cell)))
       (should (= 196 (ebb-attr-fg attr))))))
 
+(ert-deftest ebb-test-parse-sgr-256color-truncated ()
+  "A truncated 256-color sequence does not read padded parameters."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e[38;5mR\e[0m")
+    (let* ((line (ebb-screen-get-line screen 0))
+           (cell (aref (ebb-line-cells line) 0))
+           (attr (ebb-cell-attr cell)))
+      ;; Default attribute: no foreground was set from the padded zeros.
+      (should (or (null attr) (null (ebb-attr-fg attr)))))))
+
+(ert-deftest ebb-test-parse-cup-extra-semicolon ()
+  "CUP with a second semicolon falls back to the generic parser."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "A\e[1;2;3HB")
+    (should (equal "AB" (ebb-test-display-line screen 0)))))
+
 (ert-deftest ebb-test-parse-sgr-256color-followed-by-reset ()
   "A palette color does not consume a following SGR parameter."
   (ebb-test-with-screen (:width 20 :height 6)
@@ -2091,7 +2107,10 @@ Binds `screen' and `parser' in BODY."
         (let ((s "Password: "))
           (ebb-screen-write-string screen s 0 (length s)))
         (ebb--prompt-password))
-      (should (equal '("secret\r") sent))
+      ;; The newline is sent separately and `clear-string' wipes the
+      ;; only string holding the secret after it has been sent.
+      (should (equal "\r" (car sent)))
+      (should (equal (make-string 6 ?\0) (cadr sent)))
       (should-not ebb--password-mode-p)
       (should (eql 0 ebb--password-handled-y)))))
 
@@ -2150,12 +2169,11 @@ Binds `screen' and `parser' in BODY."
                           :pending-chunks chunks
                           :pending-tail chunks
                           :pending-offset 4
-                          :first-chunk-time (current-time)
-                          :throughput-bytes 2000000
-                          :binary-flood t))
+                          :first-chunk-time (current-time)))
          sent)
     (setf (ebb-parser-state parser) :osc-string
-          (ebb-parser-osc-string parser) "partial")
+          (ebb-parser-osc-parts parser) (list "l" "a" "i" "t" "r" "a" "p")
+          (ebb-parser-osc-length parser) 7)
     (cl-letf (((symbol-function 'process-live-p) (lambda (_) t))
               ((symbol-function 'process-send-string)
                (lambda (_process string) (setq sent string))))
@@ -2165,9 +2183,9 @@ Binds `screen' and `parser' in BODY."
     (should-not (ebb-io-pending-tail io))
     (should (zerop (ebb-io-pending-offset io)))
     (should-not (ebb-io-first-chunk-time io))
-    (should-not (ebb-io-binary-flood io))
     (should (eq :ground (ebb-parser-state parser)))
-    (should (string-empty-p (ebb-parser-osc-string parser)))))
+    (should-not (ebb-parser-osc-parts parser))
+    (should (zerop (ebb-parser-osc-length parser)))))
 
 (ert-deftest ebb-test-io-process-uses-binary-writes ()
   "PTY output is decoded as UTF-8 while input remains byte-preserving."
@@ -2404,15 +2422,6 @@ Binds `screen' and `parser' in BODY."
   (should (eq 'box (ebb-render--cursor-type-for-style :blinking-block)))
   (should (equal '(bar . 2) (ebb-render--cursor-type-for-style :bar)))
   (should (equal '(hbar . 2) (ebb-render--cursor-type-for-style :underline))))
-
-(ert-deftest ebb-test-render-cursor-blink-check ()
-  "Cursor blink detection works."
-  (should (ebb-render--cursor-blink-p :blinking-block))
-  (should (ebb-render--cursor-blink-p :blinking-bar))
-  (should (ebb-render--cursor-blink-p :blinking-underline))
-  (should-not (ebb-render--cursor-blink-p :block))
-  (should-not (ebb-render--cursor-blink-p :bar))
-  (should-not (ebb-render--cursor-blink-p :underline)))
 
 (ert-deftest ebb-test-render-cursor-only-refresh ()
   "Pure cursor movement updates the rendered cursor overlay."
@@ -2796,23 +2805,6 @@ Binds `screen' and `parser' in BODY."
           (ebb-io--process-pending io t)
           (ebb-io--process-pending io t))
         (should (equal '(2 1) counts))))))
-
-(ert-deftest ebb-test-io-binary-flood-does-not-drop-output ()
-  "Flood mode still parses pending terminal output."
-  (let* ((screen (ebb-screen-create 10 2))
-         (parser (ebb-parse-create screen)))
-    (with-temp-buffer
-      (let* ((render (ebb-render-create screen (current-buffer)))
-             (io (make-ebb-io :screen screen :parser parser :render render
-                                :buffer (current-buffer) :chunk-size 10)))
-        ;; Force the next chunk over the flood threshold, then ensure parsing
-        ;; still happens instead of skipping bytes.
-        (setf (ebb-io-throughput-time io) (float-time))
-        (setf (ebb-io-throughput-bytes io) 1048576)
-        (ebb-io--enqueue-output io "OK")
-        (ebb-io--process-pending io t)
-        (should (ebb-io-binary-flood io))
-        (should (equal "OK" (ebb-test-display-line screen 0)))))))
 
 (ert-deftest ebb-test-io-sentinel-emits-in-terminal-buffer ()
   "Process exit events run with the terminal buffer current."

@@ -81,13 +81,23 @@ cycles are logged to a trace buffer."
     (add-hook 'kill-buffer-hook #'ebb-trace--stop nil t)
     (message "Trace started: %s" (buffer-name trace-buf))))
 
+(defun ebb-trace--other-traces-p ()
+  "Return non-nil when a buffer other than the current one is tracing."
+  (cl-some (lambda (buffer)
+             (and (not (eq buffer (current-buffer)))
+                  (buffer-live-p buffer)
+                  (buffer-local-value 'ebb-trace-mode buffer)))
+           (buffer-list)))
+
 (defun ebb-trace--stop ()
   "Stop tracing."
   (when ebb-trace--buffer
     (ebb-trace--log nil 'finish)
-    (advice-remove 'ebb-io--filter #'ebb-trace--filter-advice)
-    (advice-remove 'ebb-io-handle-resize #'ebb-trace--resize-advice)
-    (advice-remove 'ebb-render-refresh #'ebb-trace--refresh-advice)
+    ;; The advice is installed globally; keep it while other traces run.
+    (unless (ebb-trace--other-traces-p)
+      (advice-remove 'ebb-io--filter #'ebb-trace--filter-advice)
+      (advice-remove 'ebb-io-handle-resize #'ebb-trace--resize-advice)
+      (advice-remove 'ebb-render-refresh #'ebb-trace--refresh-advice))
     (remove-hook 'kill-buffer-hook #'ebb-trace--stop t)
     (setq ebb-trace--buffer nil)))
 
