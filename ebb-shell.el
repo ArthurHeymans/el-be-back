@@ -539,12 +539,12 @@ and `EAT_SHELL_INTEGRATION_DIR' environment variables.")
 (defcustom ebb-terminfo-directory
   (expand-file-name "terminfo" ebb-shell--install-path)
   "Directory containing terminfo databases.
-Set `TERMINFO' env var so terminal programs find the eat-truecolor
+Set `TERMINFO' env var so terminal programs find the ebb-truecolor
 terminfo entry."
   :type 'directory
   :group 'ebb-shell)
 
-(defcustom ebb-term-name "eat-truecolor"
+(defcustom ebb-term-name "ebb-truecolor"
   "Value of `TERM' environment variable for ebb terminals.
 Should match an available terminfo entry."
   :type 'string
