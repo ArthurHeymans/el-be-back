@@ -1462,6 +1462,62 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "\e]2;My Title\e\\")
     (should (equal "My Title" (ebb-screen-title screen)))))
 
+(ert-deftest ebb-test-parse-can-aborts-csi ()
+  "CAN aborts a pending CSI sequence; the final byte prints."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "A\e[5;3\x18mBX")
+    (should (equal "AmBX" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-parse-unknown-csi-intermediate-ignored ()
+  "Unknown CSI+intermediate sequences are ignored, not dispatched as plain CSI."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "ABCD\e[1;2H\e[ @")
+    (should (equal "ABCD" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-parse-malformed-csi-ignored ()
+  "A parameter byte after an intermediate byte ignores the whole sequence."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "AB\e[ 3qCD")
+    (should (equal "ABCD" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-parse-c1-st-terminates-osc ()
+  "C1 ST (U+009C) terminates a pending OSC string."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser (concat "\e]0;hello" (string #x9c) "X"))
+    (should (equal "hello" (ebb-screen-title screen)))
+    (should (equal "X" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-parse-c1-st-after-esc-completes-osc ()
+  "C1 ST after an ESC inside an OSC string still dispatches the string."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser (concat "\e]0;hello\e" (string #x9c) "X"))
+    (should (equal "hello" (ebb-screen-title screen)))
+    (should (equal "X" (ebb-test-display-line screen 0)))
+    (should (eq :ground (ebb-parser-state parser)))))
+
+(ert-deftest ebb-test-parse-osc-discards-c0 ()
+  "C0 controls inside an OSC string are discarded."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e]0;ti\nle\a")
+    (should (equal "tile" (ebb-screen-title screen)))))
+
+(ert-deftest ebb-test-parse-dcs-header-ignores-c0 ()
+  "C0 controls in the DCS header are ignored and the sequence continues."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\eP\n$qmBODY\e\\")
+    (should (equal "" (ebb-test-display-line screen 0)))
+    (should (eq :ground (ebb-parser-state parser)))))
+
+(ert-deftest ebb-test-parse-decstbm-ignores-private-marker ()
+  "CSI ? Ps r is not DECSTBM; only CSI Pt;Pb r sets the scroll region."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e[?5r")
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 5 (ebb-screen-scroll-bottom screen)))
+    (ebb-test-output parser "\e[2;4r")
+    (should (= 1 (ebb-screen-scroll-top screen)))
+    (should (= 3 (ebb-screen-scroll-bottom screen)))))
+
 (ert-deftest ebb-test-osc8-hyperlink-rendering ()
   "OSC 8 URIs and ids become clickable text properties."
   (ebb-test-with-screen (:width 30 :height 2)
@@ -2460,6 +2516,103 @@ Binds `screen' and `parser' in BODY."
             (should (= (point)
                        (overlay-start
                         (ebb-render-state-cursor-overlay render))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest ebb-test-render-emacs-mode-history-point-stops-following ()
+  "A history point prevents a viewport-anchored window from following output."
+  (let* ((screen (ebb-screen-create 8 3))
+         (buffer (generate-new-buffer " *ebb-test-history-follow*")))
+    (setf (ebb-screen-scrollback screen)
+          (cl-loop for id downfrom 9 to 0
+                   collect (make-ebb-history-line
+                            :id id :text (format "%03d" id)
+                            :text-length 3))
+          (ebb-screen-scrollback-length screen) 10
+          (ebb-screen-history-next-id screen) 10
+          (ebb-screen-history-generation screen) 1
+          (ebb-screen-history-logical-p screen) t)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (setq-local ebb--input-mode 'emacs)
+          (let ((render (ebb-render-create screen buffer)))
+            (ebb-render--rebuild-scrollback render 0 10 10 1)
+            (ebb-render-goto-location render 9 0 t)
+            ;; Model the transient state after C-p moved point into history,
+            ;; but before redisplay moved a bottom-following window-start.
+            (set-window-start (selected-window)
+                              (ebb-render-state-display-begin render) t)
+            (let ((point-anchor (ebb-render-buffer-anchor render)))
+              (push (make-ebb-history-line :id 10 :text "010" :text-length 3)
+                    (ebb-screen-scrollback screen))
+              (setf (ebb-screen-scrollback-length screen) 11
+                    (ebb-screen-history-next-id screen) 11
+                    (ebb-screen-history-generation screen) 2
+                    (ebb-screen-scrollback-dirty screen) t)
+              (ebb-render-refresh render)
+              (should (equal point-anchor
+                             (ebb-render-buffer-anchor render)))
+              (should (equal point-anchor
+                             (ebb-render-buffer-anchor
+                              render (window-start))))
+              ;; Once normalized to a history anchor, later output preserves
+              ;; both point and the reading window.
+              (let ((start-anchor
+                     (ebb-render-buffer-anchor render (window-start))))
+                (push (make-ebb-history-line
+                       :id 11 :text "011" :text-length 3)
+                      (ebb-screen-scrollback screen))
+                (setf (ebb-screen-scrollback-length screen) 12
+                      (ebb-screen-history-next-id screen) 12
+                      (ebb-screen-history-generation screen) 3
+                      (ebb-screen-scrollback-dirty screen) t)
+                (ebb-render-refresh render)
+                (should (equal point-anchor
+                               (ebb-render-buffer-anchor render)))
+                (should (equal start-anchor
+                               (ebb-render-buffer-anchor
+                                render (window-start))))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest ebb-test-render-emacs-mode-trimmed-point-keeps-viewport ()
+  "A trimmed history point does not pull a live window into scrollback."
+  (let* ((screen (ebb-screen-create 8 3))
+         (buffer (generate-new-buffer " *ebb-test-trimmed-history-point*")))
+    (setf (ebb-screen-scrollback screen)
+          (cl-loop for id downfrom 9 to 0
+                   collect (make-ebb-history-line
+                            :id id :text (format "%03d" id)
+                            :text-length 3))
+          (ebb-screen-scrollback-length screen) 10
+          (ebb-screen-history-next-id screen) 10
+          (ebb-screen-history-generation screen) 1
+          (ebb-screen-history-logical-p screen) t)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (setq-local ebb--input-mode 'emacs)
+          (let ((render (ebb-render-create screen buffer)))
+            (ebb-render--rebuild-scrollback render 0 10 10 1)
+            (ebb-render-goto-location render 0 0 t)
+            (set-window-start (selected-window)
+                              (ebb-render-state-display-begin render) t)
+            ;; Replace the bounded history with newer lines, trimming the
+            ;; logical line that anchors point.
+            (setf (ebb-screen-scrollback screen)
+                  (cl-loop for id downfrom 19 to 10
+                           collect (make-ebb-history-line
+                                    :id id :text (format "%03d" id)
+                                    :text-length 3))
+                  (ebb-screen-scrollback-length screen) 10
+                  (ebb-screen-history-next-id screen) 20
+                  (ebb-screen-history-generation screen) 2
+                  (ebb-screen-scrollback-dirty screen) t)
+            (ebb-render-refresh render)
+            (should (equal '(viewport 0 0)
+                           (ebb-render-buffer-anchor
+                            render (window-start))))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 

@@ -402,9 +402,28 @@ state are reconciled independently so metadata-only updates are visible."
                   (setq mark-active saved-mark-active))
               (set-marker (mark-marker) nil))
             (when (window-live-p saved-window)
-              (save-excursion
-                (ebb-render-goto-anchor render saved-window-start t)
-                (set-window-start saved-window (point) t))))
+              (let ((window-anchor
+                     ;; Point decides whether this window follows the live
+                     ;; viewport.  A transient state with point in history and
+                     ;; window-start in the viewport can occur after ordinary
+                     ;; point motion, before redisplay has exposed point.  Do
+                     ;; not restore those conflicting intentions: anchor the
+                     ;; reading window at point until redisplay establishes a
+                     ;; history window-start of its own.
+                     (if (and (eq (car-safe saved-point) 'history)
+                              (eq (car-safe saved-window-start) 'viewport)
+                              ;; A bounded scrollback refresh may have trimmed
+                              ;; the saved history line.  In that case there is
+                              ;; no reading position left to preserve, so keep
+                              ;; the live viewport anchor instead.
+                              (ebb-render--anchor-location
+                               render saved-point
+                               (ebb-screen-history-row-count screen)))
+                         saved-point
+                       saved-window-start)))
+                (save-excursion
+                  (ebb-render-goto-anchor render window-anchor t)
+                  (set-window-start saved-window (point) t)))))
           (run-hook-with-args 'ebb-render-after-refresh-hook render)))
       (ebb-screen-clear-dirty screen))))
 
