@@ -327,7 +327,6 @@ Eshell retain everything outside an inline terminal."
   (let ((render (make-ebb-render-state
                  :screen screen :buffer buffer
                  :history-cache (make-hash-table :test #'equal)))
-        (w (ebb-screen-width screen))
         (h (ebb-screen-height screen)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t)
@@ -339,9 +338,10 @@ Eshell retain everything outside an inline terminal."
           (set-marker-insertion-type region-end t)
           (delete-region region-begin region-end)
           (goto-char region-begin)
-          ;; Insert display lines (H lines of W spaces, newline-separated).
+          ;; Insert H empty display lines, newline-separated.  Row text is
+          ;; materialized on demand; trailing blank cells are never padded
+          ;; into the buffer so point cannot wander into dead space.
           (dotimes (i h)
-            (insert (make-string w ?\s))
             (when (< i (1- h)) (insert "\n")))
           (setf (ebb-render-state-region-begin render) region-begin
                 (ebb-render-state-region-end render) region-end)
@@ -554,10 +554,11 @@ state are reconciled independently so metadata-only updates are visible."
     (or (gethash key cache)
         (let* ((line (ebb-screen-history-render-row screen row))
                (string (concat
-                        (ebb-render--apply-line-metadata
-                         line
-                         (ebb-render--line-to-string-scrollback line width)
-                         width)
+                        (ebb-render--trim-trailing
+                         (ebb-render--apply-line-metadata
+                          line
+                          (ebb-render--line-to-string-scrollback line width)
+                          width))
                         "\n")))
           (put-text-property 0 (length string) 'ebb-history-id
                              (ebb-history-line-id logical) string)
@@ -878,6 +879,26 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
 
 ;;;; ---- Display Line Rendering -----------------------------------------
 
+(defun ebb-render--trim-trailing (string)
+  "Strip trailing unpropertized spaces from rendered STRING.
+Styled blanks (painted backgrounds, hyperlinks), invisible wide-cell
+spacers, and characters carrying shell metadata keep their padding.
+The width-only face on DEC double-size lines does not make otherwise
+empty padding significant."
+  (let ((end (length string)))
+    (while (and (> end 0)
+                (= (aref string (1- end)) ?\s)
+                (let ((properties
+                       (text-properties-at (1- end) string)))
+                  (or (null properties)
+                      (and (equal (plist-get properties 'face)
+                                  '(:width ultra-expanded))
+                           (cl-loop for (property _value) on properties
+                                    by #'cddr
+                                    always (eq property 'face))))))
+      (setq end (1- end)))
+    (if (= end (length string)) string (substring string 0 end))))
+
 (defun ebb-render--update-line (render row)
   "Re-render display line ROW in the buffer."
   (let* ((screen (ebb-render-state-screen render))
@@ -892,8 +913,10 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
                (eol (min (line-end-position)
                          (marker-position
                           (ebb-render-state-region-end render))))
-               (new (ebb-render--apply-line-metadata
-                     line (ebb-render--line-to-string line width) width)))
+               (new (ebb-render--trim-trailing
+                     (ebb-render--apply-line-metadata
+                      line (ebb-render--line-to-string line width)
+                      width))))
           ;; TUI programs often repaint rows with identical content.  Avoid a
           ;; buffer modification when the rendered text/properties are already
           ;; correct; cursor overlay movement is handled separately.
@@ -1175,21 +1198,40 @@ hint at the live terminal position."
       (if (not visible)
           (progn
             (overlay-put ov 'face nil)
+            (overlay-put ov 'after-string nil)
             (setq-local cursor-type nil))
-        (let (pos)
+        (let* ((region-end (marker-position
+                            (ebb-render-state-region-end render)))
+               pos after-string)
           (save-excursion
             (goto-char display-begin)
             (forward-line cy)
             (let* ((bol (point))
-                   (eol (min (line-end-position)
-                             (marker-position
-                              (ebb-render-state-region-end render)))))
-              (setq pos (min (+ bol cx) eol))
+                   (eol (min (line-end-position) region-end))
+                   (target (+ bol cx)))
+              (if (< target eol)
+                  (setq pos target)
+                ;; The cursor sits on a virtual cell beyond the row's
+                ;; trimmed content.  Draw it with an `after-string' at
+                ;; EOL instead of relying on buffer padding, which no
+                ;; longer exists.
+                (setq pos eol
+                      after-string
+                      (concat (make-string (max 0 (- target eol)) ?\s)
+                              (propertize " " 'face 'ebb-cursor)))
+                ;; Virtual cells must use the row's DEC rendition too;
+                ;; otherwise a double-size cursor lands too far left.
+                (unless (eq (ebb-line-rendition
+                             (ebb--line-at screen cy))
+                            'normal)
+                  (add-face-text-property
+                   0 (length after-string) '(:width ultra-expanded)
+                   t after-string)))
               (move-overlay ov pos
-                            (min (1+ pos)
-                                 (marker-position
-                                  (ebb-render-state-region-end render))))))
-          (overlay-put ov 'face 'ebb-cursor)
+                            (if after-string pos
+                              (min (1+ pos) region-end)))))
+          (overlay-put ov 'after-string after-string)
+          (overlay-put ov 'face (if after-string nil 'ebb-cursor))
           (if emacs-mode
               (setq-local cursor-type
                           (ebb-render--cursor-type-for-style style))
@@ -1312,9 +1354,10 @@ Used after resize when the display area size has changed."
           (dotimes (i h)
             (let ((line (ebb-screen-get-line screen i)))
               (insert (if line
-                          (ebb-render--apply-line-metadata
-                           line (ebb-render--line-to-string line w) w)
-                        (make-string w ?\s)))
+                          (ebb-render--trim-trailing
+                           (ebb-render--apply-line-metadata
+                            line (ebb-render--line-to-string line w) w))
+                        ""))
               (when (< i (1- h))
                 (insert "\n"))))
           ;; Now re-enable advance-on-insert so future scrollback
@@ -1371,9 +1414,11 @@ Used after resize when the display area size has changed."
             (dotimes (row height)
               (let ((line (ebb-screen-get-line screen row)))
                 (insert (if line
-                            (ebb-render--apply-line-metadata
-                             line (ebb-render--line-to-string line width) width)
-                          (make-string width ?\s)))
+                            (ebb-render--trim-trailing
+                             (ebb-render--apply-line-metadata
+                              line (ebb-render--line-to-string line width)
+                              width))
+                          ""))
                 (when (< row (1- height)) (insert "\n"))))
             (set-marker-insertion-type display-begin t))
           (ebb-render--update-cursor render)

@@ -258,12 +258,17 @@ Returns a string or nil."
            ((and pos-offset (integer-or-marker-p pt))
             (save-excursion
               (goto-char pt)
-              (let ((row (- (line-number-at-pos pt)
-                            (line-number-at-pos pos-offset)))
-                    (col (current-column)))
+              (let* ((row (- (line-number-at-pos pt)
+                             (line-number-at-pos pos-offset)))
+                     (col (current-column)))
+                ;; Display rows are trimmed past their last real cell, so a
+                ;; click right of the text lands at EOL.  Recover the clicked
+                ;; column from the event's visual position.
+                (when (eolp)
+                  (setq col (max col (car (posn-col-row posn t)))))
                 (cons col row))))
            (t
-            (posn-col-row posn))))
+            (posn-col-row posn t))))
     (when (and coords
                (<= 0 (car coords))
                (< (car coords) (ebb-screen-width screen))
