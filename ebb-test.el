@@ -2334,7 +2334,7 @@ Binds `screen' and `parser' in BODY."
           (with-temp-file (expand-file-name ".zshrc" home)
             (insert "print USER_ZSHRC\nPS1='USER> '\n"))
           (setenv "HOME" home)
-          (setenv "TERM" "eat-truecolor")
+          (setenv "TERM" "ebb-truecolor")
           (setenv "ZDOTDIR" nil)
           (setq process-environment
                 (append (ebb-io--prepare-environment
@@ -3593,7 +3593,7 @@ Binds `screen' and `parser' in BODY."
   (let ((cmd (ebb-io--remote-command '("/bin/bash" "-l" "-i") 24 80)))
     (should (equal '("/bin/sh" "-c") (list (nth 0 cmd) (nth 1 cmd))))
     (let ((script (nth 2 cmd)))
-      (should (string-match-p "infocmp eat-truecolor" script))
+      (should (string-match-p "infocmp ebb-truecolor" script))
       (should (string-match-p "TERM=xterm-256color" script))
       (should (string-match-p "export TERM COLORTERM" script))
       (should (string-match-p "rows 24 columns 80" script))

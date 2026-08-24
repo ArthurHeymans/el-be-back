@@ -308,7 +308,7 @@ EXTRA-ENV is the env var list (used to find integration dir)."
 
 (defun ebb-io--term-name ()
   "Return the TERM value ebb advertises."
-  (if (boundp 'ebb-term-name) ebb-term-name "eat-truecolor"))
+  (if (boundp 'ebb-term-name) ebb-term-name "ebb-truecolor"))
 
 (defun ebb-io--remote-command (shell-command rows columns)
   "Wrap SHELL-COMMAND for a remote (TRAMP) spawn.
