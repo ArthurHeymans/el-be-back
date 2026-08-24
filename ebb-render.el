@@ -1218,7 +1218,15 @@ hint at the live terminal position."
                 (setq pos eol
                       after-string
                       (concat (make-string (max 0 (- target eol)) ?\s)
-                              (propertize " " 'face 'ebb-cursor))))
+                              (propertize " " 'face 'ebb-cursor)))
+                ;; Virtual cells must use the row's DEC rendition too;
+                ;; otherwise a double-size cursor lands too far left.
+                (unless (eq (ebb-line-rendition
+                             (ebb--line-at screen cy))
+                            'normal)
+                  (add-face-text-property
+                   0 (length after-string) '(:width ultra-expanded)
+                   t after-string)))
               (move-overlay ov pos
                             (if after-string pos
                               (min (1+ pos) region-end)))))

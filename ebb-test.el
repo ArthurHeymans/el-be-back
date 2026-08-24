@@ -2504,6 +2504,27 @@ Binds `screen' and `parser' in BODY."
             (should (get-text-property (1- (length after)) 'face after))
             (should-not (get-text-property 0 'face after))))))))
 
+(ert-deftest ebb-test-render-virtual-cursor-keeps-line-rendition ()
+  "Virtual cursor cells retain DEC double-size line rendering."
+  (let* ((screen (ebb-screen-create 10 2))
+         (parser (ebb-parse-create screen)))
+    (with-temp-buffer
+      (let ((render (ebb-render-create screen (current-buffer))))
+        (ebb-render-refresh render)
+        (ebb-test-output parser "\e#6Hi\e[1;5H")
+        (ebb-render-refresh render)
+        (let* ((after (overlay-get
+                       (ebb-render-state-cursor-overlay render)
+                       'after-string))
+               (cursor-face (get-text-property
+                             (1- (length after)) 'face after)))
+          (should (= (length after) 3))
+          (should (equal 'ultra-expanded
+                         (plist-get (get-text-property 0 'face after)
+                                    :width)))
+          (should (memq 'ebb-cursor cursor-face))
+          (should (member '(:width ultra-expanded) cursor-face)))))))
+
 (ert-deftest ebb-test-render-cursor-only-refresh ()
   "Pure cursor movement updates the rendered cursor overlay."
   (let* ((screen (ebb-screen-create 5 3))
