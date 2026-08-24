@@ -2416,12 +2416,93 @@ Binds `screen' and `parser' in BODY."
                      (ebb-test--mouse-event 'down-mouse-1 (point-min))
                      screen display-begin))))))
 
+(ert-deftest ebb-test-mouse-trimmed-row-recovers-window-column ()
+  "Clicks past trimmed text use the window-relative visual column."
+  (let ((screen (ebb-screen-create 10 3))
+        used-window)
+    (with-temp-buffer
+      (insert "abc\n\n")
+      (cl-letf (((symbol-function 'posn-col-row)
+                 (lambda (_posn &optional use-window)
+                   (setq used-window use-window)
+                   '(7 . 0))))
+        (should (equal '(7 . 0)
+                       (ebb-input--mouse-coordinates
+                        (ebb-test--mouse-event 'down-mouse-1 4)
+                        screen (point-min))))
+        (should used-window)))))
+
 (ert-deftest ebb-test-render-cursor-type-mapping ()
   "Cursor style maps to correct Emacs cursor-type."
   (should (eq 'box (ebb-render--cursor-type-for-style :block)))
   (should (eq 'box (ebb-render--cursor-type-for-style :blinking-block)))
   (should (equal '(bar . 2) (ebb-render--cursor-type-for-style :bar)))
   (should (equal '(hbar . 2) (ebb-render--cursor-type-for-style :underline))))
+
+(ert-deftest ebb-test-render-trims-trailing-padding ()
+  "Viewport rows end at their last real cell, not at the grid width."
+  (let* ((screen (ebb-screen-create 10 3))
+         (parser (ebb-parse-create screen)))
+    (with-temp-buffer
+      (let ((render (ebb-render-create screen (current-buffer))))
+        (ebb-render-refresh render)
+        (ebb-test-output parser "abc")
+        (ebb-render-refresh render)
+        (should (equal "abc\n\n" (buffer-string)))
+        ;; Motion therefore stops at real content.
+        (goto-char (point-min))
+        (end-of-line)
+        (should (= 3 (current-column)))))))
+
+(ert-deftest ebb-test-render-keeps-styled-trailing-cells ()
+  "Styled blank cells keep their padding; only default blanks are trimmed."
+  (let* ((screen (ebb-screen-create 10 3))
+         (parser (ebb-parse-create screen)))
+    (with-temp-buffer
+      (let ((render (ebb-render-create screen (current-buffer))))
+        (ebb-render-refresh render)
+        (ebb-test-output parser "\e[41m   \e[0mab")
+        (ebb-render-refresh render)
+        (should (equal "   ab\n\n" (buffer-string)))
+        (should (get-text-property 0 'face (buffer-substring
+                                            (point-min) (+ (point-min) 3))))))))
+
+(ert-deftest ebb-test-render-trims-double-width-padding ()
+  "DEC double-size width faces do not preserve empty row padding."
+  (let* ((screen (ebb-screen-create 10 2))
+         (parser (ebb-parse-create screen)))
+    (with-temp-buffer
+      (let ((render (ebb-render-create screen (current-buffer))))
+        (ebb-render-refresh render)
+        (ebb-test-output parser "\e#6Hi")
+        (ebb-render-refresh render)
+        (should (equal "Hi\n" (buffer-string)))
+        (should (equal 'ultra-expanded
+                       (plist-get (get-text-property (point-min) 'face)
+                                  :width)))))))
+
+(ert-deftest ebb-test-render-virtual-cursor-past-eol ()
+  "A cursor right of trimmed content is drawn with an `after-string'."
+  (let* ((screen (ebb-screen-create 10 3))
+         (parser (ebb-parse-create screen)))
+    (with-temp-buffer
+      (let ((render (ebb-render-create screen (current-buffer))))
+        (ebb-render-refresh render)
+        (ebb-test-output parser "abc\e[1;8H")
+        (ebb-render-refresh render)
+        (let* ((ov (ebb-render-state-cursor-overlay render))
+               (after (overlay-get ov 'after-string)))
+          (should after)
+          ;; Overlay anchors at EOL of the cursor row; the string bridges
+          ;; columns 3..7 and paints column 7 with the cursor face.
+          (save-excursion
+            (goto-char (ebb-render-state-display-begin render))
+            (should (= (overlay-start ov)
+                       (+ (point-min) 3)))
+            (should (= (length after) 5))
+            (should (string-suffix-p " " (substring-no-properties after)))
+            (should (get-text-property (1- (length after)) 'face after))
+            (should-not (get-text-property 0 'face after))))))))
 
 (ert-deftest ebb-test-render-cursor-only-refresh ()
   "Pure cursor movement updates the rendered cursor overlay."
@@ -2433,12 +2514,16 @@ Binds `screen' and `parser' in BODY."
         (let ((before (overlay-start (ebb-render-state-cursor-overlay render))))
           (ebb-test-output parser "\e[2;3H")
           (ebb-render-refresh render)
+          ;; Row 2 is empty, so the cursor sits on a virtual cell drawn via
+          ;; `after-string' at EOL.
           (let ((after (overlay-start (ebb-render-state-cursor-overlay render))))
             (should (/= before after))
+            (should (overlay-get
+                     (ebb-render-state-cursor-overlay render) 'after-string))
             (save-excursion
               (goto-char (ebb-render-state-display-begin render))
               (forward-line 1)
-              (should (= after (+ (point) 2))))))))))
+              (should (= after (point))))))))))
 
 (ert-deftest ebb-test-render-keeps-display-begin-at-viewport-start ()
   "Updating row zero does not move the scrollback/display boundary."
@@ -2463,7 +2548,7 @@ Binds `screen' and `parser' in BODY."
                     (ebb-render-state-display-begin render))))
         (should (equal '("AAAAA" "BBBBB" "CCCCC" "DDDDD")
                        (ebb-test-display-text screen)))
-        (should (equal "AAAAA \nBBBBB \nCCCCC \nDDDDD "
+        (should (equal "AAAAA\nBBBBB\nCCCCC\nDDDDD"
                        (buffer-string)))))))
 
 (ert-deftest ebb-test-render-emacs-mode-preserves-view ()
@@ -2709,11 +2794,11 @@ Binds `screen' and `parser' in BODY."
         (ebb-screen-index screen)
         (ebb-render-refresh render)
         (should (= 1 (ebb-render-state-scrollback-count render)))
-        (should (string-prefix-p "A  \n" (buffer-string)))
+        (should (string-prefix-p "A\n" (buffer-string)))
         (ebb-screen-erase-in-display screen 3)
         (ebb-render-refresh render)
         (should (= 0 (ebb-render-state-scrollback-count render)))
-        (should-not (string-prefix-p "A  \n" (buffer-string)))))))
+        (should-not (string-prefix-p "A\n" (buffer-string)))))))
 
 (ert-deftest ebb-test-render-region-preserves-surrounding-buffer ()
   "A bounded render region never rewrites surrounding Eshell text."
@@ -3395,11 +3480,22 @@ Binds `screen' and `parser' in BODY."
           (should first-end)
           (should second-end)
           ;; Later replacement of a prompt row must retain model metadata.
+          ;; Note the replacement may change the row's rendered length
+          ;; (rows are trimmed), so recapture positions afterwards.
           (ebb-test-output parser "\e[1;6H!")
           (ebb-render-refresh render)
           (ebb-shell-post-render render)
           (should (get-text-property first-begin 'ebb-shell-prompt-begin))
-          (should (get-text-property first-end 'ebb-shell-prompt-end))
+          (setq first-begin
+                (text-property-any (point-min) (point-max)
+                                   'ebb-shell-prompt-begin t))
+          (setq first-end
+                (text-property-any (point-min) (point-max)
+                                   'ebb-shell-prompt-end t))
+          (setq second-end
+                (and first-end
+                     (text-property-any (1+ first-end) (point-max)
+                                        'ebb-shell-prompt-end t)))
           (setq-local ebb--input-mode 'semi-char)
           (goto-char (point-max))
           (ebb-previous-prompt)
