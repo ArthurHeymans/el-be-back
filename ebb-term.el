@@ -1448,6 +1448,83 @@ only join with a line that was auto-wrapped."
           (cl-decf column))
         (cons previous column))))))
 
+(defconst ebb--emoji-presentation-bases
+  '((#x00a9 . #x00a9) (#x00ae . #x00ae) (#x203c . #x203c) (#x2049 . #x2049)
+    (#x2122 . #x2122) (#x2139 . #x2139) (#x2194 . #x2199) (#x21a9 . #x21aa)
+    (#x231a . #x231b) (#x2328 . #x2328) (#x23cf . #x23cf) (#x23e9 . #x23ef)
+    (#x23f0 . #x23f0) (#x23f1 . #x23f3) (#x23f8 . #x23fa) (#x24c2 . #x24c2)
+    (#x25aa . #x25ab) (#x25b6 . #x25b6) (#x25c0 . #x25c0) (#x25fb . #x25fe)
+    (#x2600 . #x2604) (#x260e . #x260e) (#x2611 . #x2611) (#x2614 . #x2615)
+    (#x2618 . #x2618) (#x261d . #x261d) (#x2620 . #x2620) (#x2622 . #x2623)
+    (#x2626 . #x2626) (#x262a . #x262a) (#x262e . #x262f) (#x2638 . #x263a)
+    (#x2640 . #x2640) (#x2642 . #x2642) (#x2648 . #x2653) (#x265f . #x2660)
+    (#x2663 . #x2663) (#x2665 . #x2666) (#x2668 . #x2668) (#x267b . #x267b)
+    (#x267e . #x267f) (#x2692 . #x2692) (#x2694 . #x2697) (#x2699 . #x2699)
+    (#x269b . #x269c) (#x26a0 . #x26a1) (#x26a7 . #x26a7) (#x26b0 . #x26b1)
+    (#x26c4 . #x26c5) (#x26c8 . #x26c8) (#x26ce . #x26cf) (#x26d1 . #x26d1)
+    (#x26d3 . #x26d4) (#x26e9 . #x26ea) (#x26f0 . #x26f5) (#x26f7 . #x26fa)
+    (#x26fd . #x26fd) (#x2702 . #x2702) (#x2708 . #x270d) (#x270f . #x270f)
+    (#x2712 . #x2712) (#x2714 . #x2714) (#x2716 . #x2716) (#x271d . #x271d)
+    (#x2721 . #x2721) (#x2733 . #x2734) (#x2744 . #x2744) (#x2747 . #x2747)
+    (#x274c . #x274c) (#x274e . #x274e) (#x2753 . #x2755) (#x2757 . #x2757)
+    (#x2763 . #x2764) (#x2795 . #x2797) (#x27a1 . #x27a1) (#x27b0 . #x27b0)
+    (#x27bf . #x27bf) (#x2934 . #x2935) (#x2b05 . #x2b07) (#x2b1b . #x2b1c)
+    (#x2b50 . #x2b50) (#x2b55 . #x2b55))
+  "Characters that render double-width followed by VARIATION SELECTOR-16.
+Approximates the text-default list from Unicode's
+emoji-variation-sequences.txt.  Characters already double-width under
+`char-width' are excluded; for those the selector is an ordinary
+zero-width suffix.")
+
+(defsubst ebb--emoji-presentation-base-p (char)
+  "Return non-nil when CHAR widens with an emoji presentation selector."
+  (cl-loop for range in ebb--emoji-presentation-bases
+           when (and (>= char (car range)) (<= char (cdr range)))
+           return t))
+
+(defun ebb--apply-emoji-presentation (screen)
+  "Apply emoji presentation to the cell before SCREEN's cursor.
+Called with U+FE0F pending: when the preceding character renders as
+emoji presentation, base and selector occupy two columns, so a
+continuation cell is inserted after it.  Returns non-nil when applied;
+otherwise the caller appends the selector as an ordinary zero-width
+suffix."
+  (when-let* ((target (ebb--previous-cell screen))
+              (line (car target))
+              (column (cdr target))
+              (cells (ebb-line-cells line))
+              (cell (aref cells column))
+              ((= (ebb-cell-width cell) 1))
+              ((ebb--emoji-presentation-base-p (ebb-cell-char cell)))
+              ((< (1+ column) (ebb-screen-width screen))))
+    ;; Rebuild the row with the base widened to two columns and a new
+    ;; continuation cell behind it, shifting the tail right by one.
+    (let ((wide (copy-ebb-cell cell)))
+      (setf (ebb-cell-width wide) 2
+            (ebb-cell-combining wide)
+            (concat (ebb-cell-combining cell) "\uFE0F"))
+      (setf (ebb-line-cells line)
+            (vconcat (substring cells 0 column)
+                     (list wide)
+                     (list (make-ebb-cell :char ?\s :width 0
+                                          :attr (ebb-cell-attr cell)))
+                     (substring cells (1+ column)
+                                (1- (length cells))))))
+    (setf (ebb-line-text line) nil
+          (ebb-line-attr-runs line) nil
+          (ebb-line-uniform-attr line) nil
+          (ebb-line-rendered line) nil
+          (ebb-line-dirty line) t)
+    ;; Continue writing after the two-column sequence.
+    (setf (ebb-screen-cursor-x screen) (+ column 2))
+    (ebb--mark-dirty screen
+                     (if (eq line
+                             (ebb--line-at screen
+                                           (ebb-screen-cursor-y screen)))
+                         (ebb-screen-cursor-y screen)
+                       (1- (ebb-screen-cursor-y screen))))
+    t))
+
 (defun ebb--append-to-previous-cell (screen char)
   "Append zero-width CHAR to the cell before SCREEN's cursor."
   (when-let* ((target (ebb--previous-cell screen))
@@ -1587,7 +1664,9 @@ Handles combining and double-width characters."
          (char-width (ebb--char-display-width char)))
     (catch 'ebb-screen-write-char
       (when (zerop char-width)
-        (ebb--append-to-previous-cell screen char)
+        (unless (and (= char #xfe0f)
+                     (ebb--apply-emoji-presentation screen))
+          (ebb--append-to-previous-cell screen char))
         (throw 'ebb-screen-write-char nil))
       (when (ebb--append-joined-char screen char)
         (throw 'ebb-screen-write-char nil))

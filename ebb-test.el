@@ -164,6 +164,44 @@ Binds `screen' and `parser' in BODY."
                              (ebb-render--line-to-string
                               (ebb-screen-get-line screen 0) 5)))))
 
+(ert-deftest ebb-test-vs16-emoji-presentation-widens ()
+  "A text-default emoji followed by VS16 occupies two cells."
+  (let ((vs "\uFE0F"))
+    (ebb-test-with-screen (:width 5 :height 1)
+      (ebb-test-output parser (concat "\u2764" vs "b"))
+      (let ((cells (ebb-line-cells (ebb-screen-get-line screen 0))))
+        (should (= ?\u2764 (ebb-cell-char (aref cells 0))))
+        (should (= 2 (ebb-cell-width (aref cells 0))))
+        (should (equal vs (ebb-cell-combining (aref cells 0))))
+        (should (zerop (ebb-cell-width (aref cells 1))))
+        ;; The shifted tail keeps its content.
+        (should (= ?b (ebb-cell-char (aref cells 2)))))
+      (should (equal (concat "\u2764" vs "b")
+                     (ebb-test-display-line screen 0)))
+      (should (equal '(3 . 0) (ebb-test-cursor screen))))))
+
+(ert-deftest ebb-test-vs16-after-non-emoji-stays-zero-width ()
+  "VS16 after a character outside the presentation table is a suffix."
+  (let ((vs "\uFE0F"))
+    (ebb-test-with-screen (:width 5 :height 1)
+      (ebb-test-output parser (concat "a" vs))
+      (let ((cell (aref (ebb-line-cells (ebb-screen-get-line screen 0)) 0)))
+        (should (= ?a (ebb-cell-char cell)))
+        (should (= 1 (ebb-cell-width cell)))
+        (should (equal vs (ebb-cell-combining cell))))
+      (should (equal '(1 . 0) (ebb-test-cursor screen))))))
+
+(ert-deftest ebb-test-vs16-after-wide-emoji-is-suffix ()
+  "VS16 after an already double-width emoji does not widen again."
+  (let ((vs "\uFE0F"))
+    (ebb-test-with-screen (:width 5 :height 1)
+      (ebb-test-output parser (concat "\U0001f600" vs))
+      (let ((cell (aref (ebb-line-cells (ebb-screen-get-line screen 0)) 0)))
+        (should (= #x1f600 (ebb-cell-char cell)))
+        (should (= 2 (ebb-cell-width cell)))
+        (should (equal vs (ebb-cell-combining cell))))
+      (should (equal '(2 . 0) (ebb-test-cursor screen))))))
+
 (ert-deftest ebb-test-auto-wrap ()
   "Auto-wrap moves to next line at end of line."
   (ebb-test-with-screen (:width 5 :height 3)
