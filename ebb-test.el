@@ -1191,6 +1191,24 @@ Binds `screen' and `parser' in BODY."
       (ebb-test-output parser "\e[?69h\e[?69$p")
       (should (equal "\e[?69;1$y" (car responses))))))
 
+(ert-deftest ebb-test-parse-synchronized-output ()
+  "DEC 2026 synchronized output tracks mode state and answers DECRQM."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (should-not (ebb-screen-sync-output screen))
+      (ebb-test-output parser "\e[?2026h\e[?2026$p")
+      (should (ebb-screen-sync-output screen))
+      (should (equal "\e[?2026;1$y" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\e[?2026l\e[?2026$p")
+      (should-not (ebb-screen-sync-output screen))
+      (should (equal "\e[?2026;2$y" (car responses)))
+      ;; RIS clears a stuck mode.
+      (ebb-test-output parser "\e[?2026h\ec")
+      (should-not (ebb-screen-sync-output screen)))))
+
 (ert-deftest ebb-test-parse-decrqss ()
   "DECRQSS reports current rendition and margin state."
   (ebb-test-with-screen (:width 10 :height 5)
@@ -2893,6 +2911,51 @@ Binds `screen' and `parser' in BODY."
         (ebb-io--enqueue-output io "OK")
         (ebb-io--process-pending io t)
         (should (eq seen render))))))
+
+(ert-deftest ebb-test-io-holds-frame-during-synchronized-output ()
+  "DEC 2026 defers rendering until the application releases the frame."
+  (let* ((screen (ebb-screen-create 5 2))
+         (parser (ebb-parse-create screen))
+         (renders 0))
+    (with-temp-buffer
+      (let* ((render (ebb-render-create screen (current-buffer)))
+             (io (make-ebb-io :screen screen :parser parser :render render
+                              :buffer (current-buffer))))
+        (cl-letf (((symbol-function 'ebb-render-refresh)
+                   (lambda (_) (cl-incf renders)))
+                  ((symbol-function 'run-at-time) (lambda (&rest _) 'timer))
+                  ((symbol-function 'cancel-timer) #'ignore))
+          ;; Output inside an open synchronized-update window is parsed
+          ;; but not rendered.
+          (ebb-io--enqueue-output io "\e[?2026hOK")
+          (ebb-io--process-pending io)
+          (should (ebb-screen-sync-output screen))
+          (should (= renders 0))
+          (should (ebb-io-sync-timer io))
+          ;; The release flushes the held frame.
+          (ebb-io--enqueue-output io "\e[?2026l")
+          (ebb-io--process-pending io t)
+          (should (= renders 1))
+          (should-not (ebb-io-sync-timer io)))))))
+
+(ert-deftest ebb-test-io-synchronized-output-timeout-forces-refresh ()
+  "A stuck synchronized-output window only delays its redraw."
+  (let* ((screen (ebb-screen-create 5 2))
+         (parser (ebb-parse-create screen))
+         (renders 0))
+    (with-temp-buffer
+      (let* ((render (ebb-render-create screen (current-buffer)))
+             (io (make-ebb-io :screen screen :parser parser :render render
+                              :buffer (current-buffer))))
+        (cl-letf (((symbol-function 'ebb-render-refresh)
+                   (lambda (_) (cl-incf renders))))
+          (ebb-io--enqueue-output io "\e[?2026hOK")
+          (ebb-io--process-pending io)
+          (should (= renders 0))
+          ;; The safety flush renders even though the mode is still set.
+          (ebb-io--sync-timeout io)
+          (should (= renders 1))
+          (should-not (ebb-io-sync-timer io)))))))
 
 (ert-deftest ebb-test-io-processing-errors-are-counted ()
   "Repeated asynchronous processing errors reach the error hook with a count."

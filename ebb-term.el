@@ -126,7 +126,7 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (scroll-top 0) (scroll-bottom 23)
   ;; Mode flags
   (auto-wrap t) (insert-mode nil) (origin-mode nil)
-  (keypad-mode nil) (bracketed-paste nil)
+  (keypad-mode nil) (bracketed-paste nil) (sync-output nil)
   ;; Mouse
   (mouse-mode nil) (mouse-sgr nil) (mouse-pressed nil) (focus-events nil)
   ;; Character sets
@@ -2834,7 +2834,9 @@ DECCOLM clears the display, restores full-screen margins, and homes the cursor."
            (ebb-screen-enter-alt screen))
        (ebb-screen-leave-alt screen)
        (ebb-screen-restore-cursor screen)))
-    (2004 (setf (ebb-screen-bracketed-paste screen) value))))
+    (2004 (setf (ebb-screen-bracketed-paste screen) value))
+    ;; DEC 2026 synchronized output: the renderer holds frames while set.
+    (2026 (setf (ebb-screen-sync-output screen) value))))
 
 (defun ebb-screen-set-cursor-style (screen style)
   "Set the cursor style.  STYLE: 0-6."
@@ -3281,6 +3283,7 @@ OFFSET, when non-nil, is translated to the normalized cell sequence."
         (ebb-screen-insert-mode screen) nil
         (ebb-screen-origin-mode screen) nil
         (ebb-screen-keypad-mode screen) nil
+        (ebb-screen-sync-output screen) nil
         (ebb-screen-cursor-visible screen) t
         (ebb-screen-charset-g0 screen) 'us-ascii
         (ebb-screen-charset-g1 screen) 'us-ascii
@@ -3335,6 +3338,7 @@ OFFSET, when non-nil, is translated to the normalized cell sequence."
     (setf (ebb-screen-insert-mode screen) nil)
     (setf (ebb-screen-origin-mode screen) nil)
     (setf (ebb-screen-keypad-mode screen) nil)
+    (setf (ebb-screen-sync-output screen) nil)
     (setf (ebb-screen-bracketed-paste screen) nil)
     (setf (ebb-screen-mouse-mode screen) nil)
     (setf (ebb-screen-mouse-sgr screen) nil)
