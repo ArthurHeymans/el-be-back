@@ -1088,6 +1088,46 @@ Resolves per TRAMP method via `ebb-tramp-shells'; falls back to
                         '("-l" "-i")))))
     (cons program args)))
 
+(defun ebb--start (program display-function)
+  "Start PROGRAM after DISPLAY-FUNCTION places the terminal buffer.
+DISPLAY-FUNCTION receives the new buffer.  Displaying it before constructing
+and starting the terminal ensures the screen and PTY use their final window
+size from the outset."
+  (let* ((shell (or program
+                    (and (file-remote-p default-directory)
+                         (ebb--remote-shell))
+                    ebb-default-shell
+                    (getenv "SHELL")
+                    shell-file-name
+                    "/bin/sh"))
+         (buf (generate-new-buffer ebb-buffer-name)))
+    (with-current-buffer buf
+      (ebb-mode)
+      (setq ebb--session-id (buffer-name buf)))
+    (funcall display-function buf)
+    (with-current-buffer buf
+      ;; Construct the terminal only after BUF is in its destination window.
+      ;; Starting it earlier causes an immediate resize and SIGWINCH; Readline
+      ;; may then redraw the first prompt while its original output is pending.
+      (setq ebb--io (ebb-io-create-terminal buf #'ebb--handle-event)
+            ebb--screen (ebb-io-screen ebb--io)
+            ebb--render (ebb-io-render ebb--io)
+            ebb--parser (ebb-io-parser ebb--io))
+      (ebb-io-start ebb--io shell buf (ebb-shell-env-vars))
+      ;; Initial directory-based name (before any OSC title).
+      ;; Leave custom/project buffer names alone until OSC updates.
+      (when (and ebb-buffer-name-function
+                 (or (equal (buffer-name) "*ebb*")
+                     (string-match-p "\\`\\*ebb\\*<[0-9]+>\\'"
+                                     (buffer-name))))
+        (ebb--rename-managed
+         (funcall ebb-buffer-name-function nil)))
+      (pcase ebb-default-input-mode
+        ('char (ebb-char-mode))
+        ('emacs (ebb-emacs-mode))
+        (_ (ebb-semi-char-mode))))
+    buf))
+
 ;;;###autoload
 (defun ebb (&optional program)
   "Start a terminal emulator.
@@ -1124,60 +1164,13 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
       (when existing
         (pop-to-buffer-same-window existing)
         (cl-return-from ebb existing))))
-  (let* ((shell (or program
-                    (and (file-remote-p default-directory)
-                         (ebb--remote-shell))
-                    ebb-default-shell
-                    (getenv "SHELL")
-                    shell-file-name
-                    "/bin/sh"))
-         (buf (generate-new-buffer ebb-buffer-name)))
-    ;; Set up mode first
-    (with-current-buffer buf
-      (ebb-mode)
-      (setq ebb--session-id (buffer-name buf))
-      ;; Create the screen/render/parser/I/O stack
-      (setq ebb--io (ebb-io-create-terminal buf #'ebb--handle-event)
-            ebb--screen (ebb-io-screen ebb--io)
-            ebb--render (ebb-io-render ebb--io)
-            ebb--parser (ebb-io-parser ebb--io))
-        ;; Start process with shell integration env vars
-        (ebb-io-start ebb--io shell buf
-                        (ebb-shell-env-vars))
-        ;; Initial directory-based name (before any OSC title).
-        ;; Leave custom/project buffer names alone until OSC updates.
-        (when (and ebb-buffer-name-function
-                   (or (equal (buffer-name) "*ebb*")
-                       (string-match-p "\\`\\*ebb\\*<[0-9]+>\\'"
-                                       (buffer-name))))
-          (ebb--rename-managed
-           (funcall ebb-buffer-name-function nil)))
-        ;; Set default input mode
-        (pcase ebb-default-input-mode
-          ('char (ebb-char-mode))
-          ('emacs (ebb-emacs-mode))
-          (_ (ebb-semi-char-mode))))
-    ;; Display buffer
-    (pop-to-buffer-same-window buf)
-    ;; Resize to match actual window
-    (when ebb--io
-      (let ((win (get-buffer-window buf)))
-        (when win
-          (ebb-io-handle-resize
-           ebb--io
-           (window-max-chars-per-line win)
-           (window-body-height win)))))
-    buf))
+  (ebb--start program #'pop-to-buffer-same-window))
 
 ;;;###autoload
 (defun ebb-other-window (&optional program)
   "Start a terminal in another window."
   (interactive)
-  ;; `ebb' displays in the selected window; undo that display before
-  ;; switching so the terminal only ever shows up in the other window.
-  (let ((buf (save-window-excursion (ebb program))))
-    (when buf
-      (switch-to-buffer-other-window buf))))
+  (ebb--start program #'switch-to-buffer-other-window))
 
 ;;;###autoload
 (defun ebb-project ()

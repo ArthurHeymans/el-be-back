@@ -3309,6 +3309,33 @@ Binds `screen' and `parser' in BODY."
               (when (buffer-live-p buffer) (kill-buffer buffer)))
             (list a b)))))
 
+(ert-deftest ebb-test-other-window-starts-at-destination-size ()
+  "Other-window terminals start only after reaching their destination window."
+  (let (buffer target started-size)
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (setq target (split-window-right))
+          (let ((ebb-buffer-name " *ebb-other-window-start*"))
+            (cl-letf (((symbol-function 'switch-to-buffer-other-window)
+                       (lambda (buf &optional _norecord)
+                         (select-window target)
+                         (set-window-buffer target buf)
+                         buf))
+                      ((symbol-function 'ebb-io-start)
+                       (lambda (io _shell buf &optional _env)
+                         (should (eq target (selected-window)))
+                         (should (eq buf (window-buffer target)))
+                         (setq started-size
+                               (cons (ebb-screen-width (ebb-io-screen io))
+                                     (ebb-screen-height (ebb-io-screen io)))))))
+              (setq buffer (ebb-other-window '("/bin/true")))))
+          (should (equal
+                   (cons (window-max-chars-per-line target)
+                         (window-body-height target))
+                   started-size)))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 (ert-deftest ebb-test-project-reuses-renamed-buffer ()
   "Project terminals use project names and stable identities after OSC titles."
   (let* ((root (file-name-as-directory (make-temp-file "ebb-project-" t)))
