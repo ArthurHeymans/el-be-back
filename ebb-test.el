@@ -180,6 +180,19 @@ Binds `screen' and `parser' in BODY."
                      (ebb-test-display-line screen 0)))
       (should (equal '(3 . 0) (ebb-test-cursor screen))))))
 
+(ert-deftest ebb-test-vs16-at-right-edge-sets-pending-wrap ()
+  "Widening a presentation sequence at the right edge wraps safely."
+  (let ((vs "\uFE0F"))
+    (ebb-test-with-screen (:width 5 :height 2)
+      (ebb-test-output parser (concat "abc\u2764" vs))
+      (should (equal '(4 . 0) (ebb-test-cursor screen)))
+      (should (ebb-screen-pending-wrap screen))
+      (ebb-test-output parser "x")
+      (should (equal (concat "abc\u2764" vs)
+                     (ebb-test-display-line screen 0)))
+      (should (equal "x" (ebb-test-display-line screen 1)))
+      (should (equal '(1 . 1) (ebb-test-cursor screen))))))
+
 (ert-deftest ebb-test-vs16-after-non-emoji-stays-zero-width ()
   "VS16 after a character outside the presentation table is a suffix."
   (let ((vs "\uFE0F"))
@@ -308,6 +321,22 @@ Binds `screen' and `parser' in BODY."
       (should (string-match-p "ls -al" text))
       (should (string-match-p "file" text)))
     (should (equal "$" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-erase-display-skips-duplicate-repaint-history ()
+  "Repeated ED 2 repaints do not duplicate an unchanged main-screen frame."
+  (ebb-test-with-screen (:width 8 :height 2)
+    (ebb-test-output parser "frame")
+    (ebb-test-output parser "\e[H\e[2J")
+    (let ((history-length (ebb-screen-scrollback-length screen)))
+      (should (= 1 history-length))
+      (ebb-test-output parser "frame")
+      (ebb-test-output parser "\e[H\e[2J")
+      (should (= history-length (ebb-screen-scrollback-length screen))))
+    ;; Clearing history also clears the duplicate-frame guard.
+    (ebb-screen-erase-in-display screen 3)
+    (ebb-test-output parser "frame")
+    (ebb-test-output parser "\e[H\e[2J")
+    (should (= 1 (ebb-screen-scrollback-length screen)))))
 
 (ert-deftest ebb-test-erase-in-line ()
   "Erase in line works for all modes."

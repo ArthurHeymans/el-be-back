@@ -166,6 +166,10 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (make-hash-table :test #'eq :weakness 'key)
   "Screens whose next render should show the live viewport from its top.")
 
+(defvar ebb--preserved-display-signatures
+  (make-hash-table :test #'eq :weakness 'key)
+  "Last main-screen viewport snapshot preserved for each screen.")
+
 (defvar ebb--saved-cursor-renditions
   (make-hash-table :test #'eq :weakness 'key)
   "Extended DECSC state keyed by screen without changing the screen layout.")
@@ -827,6 +831,7 @@ KIND may be `append' for ENTRY or `last' for an extended newest line."
   (setf (ebb-screen-scrollback screen) nil
         (ebb-screen-scrollback-length screen) 0
         (ebb-screen-scrollback-dirty screen) t)
+  (remhash screen ebb--preserved-display-signatures)
   (ebb--history-changed screen))
 
 (defun ebb--history-normalize (screen)
@@ -1515,8 +1520,15 @@ suffix."
           (ebb-line-uniform-attr line) nil
           (ebb-line-rendered line) nil
           (ebb-line-dirty line) t)
-    ;; Continue writing after the two-column sequence.
-    (setf (ebb-screen-cursor-x screen) (+ column 2))
+    ;; Continue writing after the two-column sequence, preserving the terminal's
+    ;; pending-wrap convention when the widened cell reaches the right edge.
+    (let ((new-column (+ column 2))
+          (screen-width (ebb-screen-width screen)))
+      (if (>= new-column screen-width)
+          (setf (ebb-screen-cursor-x screen) (1- screen-width)
+                (ebb-screen-pending-wrap screen)
+                (and (ebb-screen-auto-wrap screen) t))
+        (setf (ebb-screen-cursor-x screen) new-column)))
     (ebb--mark-dirty screen
                      (if (eq line
                              (ebb--line-at screen
@@ -2159,8 +2171,20 @@ Handles LF, VT, FF."
                (ebb--trim-trailing-blank-cells
                 (ebb--line-ensure-cells line width))))))
 
+(defun ebb--line-history-signature (line width)
+  "Return a stable content signature for LINE at WIDTH."
+  (list (ebb-line-wrapped line)
+        (ebb-line-rendition line)
+        (copy-sequence (ebb-line-prompt-begins line))
+        (copy-sequence (ebb-line-prompt-ends line))
+        (cl-loop for cell across (ebb--line-ensure-cells line width)
+                 collect (list (ebb-cell-char cell)
+                               (ebb-cell-combining cell)
+                               (ebb-cell-width cell)
+                               (ebb-cell-attr cell)))))
+
 (defun ebb--history-preserve-display (screen)
-  "Append SCREEN's meaningful main-screen viewport rows to history."
+  "Append changed, meaningful main-screen viewport rows to history."
   (unless (ebb-screen-alt-screen screen)
     (let* ((width (ebb-screen-width screen))
            (end (ebb-screen-height screen)))
@@ -2168,15 +2192,23 @@ Handles LF, VT, FF."
                   (ebb--line-empty-for-history-p
                    (ebb--line-at screen (1- end)) width))
         (cl-decf end))
-      (when (> end 0)
-        (let ((ebb--history-batch-screen screen)
-              (ebb--history-batch-rows nil))
-          (unwind-protect
-              (dotimes (row end)
-                (ebb--history-push-row
-                 screen (ebb--line-at screen row) width))
-            (ebb--history-flush-batch)
-            (ebb--trim-scrollback screen)))))))
+      (let ((signature
+             (cons width
+                   (cl-loop for row below end
+                            collect (ebb--line-history-signature
+                                     (ebb--line-at screen row) width)))))
+        (unless (equal signature
+                       (gethash screen ebb--preserved-display-signatures))
+          (puthash screen signature ebb--preserved-display-signatures)
+          (when (> end 0)
+            (let ((ebb--history-batch-screen screen)
+                  (ebb--history-batch-rows nil))
+              (unwind-protect
+                  (dotimes (row end)
+                    (ebb--history-push-row
+                     screen (ebb--line-at screen row) width))
+                (ebb--history-flush-batch)
+                (ebb--trim-scrollback screen)))))))))
 
 (defun ebb-screen--erase-in-display-unprotected (screen mode)
   "Erase in display without preserving protected cells."
