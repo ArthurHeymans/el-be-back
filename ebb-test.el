@@ -297,6 +297,18 @@ Binds `screen' and `parser' in BODY."
     (should (equal "XX" (ebb-test-display-line screen 1)))
     (should (equal "" (ebb-test-display-line screen 2)))))
 
+(ert-deftest ebb-test-erase-display-preserves-main-viewport-in-history ()
+  "ED 2 keeps cleared shell output available as main-screen history."
+  (ebb-test-with-screen (:width 8 :height 4)
+    (ebb-test-output parser "ls -al\r\nfile\r\n$ ")
+    (should (= 0 (ebb-screen-history-row-count screen)))
+    (ebb-test-output parser "\e[H\e[2J$ ")
+    (should (> (ebb-screen-history-row-count screen) 0))
+    (let ((text (ebb-screen-plain-text screen)))
+      (should (string-match-p "ls -al" text))
+      (should (string-match-p "file" text)))
+    (should (equal "$" (ebb-test-display-line screen 0)))))
+
 (ert-deftest ebb-test-erase-in-line ()
   "Erase in line works for all modes."
   (ebb-test-with-screen (:width 10 :height 3)
@@ -2861,6 +2873,67 @@ Binds `screen' and `parser' in BODY."
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
+(ert-deftest ebb-test-render-height-resize-keeps-live-viewport-visible ()
+  "A minibuffer-style height resize keeps a live terminal out of scrollback."
+  (save-window-excursion
+    (let* ((screen (ebb-screen-create 5 4))
+           (parser (ebb-parse-create screen))
+           (buffer (generate-new-buffer " *ebb-height-follow-test*")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'semi-char)
+            (let ((render (ebb-render-create screen buffer)))
+              (setf (ebb-screen-scrollback screen)
+                    (list (make-ebb-line :text "old  " :cells-valid nil))
+                    (ebb-screen-scrollback-length screen) 1
+                    (ebb-screen-scrollback-dirty screen) t)
+              (ebb-render-refresh render)
+              (ebb-test-output parser "\e[H\e[2Jprompt")
+              (ebb-render-refresh render)
+              (let ((display-begin
+                     (ebb-render-state-display-begin render)))
+                (should (= (window-start) (marker-position display-begin)))
+                ;; Model Emacs moving only window-start during a temporary
+                ;; shrink while window-point remains at the live cursor.
+                (set-window-start (selected-window) (point-min) t)
+                (should (< (window-start) (marker-position display-begin)))
+                (ebb-screen-resize screen 5 3)
+                (ebb-render-resize-height render)
+                (should (= (window-start)
+                           (marker-position display-begin))))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest ebb-test-render-height-resize-preserves-emacs-history-view ()
+  "Emacs mode keeps an intentional history view across a height resize."
+  (save-window-excursion
+    (let* ((screen (ebb-screen-create 5 4))
+           (buffer (generate-new-buffer " *ebb-height-emacs-test*")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'emacs)
+            (let ((render (ebb-render-create screen buffer)))
+              (setf (ebb-screen-scrollback screen)
+                    (list (make-ebb-line :text "old  " :cells-valid nil))
+                    (ebb-screen-scrollback-length screen) 1
+                    (ebb-screen-scrollback-dirty screen) t)
+              (ebb-render-refresh render)
+              (goto-char (ebb-render-state-display-begin render))
+              (set-window-point (selected-window) (point))
+              (set-window-start (selected-window) (point-min) t)
+              (let ((start-anchor
+                     (ebb-render-buffer-anchor render (window-start))))
+                (should (eq 'history (car start-anchor)))
+                (ebb-screen-resize screen 5 3)
+                (ebb-render-resize-height render)
+                (should (equal start-anchor
+                               (ebb-render-buffer-anchor
+                                render (window-start)))))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest ebb-test-render-scrollback-clear-reconciles-buffer ()
   "ED 3 clears both model scrollback and rendered scrollback."
   (let* ((screen (ebb-screen-create 3 2))
@@ -3192,7 +3265,8 @@ Binds `screen' and `parser' in BODY."
       (should (equal '("l" "control") redraw))
       (if (cdr clear)
           (should-not (ebb-screen-scrollback screen))
-        (should (= 1 (ebb-screen-scrollback-length screen)))))))
+        ;; Existing history plus the two meaningful viewport rows.
+        (should (= 3 (ebb-screen-scrollback-length screen)))))))
 
 (ert-deftest ebb-test-copy-all-plain-text-soft-wraps ()
   "Copy-all trims padding and omits newlines across soft-wrapped rows."
@@ -3689,10 +3763,11 @@ Binds `screen' and `parser' in BODY."
           (should (eq ebb--input-mode 'emacs))
           (should (= (point) (marker-position (cdar index))))
           (should (looking-at-p "  echo one")))
-        ;; Once model rows are erased/evicted, their properties yield no index.
+        ;; Clearing the viewport retains command metadata in scrollback.
         (ebb-screen-erase-in-display screen 2)
         (ebb-render-refresh render)
-        (should-not (ebb-shell-imenu-create-index))))))
+        (should (equal '("echo one" "printf two")
+                       (mapcar #'car (ebb-shell-imenu-create-index))))))))
 
 (ert-deftest ebb-test-shell-pending-events ()
   "OSC 51 B and C sequences queue pending events."

@@ -1402,10 +1402,28 @@ Used after resize when the display area size has changed."
          (height (ebb-screen-height screen)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (let ((inhibit-read-only t)
-              (inhibit-modification-hooks t)
-              (buffer-undo-list t)
-              (display-begin (ebb-render-state-display-begin render)))
+        (let* ((inhibit-read-only t)
+               (inhibit-modification-hooks t)
+               (buffer-undo-list t)
+               (display-begin (ebb-render-state-display-begin render))
+               (emacs-mode (eq (bound-and-true-p ebb--input-mode) 'emacs))
+               (windows
+                (cl-loop for window in (get-buffer-window-list buffer nil t)
+                         collect
+                         (cons window
+                               (ebb-render-buffer-anchor
+                                render (window-start window)))))
+               ;; A shrinking window may move `window-start' into scrollback
+               ;; before this hook runs merely to keep its live cursor visible.
+               ;; In terminal input modes window-point identifies windows that
+               ;; should continue following the terminal.  Emacs mode must
+               ;; instead preserve intentional history scrolling.
+               (following-windows
+                (unless emacs-mode
+                  (cl-loop for (window . _anchor) in windows
+                           when (>= (window-point window)
+                                    (marker-position display-begin))
+                           collect window))))
           (ebb-render--update-scrollback render)
           (save-excursion
             (goto-char display-begin)
@@ -1422,6 +1440,15 @@ Used after resize when the display area size has changed."
                 (when (< row (1- height)) (insert "\n"))))
             (set-marker-insertion-type display-begin t))
           (ebb-render--update-cursor render)
+          (dolist (entry windows)
+            (when (window-live-p (car entry))
+              (if (memq (car entry) following-windows)
+                  (set-window-start (car entry) display-begin t)
+                (if-let* ((position
+                           (ebb-render--anchor-buffer-position
+                            render (cdr entry))))
+                    (set-window-start (car entry) position t)
+                  (set-window-start (car entry) display-begin t)))))
           (ebb-render--apply-viewport-reset render)
           (ebb-screen-clear-dirty screen)
           (ebb-screen-clear-scrollback-dirty screen))))))

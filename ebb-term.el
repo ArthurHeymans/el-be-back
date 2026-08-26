@@ -2149,6 +2149,35 @@ Handles LF, VT, FF."
 
 ;;;; ---- Erasing --------------------------------------------------------
 
+(defun ebb--line-empty-for-history-p (line width)
+  "Return non-nil when LINE has no content worth preserving in history."
+  (and (not (ebb-line-wrapped line))
+       (eq (ebb-line-rendition line) 'normal)
+       (null (ebb-line-prompt-begins line))
+       (null (ebb-line-prompt-ends line))
+       (zerop (length
+               (ebb--trim-trailing-blank-cells
+                (ebb--line-ensure-cells line width))))))
+
+(defun ebb--history-preserve-display (screen)
+  "Append SCREEN's meaningful main-screen viewport rows to history."
+  (unless (ebb-screen-alt-screen screen)
+    (let* ((width (ebb-screen-width screen))
+           (end (ebb-screen-height screen)))
+      (while (and (> end 0)
+                  (ebb--line-empty-for-history-p
+                   (ebb--line-at screen (1- end)) width))
+        (cl-decf end))
+      (when (> end 0)
+        (let ((ebb--history-batch-screen screen)
+              (ebb--history-batch-rows nil))
+          (unwind-protect
+              (dotimes (row end)
+                (ebb--history-push-row
+                 screen (ebb--line-at screen row) width))
+            (ebb--history-flush-batch)
+            (ebb--trim-scrollback screen)))))))
+
 (defun ebb-screen--erase-in-display-unprotected (screen mode)
   "Erase in display without preserving protected cells."
   (let ((cy (ebb-screen-cursor-y screen))
@@ -2163,6 +2192,10 @@ Handles LF, VT, FF."
        (cl-loop for r from 0 below cy
                 do (ebb--erase-whole-line screen r)))
       (2 ;; Erase whole display
+       ;; Keep cleared main-screen content available to Emacs-mode history.
+       ;; This makes shell Ctrl-L visually clear the viewport without deleting
+       ;; output that has not yet naturally scrolled off its top edge.
+       (ebb--history-preserve-display screen)
        (ebb-screen-mark-viewport-reset screen)
        (let ((bg (and (ebb-screen-current-attr screen)
                       (ebb-attr-bg (ebb-screen-current-attr screen)))))
