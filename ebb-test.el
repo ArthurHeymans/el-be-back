@@ -164,6 +164,57 @@ Binds `screen' and `parser' in BODY."
                              (ebb-render--line-to-string
                               (ebb-screen-get-line screen 0) 5)))))
 
+(ert-deftest ebb-test-vs16-emoji-presentation-widens ()
+  "A text-default emoji followed by VS16 occupies two cells."
+  (let ((vs "\uFE0F"))
+    (ebb-test-with-screen (:width 5 :height 1)
+      (ebb-test-output parser (concat "\u2764" vs "b"))
+      (let ((cells (ebb-line-cells (ebb-screen-get-line screen 0))))
+        (should (= ?\u2764 (ebb-cell-char (aref cells 0))))
+        (should (= 2 (ebb-cell-width (aref cells 0))))
+        (should (equal vs (ebb-cell-combining (aref cells 0))))
+        (should (zerop (ebb-cell-width (aref cells 1))))
+        ;; The shifted tail keeps its content.
+        (should (= ?b (ebb-cell-char (aref cells 2)))))
+      (should (equal (concat "\u2764" vs "b")
+                     (ebb-test-display-line screen 0)))
+      (should (equal '(3 . 0) (ebb-test-cursor screen))))))
+
+(ert-deftest ebb-test-vs16-at-right-edge-sets-pending-wrap ()
+  "Widening a presentation sequence at the right edge wraps safely."
+  (let ((vs "\uFE0F"))
+    (ebb-test-with-screen (:width 5 :height 2)
+      (ebb-test-output parser (concat "abc\u2764" vs))
+      (should (equal '(4 . 0) (ebb-test-cursor screen)))
+      (should (ebb-screen-pending-wrap screen))
+      (ebb-test-output parser "x")
+      (should (equal (concat "abc\u2764" vs)
+                     (ebb-test-display-line screen 0)))
+      (should (equal "x" (ebb-test-display-line screen 1)))
+      (should (equal '(1 . 1) (ebb-test-cursor screen))))))
+
+(ert-deftest ebb-test-vs16-after-non-emoji-stays-zero-width ()
+  "VS16 after a character outside the presentation table is a suffix."
+  (let ((vs "\uFE0F"))
+    (ebb-test-with-screen (:width 5 :height 1)
+      (ebb-test-output parser (concat "a" vs))
+      (let ((cell (aref (ebb-line-cells (ebb-screen-get-line screen 0)) 0)))
+        (should (= ?a (ebb-cell-char cell)))
+        (should (= 1 (ebb-cell-width cell)))
+        (should (equal vs (ebb-cell-combining cell))))
+      (should (equal '(1 . 0) (ebb-test-cursor screen))))))
+
+(ert-deftest ebb-test-vs16-after-wide-emoji-is-suffix ()
+  "VS16 after an already double-width emoji does not widen again."
+  (let ((vs "\uFE0F"))
+    (ebb-test-with-screen (:width 5 :height 1)
+      (ebb-test-output parser (concat "\U0001f600" vs))
+      (let ((cell (aref (ebb-line-cells (ebb-screen-get-line screen 0)) 0)))
+        (should (= #x1f600 (ebb-cell-char cell)))
+        (should (= 2 (ebb-cell-width cell)))
+        (should (equal vs (ebb-cell-combining cell))))
+      (should (equal '(2 . 0) (ebb-test-cursor screen))))))
+
 (ert-deftest ebb-test-auto-wrap ()
   "Auto-wrap moves to next line at end of line."
   (ebb-test-with-screen (:width 5 :height 3)
@@ -258,6 +309,34 @@ Binds `screen' and `parser' in BODY."
     (should (equal "XXXXX" (ebb-test-display-line screen 0)))
     (should (equal "XX" (ebb-test-display-line screen 1)))
     (should (equal "" (ebb-test-display-line screen 2)))))
+
+(ert-deftest ebb-test-erase-display-preserves-main-viewport-in-history ()
+  "ED 2 keeps cleared shell output available as main-screen history."
+  (ebb-test-with-screen (:width 8 :height 4)
+    (ebb-test-output parser "ls -al\r\nfile\r\n$ ")
+    (should (= 0 (ebb-screen-history-row-count screen)))
+    (ebb-test-output parser "\e[H\e[2J$ ")
+    (should (> (ebb-screen-history-row-count screen) 0))
+    (let ((text (ebb-screen-plain-text screen)))
+      (should (string-match-p "ls -al" text))
+      (should (string-match-p "file" text)))
+    (should (equal "$" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-erase-display-skips-duplicate-repaint-history ()
+  "Repeated ED 2 repaints do not duplicate an unchanged main-screen frame."
+  (ebb-test-with-screen (:width 8 :height 2)
+    (ebb-test-output parser "frame")
+    (ebb-test-output parser "\e[H\e[2J")
+    (let ((history-length (ebb-screen-scrollback-length screen)))
+      (should (= 1 history-length))
+      (ebb-test-output parser "frame")
+      (ebb-test-output parser "\e[H\e[2J")
+      (should (= history-length (ebb-screen-scrollback-length screen))))
+    ;; Clearing history also clears the duplicate-frame guard.
+    (ebb-screen-erase-in-display screen 3)
+    (ebb-test-output parser "frame")
+    (ebb-test-output parser "\e[H\e[2J")
+    (should (= 1 (ebb-screen-scrollback-length screen)))))
 
 (ert-deftest ebb-test-erase-in-line ()
   "Erase in line works for all modes."
@@ -1190,6 +1269,24 @@ Binds `screen' and `parser' in BODY."
       (setq responses nil)
       (ebb-test-output parser "\e[?69h\e[?69$p")
       (should (equal "\e[?69;1$y" (car responses))))))
+
+(ert-deftest ebb-test-parse-synchronized-output ()
+  "DEC 2026 synchronized output tracks mode state and answers DECRQM."
+  (ebb-test-with-screen (:width 10 :height 5)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (should-not (ebb-screen-sync-output screen))
+      (ebb-test-output parser "\e[?2026h\e[?2026$p")
+      (should (ebb-screen-sync-output screen))
+      (should (equal "\e[?2026;1$y" (car responses)))
+      (setq responses nil)
+      (ebb-test-output parser "\e[?2026l\e[?2026$p")
+      (should-not (ebb-screen-sync-output screen))
+      (should (equal "\e[?2026;2$y" (car responses)))
+      ;; RIS clears a stuck mode.
+      (ebb-test-output parser "\e[?2026h\ec")
+      (should-not (ebb-screen-sync-output screen)))))
 
 (ert-deftest ebb-test-parse-decrqss ()
   "DECRQSS reports current rendition and margin state."
@@ -2805,6 +2902,67 @@ Binds `screen' and `parser' in BODY."
         (when (buffer-live-p buffer)
           (kill-buffer buffer))))))
 
+(ert-deftest ebb-test-render-height-resize-keeps-live-viewport-visible ()
+  "A minibuffer-style height resize keeps a live terminal out of scrollback."
+  (save-window-excursion
+    (let* ((screen (ebb-screen-create 5 4))
+           (parser (ebb-parse-create screen))
+           (buffer (generate-new-buffer " *ebb-height-follow-test*")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'semi-char)
+            (let ((render (ebb-render-create screen buffer)))
+              (setf (ebb-screen-scrollback screen)
+                    (list (make-ebb-line :text "old  " :cells-valid nil))
+                    (ebb-screen-scrollback-length screen) 1
+                    (ebb-screen-scrollback-dirty screen) t)
+              (ebb-render-refresh render)
+              (ebb-test-output parser "\e[H\e[2Jprompt")
+              (ebb-render-refresh render)
+              (let ((display-begin
+                     (ebb-render-state-display-begin render)))
+                (should (= (window-start) (marker-position display-begin)))
+                ;; Model Emacs moving only window-start during a temporary
+                ;; shrink while window-point remains at the live cursor.
+                (set-window-start (selected-window) (point-min) t)
+                (should (< (window-start) (marker-position display-begin)))
+                (ebb-screen-resize screen 5 3)
+                (ebb-render-resize-height render)
+                (should (= (window-start)
+                           (marker-position display-begin))))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest ebb-test-render-height-resize-preserves-emacs-history-view ()
+  "Emacs mode keeps an intentional history view across a height resize."
+  (save-window-excursion
+    (let* ((screen (ebb-screen-create 5 4))
+           (buffer (generate-new-buffer " *ebb-height-emacs-test*")))
+      (unwind-protect
+          (with-current-buffer buffer
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'emacs)
+            (let ((render (ebb-render-create screen buffer)))
+              (setf (ebb-screen-scrollback screen)
+                    (list (make-ebb-line :text "old  " :cells-valid nil))
+                    (ebb-screen-scrollback-length screen) 1
+                    (ebb-screen-scrollback-dirty screen) t)
+              (ebb-render-refresh render)
+              (goto-char (ebb-render-state-display-begin render))
+              (set-window-point (selected-window) (point))
+              (set-window-start (selected-window) (point-min) t)
+              (let ((start-anchor
+                     (ebb-render-buffer-anchor render (window-start))))
+                (should (eq 'history (car start-anchor)))
+                (ebb-screen-resize screen 5 3)
+                (ebb-render-resize-height render)
+                (should (equal start-anchor
+                               (ebb-render-buffer-anchor
+                                render (window-start)))))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest ebb-test-render-scrollback-clear-reconciles-buffer ()
   "ED 3 clears both model scrollback and rendered scrollback."
   (let* ((screen (ebb-screen-create 3 2))
@@ -2893,6 +3051,51 @@ Binds `screen' and `parser' in BODY."
         (ebb-io--enqueue-output io "OK")
         (ebb-io--process-pending io t)
         (should (eq seen render))))))
+
+(ert-deftest ebb-test-io-holds-frame-during-synchronized-output ()
+  "DEC 2026 defers rendering until the application releases the frame."
+  (let* ((screen (ebb-screen-create 5 2))
+         (parser (ebb-parse-create screen))
+         (renders 0))
+    (with-temp-buffer
+      (let* ((render (ebb-render-create screen (current-buffer)))
+             (io (make-ebb-io :screen screen :parser parser :render render
+                              :buffer (current-buffer))))
+        (cl-letf (((symbol-function 'ebb-render-refresh)
+                   (lambda (_) (cl-incf renders)))
+                  ((symbol-function 'run-at-time) (lambda (&rest _) 'timer))
+                  ((symbol-function 'cancel-timer) #'ignore))
+          ;; Output inside an open synchronized-update window is parsed
+          ;; but not rendered.
+          (ebb-io--enqueue-output io "\e[?2026hOK")
+          (ebb-io--process-pending io)
+          (should (ebb-screen-sync-output screen))
+          (should (= renders 0))
+          (should (ebb-io-sync-timer io))
+          ;; The release flushes the held frame.
+          (ebb-io--enqueue-output io "\e[?2026l")
+          (ebb-io--process-pending io t)
+          (should (= renders 1))
+          (should-not (ebb-io-sync-timer io)))))))
+
+(ert-deftest ebb-test-io-synchronized-output-timeout-forces-refresh ()
+  "A stuck synchronized-output window only delays its redraw."
+  (let* ((screen (ebb-screen-create 5 2))
+         (parser (ebb-parse-create screen))
+         (renders 0))
+    (with-temp-buffer
+      (let* ((render (ebb-render-create screen (current-buffer)))
+             (io (make-ebb-io :screen screen :parser parser :render render
+                              :buffer (current-buffer))))
+        (cl-letf (((symbol-function 'ebb-render-refresh)
+                   (lambda (_) (cl-incf renders))))
+          (ebb-io--enqueue-output io "\e[?2026hOK")
+          (ebb-io--process-pending io)
+          (should (= renders 0))
+          ;; The safety flush renders even though the mode is still set.
+          (ebb-io--sync-timeout io)
+          (should (= renders 1))
+          (should-not (ebb-io-sync-timer io)))))))
 
 (ert-deftest ebb-test-io-processing-errors-are-counted ()
   "Repeated asynchronous processing errors reach the error hook with a count."
@@ -3091,7 +3294,8 @@ Binds `screen' and `parser' in BODY."
       (should (equal '("l" "control") redraw))
       (if (cdr clear)
           (should-not (ebb-screen-scrollback screen))
-        (should (= 1 (ebb-screen-scrollback-length screen)))))))
+        ;; Existing history plus the two meaningful viewport rows.
+        (should (= 3 (ebb-screen-scrollback-length screen)))))))
 
 (ert-deftest ebb-test-copy-all-plain-text-soft-wraps ()
   "Copy-all trims padding and omits newlines across soft-wrapped rows."
@@ -3207,6 +3411,33 @@ Binds `screen' and `parser' in BODY."
       (mapc (lambda (buffer)
               (when (buffer-live-p buffer) (kill-buffer buffer)))
             (list a b)))))
+
+(ert-deftest ebb-test-other-window-starts-at-destination-size ()
+  "Other-window terminals start only after reaching their destination window."
+  (let (buffer target started-size)
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (setq target (split-window-right))
+          (let ((ebb-buffer-name " *ebb-other-window-start*"))
+            (cl-letf (((symbol-function 'switch-to-buffer-other-window)
+                       (lambda (buf &optional _norecord)
+                         (select-window target)
+                         (set-window-buffer target buf)
+                         buf))
+                      ((symbol-function 'ebb-io-start)
+                       (lambda (io _shell buf &optional _env)
+                         (should (eq target (selected-window)))
+                         (should (eq buf (window-buffer target)))
+                         (setq started-size
+                               (cons (ebb-screen-width (ebb-io-screen io))
+                                     (ebb-screen-height (ebb-io-screen io)))))))
+              (setq buffer (ebb-other-window '("/bin/true")))))
+          (should (equal
+                   (cons (window-max-chars-per-line target)
+                         (window-body-height target))
+                   started-size)))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest ebb-test-project-reuses-renamed-buffer ()
   "Project terminals use project names and stable identities after OSC titles."
@@ -3561,10 +3792,11 @@ Binds `screen' and `parser' in BODY."
           (should (eq ebb--input-mode 'emacs))
           (should (= (point) (marker-position (cdar index))))
           (should (looking-at-p "  echo one")))
-        ;; Once model rows are erased/evicted, their properties yield no index.
+        ;; Clearing the viewport retains command metadata in scrollback.
         (ebb-screen-erase-in-display screen 2)
         (ebb-render-refresh render)
-        (should-not (ebb-shell-imenu-create-index))))))
+        (should (equal '("echo one" "printf two")
+                       (mapcar #'car (ebb-shell-imenu-create-index))))))))
 
 (ert-deftest ebb-test-shell-pending-events ()
   "OSC 51 B and C sequences queue pending events."

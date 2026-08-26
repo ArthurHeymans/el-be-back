@@ -38,6 +38,7 @@
   (max-latency 0.033)     ; seconds: max delay (~30fps)
   (first-chunk-time nil)  ; float time of first unrendered chunk
   (render-timer nil)      ; pending render timer
+  (sync-timer nil)        ; synchronized-output (DEC 2026) flush timer
   ;; Error reporting
   (last-processing-error nil)
   (processing-error-count 0))
@@ -66,6 +67,13 @@ Allows batching of rapid output."
 (defcustom ebb-maximum-latency 0.033
   "Maximum seconds to wait before rendering after output arrives.
 Ensures responsiveness."
+  :type 'number
+  :group 'ebb)
+
+(defcustom ebb-sync-output-timeout 0.25
+  "Maximum seconds to hold a frame held by synchronized output (DEC 2026).
+An application that enables synchronized output but never disables it
+only delays its redraw by this long."
   :type 'number
   :group 'ebb)
 
@@ -135,6 +143,21 @@ This is the supported entry point for non-PTY transports."
     (setf (ebb-io-render-timer io)
           (run-at-time delay nil #'ebb-io--process-pending io))))
 
+(defun ebb-io--cancel-sync-timer (io)
+  "Cancel IO's pending synchronized-output flush timer."
+  (when (ebb-io-sync-timer io)
+    (cancel-timer (ebb-io-sync-timer io))
+    (setf (ebb-io-sync-timer io) nil)))
+
+(defun ebb-io--sync-timeout (io)
+  "Refresh a frame held too long by synchronized output (DEC 2026)."
+  (setf (ebb-io-sync-timer io) nil)
+  (when (buffer-live-p (ebb-io-buffer io))
+    (with-current-buffer (ebb-io-buffer io)
+      (ebb-render-refresh (ebb-io-render io))
+      (run-hook-with-args 'ebb-io-after-render-functions
+                          (ebb-io-render io)))))
+
 (defun ebb-io--process-pending (io &optional drain-all)
   "Process pending output: parse chunks, then render."
   (setf (ebb-io-processing io) t)
@@ -162,10 +185,18 @@ This is the supported entry point for non-PTY transports."
                 (cl-incf total-parsed chunk-size)))
             (ebb-io--normalize-pending io)
 
-            ;; Render
-            (ebb-render-refresh (ebb-io-render io))
-            (run-hook-with-args 'ebb-io-after-render-functions
-                                (ebb-io-render io))))
+            ;; Render, unless DEC 2026 synchronized output holds the
+            ;; frame; the safety timer bounds how long it can be held.
+            (if (and (null drain-all)
+                     (ebb-screen-sync-output (ebb-io-screen io)))
+                (unless (ebb-io-sync-timer io)
+                  (setf (ebb-io-sync-timer io)
+                        (run-at-time ebb-sync-output-timeout nil
+                                     #'ebb-io--sync-timeout io)))
+              (ebb-io--cancel-sync-timer io)
+              (ebb-render-refresh (ebb-io-render io))
+              (run-hook-with-args 'ebb-io-after-render-functions
+                                  (ebb-io-render io)))))
 
         ;; Reset latency tracking
         (setf (ebb-io-first-chunk-time io) nil
@@ -490,6 +521,7 @@ Ebb through `ebb-io--filter'."
         (when (ebb-io-render-timer io)
           (cancel-timer (ebb-io-render-timer io))
           (setf (ebb-io-render-timer io) nil))
+        (ebb-io--cancel-sync-timer io)
         ;; Flush remaining output.
         (when (ebb-io--pending-p io)
           (ebb-io--process-pending io t))
@@ -508,6 +540,7 @@ Ebb through `ebb-io--filter'."
         (ebb-io-pending-tail io) nil
         (ebb-io-pending-offset io) 0
         (ebb-io-first-chunk-time io) nil)
+  (ebb-io--cancel-sync-timer io)
   (when (ebb-io-parser io)
     (ebb-parse-cancel-sequence (ebb-io-parser io))))
 
@@ -563,6 +596,7 @@ queued output so the interrupted program's prompt is not stuck behind it."
   (when (ebb-io-render-timer io)
     (cancel-timer (ebb-io-render-timer io))
     (setf (ebb-io-render-timer io) nil))
+  (ebb-io--cancel-sync-timer io)
   (when-let* ((proc (ebb-io-process io)))
     (when (process-live-p proc)
       (delete-process proc))

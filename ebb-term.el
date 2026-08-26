@@ -126,7 +126,7 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (scroll-top 0) (scroll-bottom 23)
   ;; Mode flags
   (auto-wrap t) (insert-mode nil) (origin-mode nil)
-  (keypad-mode nil) (bracketed-paste nil)
+  (keypad-mode nil) (bracketed-paste nil) (sync-output nil)
   ;; Mouse
   (mouse-mode nil) (mouse-sgr nil) (mouse-pressed nil) (focus-events nil)
   ;; Character sets
@@ -165,6 +165,10 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
 (defvar ebb--viewport-reset-screens
   (make-hash-table :test #'eq :weakness 'key)
   "Screens whose next render should show the live viewport from its top.")
+
+(defvar ebb--preserved-display-signatures
+  (make-hash-table :test #'eq :weakness 'key)
+  "Last main-screen viewport snapshot preserved for each screen.")
 
 (defvar ebb--saved-cursor-renditions
   (make-hash-table :test #'eq :weakness 'key)
@@ -827,6 +831,7 @@ KIND may be `append' for ENTRY or `last' for an extended newest line."
   (setf (ebb-screen-scrollback screen) nil
         (ebb-screen-scrollback-length screen) 0
         (ebb-screen-scrollback-dirty screen) t)
+  (remhash screen ebb--preserved-display-signatures)
   (ebb--history-changed screen))
 
 (defun ebb--history-normalize (screen)
@@ -1448,6 +1453,90 @@ only join with a line that was auto-wrapped."
           (cl-decf column))
         (cons previous column))))))
 
+(defconst ebb--emoji-presentation-bases
+  '((#x00a9 . #x00a9) (#x00ae . #x00ae) (#x203c . #x203c) (#x2049 . #x2049)
+    (#x2122 . #x2122) (#x2139 . #x2139) (#x2194 . #x2199) (#x21a9 . #x21aa)
+    (#x231a . #x231b) (#x2328 . #x2328) (#x23cf . #x23cf) (#x23e9 . #x23ef)
+    (#x23f0 . #x23f0) (#x23f1 . #x23f3) (#x23f8 . #x23fa) (#x24c2 . #x24c2)
+    (#x25aa . #x25ab) (#x25b6 . #x25b6) (#x25c0 . #x25c0) (#x25fb . #x25fe)
+    (#x2600 . #x2604) (#x260e . #x260e) (#x2611 . #x2611) (#x2614 . #x2615)
+    (#x2618 . #x2618) (#x261d . #x261d) (#x2620 . #x2620) (#x2622 . #x2623)
+    (#x2626 . #x2626) (#x262a . #x262a) (#x262e . #x262f) (#x2638 . #x263a)
+    (#x2640 . #x2640) (#x2642 . #x2642) (#x2648 . #x2653) (#x265f . #x2660)
+    (#x2663 . #x2663) (#x2665 . #x2666) (#x2668 . #x2668) (#x267b . #x267b)
+    (#x267e . #x267f) (#x2692 . #x2692) (#x2694 . #x2697) (#x2699 . #x2699)
+    (#x269b . #x269c) (#x26a0 . #x26a1) (#x26a7 . #x26a7) (#x26b0 . #x26b1)
+    (#x26c4 . #x26c5) (#x26c8 . #x26c8) (#x26ce . #x26cf) (#x26d1 . #x26d1)
+    (#x26d3 . #x26d4) (#x26e9 . #x26ea) (#x26f0 . #x26f5) (#x26f7 . #x26fa)
+    (#x26fd . #x26fd) (#x2702 . #x2702) (#x2708 . #x270d) (#x270f . #x270f)
+    (#x2712 . #x2712) (#x2714 . #x2714) (#x2716 . #x2716) (#x271d . #x271d)
+    (#x2721 . #x2721) (#x2733 . #x2734) (#x2744 . #x2744) (#x2747 . #x2747)
+    (#x274c . #x274c) (#x274e . #x274e) (#x2753 . #x2755) (#x2757 . #x2757)
+    (#x2763 . #x2764) (#x2795 . #x2797) (#x27a1 . #x27a1) (#x27b0 . #x27b0)
+    (#x27bf . #x27bf) (#x2934 . #x2935) (#x2b05 . #x2b07) (#x2b1b . #x2b1c)
+    (#x2b50 . #x2b50) (#x2b55 . #x2b55))
+  "Characters that render double-width followed by VARIATION SELECTOR-16.
+Approximates the text-default list from Unicode's
+emoji-variation-sequences.txt.  Characters already double-width under
+`char-width' are excluded; for those the selector is an ordinary
+zero-width suffix.")
+
+(defsubst ebb--emoji-presentation-base-p (char)
+  "Return non-nil when CHAR widens with an emoji presentation selector."
+  (cl-loop for range in ebb--emoji-presentation-bases
+           when (and (>= char (car range)) (<= char (cdr range)))
+           return t))
+
+(defun ebb--apply-emoji-presentation (screen)
+  "Apply emoji presentation to the cell before SCREEN's cursor.
+Called with U+FE0F pending: when the preceding character renders as
+emoji presentation, base and selector occupy two columns, so a
+continuation cell is inserted after it.  Returns non-nil when applied;
+otherwise the caller appends the selector as an ordinary zero-width
+suffix."
+  (when-let* ((target (ebb--previous-cell screen))
+              (line (car target))
+              (column (cdr target))
+              (cells (ebb-line-cells line))
+              (cell (aref cells column))
+              ((= (ebb-cell-width cell) 1))
+              ((ebb--emoji-presentation-base-p (ebb-cell-char cell)))
+              ((< (1+ column) (ebb-screen-width screen))))
+    ;; Rebuild the row with the base widened to two columns and a new
+    ;; continuation cell behind it, shifting the tail right by one.
+    (let ((wide (copy-ebb-cell cell)))
+      (setf (ebb-cell-width wide) 2
+            (ebb-cell-combining wide)
+            (concat (ebb-cell-combining cell) "\uFE0F"))
+      (setf (ebb-line-cells line)
+            (vconcat (substring cells 0 column)
+                     (list wide)
+                     (list (make-ebb-cell :char ?\s :width 0
+                                          :attr (ebb-cell-attr cell)))
+                     (substring cells (1+ column)
+                                (1- (length cells))))))
+    (setf (ebb-line-text line) nil
+          (ebb-line-attr-runs line) nil
+          (ebb-line-uniform-attr line) nil
+          (ebb-line-rendered line) nil
+          (ebb-line-dirty line) t)
+    ;; Continue writing after the two-column sequence, preserving the terminal's
+    ;; pending-wrap convention when the widened cell reaches the right edge.
+    (let ((new-column (+ column 2))
+          (screen-width (ebb-screen-width screen)))
+      (if (>= new-column screen-width)
+          (setf (ebb-screen-cursor-x screen) (1- screen-width)
+                (ebb-screen-pending-wrap screen)
+                (and (ebb-screen-auto-wrap screen) t))
+        (setf (ebb-screen-cursor-x screen) new-column)))
+    (ebb--mark-dirty screen
+                     (if (eq line
+                             (ebb--line-at screen
+                                           (ebb-screen-cursor-y screen)))
+                         (ebb-screen-cursor-y screen)
+                       (1- (ebb-screen-cursor-y screen))))
+    t))
+
 (defun ebb--append-to-previous-cell (screen char)
   "Append zero-width CHAR to the cell before SCREEN's cursor."
   (when-let* ((target (ebb--previous-cell screen))
@@ -1587,7 +1676,9 @@ Handles combining and double-width characters."
          (char-width (ebb--char-display-width char)))
     (catch 'ebb-screen-write-char
       (when (zerop char-width)
-        (ebb--append-to-previous-cell screen char)
+        (unless (and (= char #xfe0f)
+                     (ebb--apply-emoji-presentation screen))
+          (ebb--append-to-previous-cell screen char))
         (throw 'ebb-screen-write-char nil))
       (when (ebb--append-joined-char screen char)
         (throw 'ebb-screen-write-char nil))
@@ -2070,6 +2161,55 @@ Handles LF, VT, FF."
 
 ;;;; ---- Erasing --------------------------------------------------------
 
+(defun ebb--line-empty-for-history-p (line width)
+  "Return non-nil when LINE has no content worth preserving in history."
+  (and (not (ebb-line-wrapped line))
+       (eq (ebb-line-rendition line) 'normal)
+       (null (ebb-line-prompt-begins line))
+       (null (ebb-line-prompt-ends line))
+       (zerop (length
+               (ebb--trim-trailing-blank-cells
+                (ebb--line-ensure-cells line width))))))
+
+(defun ebb--line-history-signature (line width)
+  "Return a stable content signature for LINE at WIDTH."
+  (list (ebb-line-wrapped line)
+        (ebb-line-rendition line)
+        (copy-sequence (ebb-line-prompt-begins line))
+        (copy-sequence (ebb-line-prompt-ends line))
+        (cl-loop for cell across (ebb--line-ensure-cells line width)
+                 collect (list (ebb-cell-char cell)
+                               (ebb-cell-combining cell)
+                               (ebb-cell-width cell)
+                               (ebb-cell-attr cell)))))
+
+(defun ebb--history-preserve-display (screen)
+  "Append changed, meaningful main-screen viewport rows to history."
+  (unless (ebb-screen-alt-screen screen)
+    (let* ((width (ebb-screen-width screen))
+           (end (ebb-screen-height screen)))
+      (while (and (> end 0)
+                  (ebb--line-empty-for-history-p
+                   (ebb--line-at screen (1- end)) width))
+        (cl-decf end))
+      (let ((signature
+             (cons width
+                   (cl-loop for row below end
+                            collect (ebb--line-history-signature
+                                     (ebb--line-at screen row) width)))))
+        (unless (equal signature
+                       (gethash screen ebb--preserved-display-signatures))
+          (puthash screen signature ebb--preserved-display-signatures)
+          (when (> end 0)
+            (let ((ebb--history-batch-screen screen)
+                  (ebb--history-batch-rows nil))
+              (unwind-protect
+                  (dotimes (row end)
+                    (ebb--history-push-row
+                     screen (ebb--line-at screen row) width))
+                (ebb--history-flush-batch)
+                (ebb--trim-scrollback screen)))))))))
+
 (defun ebb-screen--erase-in-display-unprotected (screen mode)
   "Erase in display without preserving protected cells."
   (let ((cy (ebb-screen-cursor-y screen))
@@ -2084,6 +2224,10 @@ Handles LF, VT, FF."
        (cl-loop for r from 0 below cy
                 do (ebb--erase-whole-line screen r)))
       (2 ;; Erase whole display
+       ;; Keep cleared main-screen content available to Emacs-mode history.
+       ;; This makes shell Ctrl-L visually clear the viewport without deleting
+       ;; output that has not yet naturally scrolled off its top edge.
+       (ebb--history-preserve-display screen)
        (ebb-screen-mark-viewport-reset screen)
        (let ((bg (and (ebb-screen-current-attr screen)
                       (ebb-attr-bg (ebb-screen-current-attr screen)))))
@@ -2834,7 +2978,9 @@ DECCOLM clears the display, restores full-screen margins, and homes the cursor."
            (ebb-screen-enter-alt screen))
        (ebb-screen-leave-alt screen)
        (ebb-screen-restore-cursor screen)))
-    (2004 (setf (ebb-screen-bracketed-paste screen) value))))
+    (2004 (setf (ebb-screen-bracketed-paste screen) value))
+    ;; DEC 2026 synchronized output: the renderer holds frames while set.
+    (2026 (setf (ebb-screen-sync-output screen) value))))
 
 (defun ebb-screen-set-cursor-style (screen style)
   "Set the cursor style.  STYLE: 0-6."
@@ -3281,6 +3427,7 @@ OFFSET, when non-nil, is translated to the normalized cell sequence."
         (ebb-screen-insert-mode screen) nil
         (ebb-screen-origin-mode screen) nil
         (ebb-screen-keypad-mode screen) nil
+        (ebb-screen-sync-output screen) nil
         (ebb-screen-cursor-visible screen) t
         (ebb-screen-charset-g0 screen) 'us-ascii
         (ebb-screen-charset-g1 screen) 'us-ascii
@@ -3335,6 +3482,7 @@ OFFSET, when non-nil, is translated to the normalized cell sequence."
     (setf (ebb-screen-insert-mode screen) nil)
     (setf (ebb-screen-origin-mode screen) nil)
     (setf (ebb-screen-keypad-mode screen) nil)
+    (setf (ebb-screen-sync-output screen) nil)
     (setf (ebb-screen-bracketed-paste screen) nil)
     (setf (ebb-screen-mouse-mode screen) nil)
     (setf (ebb-screen-mouse-sgr screen) nil)

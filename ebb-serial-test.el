@@ -13,6 +13,7 @@
 
 (declare-function ebb-serial "ebb-serial")
 (declare-function ebb-serial--buffer-name "ebb-serial")
+(declare-function ebb-serial--create-terminal "ebb-serial")
 (declare-function ebb-serial--delete-foreign-buffer-processes "ebb-serial")
 (declare-function ebb-serial--live-process-p "ebb-serial")
 (declare-function ebb-serial--open-process "ebb-serial")
@@ -161,6 +162,16 @@
           (aset chunk index (random 256)))
         (should (stringp (ebb-serial-codec-decode state chunk)))))
     (should (stringp (ebb-serial-codec-flush state)))))
+
+(ert-deftest ebb-serial-creates-terminal-with-ebb-0.1.0 ()
+  (ebb-serial-tests--require-ebb-serial)
+  (cl-letf (((symbol-function 'ebb-io-create-terminal) nil))
+    (with-temp-buffer
+      (let ((io (ebb-serial--create-terminal)))
+        (should (eq (ebb-io-buffer io) (current-buffer)))
+        (should (ebb-io-screen io))
+        (should (ebb-io-render io))
+        (should (ebb-io-parser io))))))
 
 (ert-deftest ebb-serial-setup-uses-shared-resize-hook ()
   (ebb-serial-tests--require-ebb-serial)
