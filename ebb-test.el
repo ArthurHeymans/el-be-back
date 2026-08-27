@@ -2788,6 +2788,55 @@ Binds `screen' and `parser' in BODY."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest ebb-test-render-nonselected-window-point-survives-refresh ()
+  "Window-point in history survives a scrollback rebuild while unselected."
+  (let* ((screen (ebb-screen-create 20 6))
+         (parser (ebb-parse-create screen))
+         (buffer (generate-new-buffer " *ebb-test-wp*"))
+         (other (generate-new-buffer " *ebb-test-wp-other*")))
+    (cl-flet ((point-line ()
+                (with-current-buffer buffer
+                  (save-excursion
+                    (goto-char (window-point
+                                (get-buffer-window buffer)))
+                    (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))))
+      (unwind-protect
+          (save-window-excursion
+            (delete-other-windows)
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'emacs)
+            (let ((render (ebb-render-create screen buffer)))
+              (setq-local ebb--render render)
+              (dotimes (i 200)
+                (ebb-test-output parser (format "line-%04d\r\n" i)))
+              (ebb-render-refresh render)
+              ;; Read history in this window, then work elsewhere while
+              ;; output keeps arriving.
+              (ebb-render-scroll-history render -60)
+              (let ((line (point-line)))
+                (select-window (split-window))
+                (switch-to-buffer other)
+                (dotimes (i 20)
+                  (ebb-test-output parser (format "more-%04d\r\n" i)))
+                (with-current-buffer buffer
+                  (ebb-render-refresh render))
+                (should (equal line (point-line))))))
+        (when (buffer-live-p buffer) (kill-buffer buffer))
+        (when (buffer-live-p other) (kill-buffer other))))))
+
+(ert-deftest ebb-test-ebb-numeric-prefix-switches-to-existing ()
+  "A numeric prefix switches to the Nth session instead of erroring."
+  (let ((buffer (generate-new-buffer "*ebb-test-prefix*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ebb--buffers)
+                   (lambda () (list buffer))))
+          (save-window-excursion
+            (let ((current-prefix-arg 1))
+              (ebb)
+              (should (eq (current-buffer) buffer)))))
+      (kill-buffer buffer))))
+
 (ert-deftest ebb-test-render-emacs-mode-trimmed-point-keeps-viewport ()
   "A trimmed history point does not pull a live window into scrollback."
   (let* ((screen (ebb-screen-create 8 3))

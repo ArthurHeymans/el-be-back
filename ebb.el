@@ -522,6 +522,33 @@ Called after each render.  Debounced so short-lived matches don't flash."
       (ebb-render-scroll-history ebb--render (- (ebb--scroll-rows arg)))
     (scroll-down-command arg)))
 
+(defun ebb--wheel-rows (event)
+  "Return the number of history rows wheel EVENT scrolls."
+  (let ((amount (and (boundp 'mouse-wheel-scroll-amount)
+                     (car mouse-wheel-scroll-amount))))
+    (max 1 (* (if (integerp amount) amount 5)
+              (or (ignore-errors (event-click-count event)) 1)))))
+
+(defun ebb-mouse-scroll-up (event)
+  "Scroll the Ebb window under wheel EVENT forward through history.
+Like `mwheel-scroll', act on the window the mouse is over, not the
+selected window."
+  (interactive "e")
+  (let ((window (posn-window (event-start event))))
+    (when (window-live-p window)
+      (with-selected-window window
+        (ebb-scroll-up (ebb--wheel-rows event))))))
+
+(defun ebb-mouse-scroll-down (event)
+  "Scroll the Ebb window under wheel EVENT backward through history.
+Like `mwheel-scroll', act on the window the mouse is over, not the
+selected window."
+  (interactive "e")
+  (let ((window (posn-window (event-start event))))
+    (when (window-live-p window)
+      (with-selected-window window
+        (ebb-scroll-down (ebb--wheel-rows event))))))
+
 (defun ebb--clear-screen (scrollback)
   "Clear the viewport, and history too when SCROLLBACK is non-nil."
   (ebb--require-running-terminal)
@@ -1157,14 +1184,12 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
           argv)))
      (t nil))))
   ;; With numeric prefix: switch to Nth ebb buffer
-  (when (and (numberp current-prefix-arg) (not program))
-    (let* ((n current-prefix-arg)
-           (ebb-bufs (ebb--buffers))
-           (existing (nth (1- n) ebb-bufs)))
-      (when existing
+  (let ((existing (and (numberp current-prefix-arg)
+                       (not program)
+                       (nth (1- current-prefix-arg) (ebb--buffers)))))
+    (if existing
         (pop-to-buffer-same-window existing)
-        (cl-return-from ebb existing))))
-  (ebb--start program #'pop-to-buffer-same-window))
+      (ebb--start program #'pop-to-buffer-same-window))))
 
 ;;;###autoload
 (defun ebb-other-window (&optional program)
