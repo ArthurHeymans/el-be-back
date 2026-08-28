@@ -322,11 +322,15 @@ non-parameter byte."
 START is the first byte after ESC [.  Return nil when the sequence is not one
 of the simple forms handled here."
   (catch 'done
-    (let ((j start))
+    (let ((j start)
+          (header-length 0))
       (while (< j end)
         (let ((c (aref string j)))
           (cond
            ((or (and (>= c ?0) (<= c ?9)) (= c ?\;))
+            (when (= header-length ebb-parse--max-control-header-length)
+              (throw 'done nil))
+            (cl-incf header-length)
             (cl-incf j))
            ((and (>= c ?@) (<= c ?~))
             (let ((screen (ebb-parser-screen parser)))
