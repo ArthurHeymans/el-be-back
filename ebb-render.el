@@ -590,8 +590,7 @@ visible and jump the window into old history."
                         (ebb-render--trim-trailing
                          (ebb-render--apply-line-metadata
                           line
-                          (ebb-render--line-to-string-scrollback line width)
-                          width))
+                          (ebb-render--line-to-string-scrollback line width)))
                         "\n")))
           (put-text-property 0 (length string) 'ebb-history-id
                              (ebb-history-line-id logical) string)
@@ -929,8 +928,8 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
         (setf (substring s begin end) part)))
     s))
 
-(defun ebb-render--apply-line-metadata (line string width)
-  "Apply shell metadata from LINE to STRING of WIDTH columns."
+(defun ebb-render--apply-line-metadata (line string)
+  "Apply shell metadata from LINE to STRING."
   (if (not (or (ebb-line-prompt-begins line)
                (ebb-line-prompt-ends line)))
       string
@@ -984,8 +983,7 @@ empty padding significant."
                           (ebb-render-state-region-end render))))
                (new (ebb-render--trim-trailing
                      (ebb-render--apply-line-metadata
-                      line (ebb-render--line-to-string line width)
-                      width))))
+                      line (ebb-render--line-to-string line width)))))
           ;; TUI programs often repaint rows with identical content.  Avoid a
           ;; buffer modification when the rendered text/properties are already
           ;; correct; cursor overlay movement is handled separately.
@@ -1437,7 +1435,7 @@ Used after resize when the display area size has changed."
               (insert (if line
                           (ebb-render--trim-trailing
                            (ebb-render--apply-line-metadata
-                            line (ebb-render--line-to-string line w) w))
+                            line (ebb-render--line-to-string line w)))
                         ""))
               (when (< i (1- h))
                 (insert "\n"))))
@@ -1521,8 +1519,7 @@ Used after resize when the display area size has changed."
                 (insert (if line
                             (ebb-render--trim-trailing
                              (ebb-render--apply-line-metadata
-                              line (ebb-render--line-to-string line width)
-                              width))
+                              line (ebb-render--line-to-string line width)))
                           ""))
                 (when (< row (1- height)) (insert "\n"))))
             (set-marker-insertion-type display-begin t))
