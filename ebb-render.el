@@ -642,7 +642,9 @@ visible and jump the window into old history."
                    (- (line-number-at-pos window-start)
                       (line-number-at-pos
                        (ebb-render-state-region-begin render)))))))
-         (target (ebb--clamp (+ current rows) 0 total))
+         ;; A window-start below the viewport top (left there by redisplay)
+         ;; may scroll backward relatively; forward it can only stay put.
+         (target (ebb--clamp (+ current rows) 0 (max total current)))
          (capacity (ebb-render--history-capacity render))
          (point-anchor (ebb-render-buffer-anchor render (point)))
          (mark-anchor (and (mark t)
@@ -699,8 +701,15 @@ visible and jump the window into old history."
       (when-let* ((position
                   (ebb-render--anchor-buffer-position render mark-anchor)))
         (set-marker (mark-marker) position)))
-    (if (= target total)
-        (set-window-start window display-begin t)
+    (if (>= target total)
+        (if (= target total)
+            (set-window-start window display-begin t)
+          ;; Keep a start inside the viewport relative instead of
+          ;; snapping it back to the viewport top.
+          (save-excursion
+            (goto-char display-begin)
+            (forward-line (- target total))
+            (set-window-start window (point) t)))
       (save-excursion
         (goto-char (ebb-render-state-region-begin render))
         (forward-line (- target start))
@@ -1293,8 +1302,17 @@ hint at the live terminal position."
             ;; old window-point and look like a second/wrong cursor.
             (setq-local cursor-type nil)
             (goto-char pos)
-            (dolist (win (get-buffer-window-list nil nil t))
-              (set-window-point win pos))))))))
+            (let ((display-start (marker-position display-begin)))
+              (dolist (win (get-buffer-window-list nil nil t))
+                (set-window-point win pos)
+                ;; Pulling window-point to the cursor makes redisplay
+                ;; scroll a history-reading window to the viewport anyway.
+                ;; Do it coherently: the bounded slab does not necessarily
+                ;; extend all the way to the viewport, so redisplay's own
+                ;; minimal scroll can render stale history rows directly
+                ;; above the live screen.
+                (when (< (window-start win) display-start)
+                  (set-window-start win display-start t))))))))))
 
 (defun ebb-render--apply-viewport-reset (render)
   "Apply a pending viewport reset, moving windows to RENDER's display start.
@@ -1510,9 +1528,13 @@ Used after resize when the display area size has changed."
                            (ebb-render--anchor-buffer-position
                             render start-anchor)))
                     (set-window-start window position t)
-                  (set-window-start window display-begin t))
-                (ebb-render--restore-window-point
-                 render window window-point-anchor))))
+                  (set-window-start window display-begin t)))
+              ;; Rebuilding the viewport collapsed window-points into
+              ;; display-begin; restore them for every window.  The cursor
+              ;; update below re-targets following windows only while the
+              ;; terminal cursor is visible.
+              (ebb-render--restore-window-point
+               render window window-point-anchor)))
           ;; Update the cursor after window restoration so the live input
           ;; modes can move window-point to the terminal cursor.
           (ebb-render--update-cursor render)

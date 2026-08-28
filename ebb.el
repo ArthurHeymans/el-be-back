@@ -523,11 +523,26 @@ Called after each render.  Debounced so short-lived matches don't flash."
     (scroll-down-command arg)))
 
 (defun ebb--wheel-rows (event)
-  "Return the number of history rows wheel EVENT scrolls."
-  (let ((amount (and (boundp 'mouse-wheel-scroll-amount)
-                     (car mouse-wheel-scroll-amount))))
-    (max 1 (* (if (integerp amount) amount 5)
-              (or (ignore-errors (event-click-count event)) 1)))))
+  "Return the number of history rows wheel EVENT scrolls.
+Follows `mouse-wheel-scroll-amount' semantics: an integer scrolls that
+many rows, a float that fraction of the window, and nil a near-full
+page.  Click-count acceleration applies only with
+`mouse-wheel-progressive-speed'."
+  (let* ((amount (and (boundp 'mouse-wheel-scroll-amount)
+                      (car mouse-wheel-scroll-amount)))
+         (base (cond
+                ((integerp amount) amount)
+                ((floatp amount)
+                 (max 1 (round (* amount (window-body-height)))))
+                ((null amount)
+                 (max 1 (- (window-body-height)
+                           next-screen-context-lines)))
+                (t 5)))
+         (lines (max 1 (or (ignore-errors (event-line-count event)) 1)))
+         (clicks (if (bound-and-true-p mouse-wheel-progressive-speed)
+                     (max 1 (or (ignore-errors (event-click-count event)) 1))
+                   1)))
+    (max 1 (* base lines clicks))))
 
 (defun ebb-mouse-scroll-up (event)
   "Scroll the Ebb window under wheel EVENT forward through history.

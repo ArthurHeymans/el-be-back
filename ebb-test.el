@@ -2825,6 +2825,42 @@ Binds `screen' and `parser' in BODY."
         (when (buffer-live-p buffer) (kill-buffer buffer))
         (when (buffer-live-p other) (kill-buffer other))))))
 
+(ert-deftest ebb-test-render-cursor-follow-avoids-slab-seam ()
+  "Following the cursor never lets a window render across the slab seam.
+A far-back scroll materializes a bounded slab that does not extend to
+the viewport.  When output arrives in a live input mode, the window
+must snap to the viewport top rather than letting redisplay scroll
+across the unmaterialized gap."
+  (let* ((screen (ebb-screen-create 20 6))
+         (parser (ebb-parse-create screen))
+         (buffer (generate-new-buffer " *ebb-test-seam*")))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (setq-local ebb--input-mode 'semi-char)
+          (let ((render (ebb-render-create screen buffer))
+                (window (selected-window)))
+            (setq-local ebb--render render)
+            (dotimes (i 2000)
+              (ebb-test-output parser (format "line-%04d\r\n" i)))
+            (ebb-render-refresh render)
+            ;; Scroll far enough back that the slab cannot cover the
+            ;; range up to the viewport.
+            (ebb-render-scroll-history render -1500)
+            (let ((total (ebb-screen-history-row-count screen))
+                  (slab-end (+ (ebb-render-state-history-start-row render)
+                               (ebb-render-state-scrollback-count render))))
+              (should (< slab-end total)))
+            ;; New output: the cursor update must move the reading window
+            ;; to the viewport, not leave it for redisplay to drag across
+            ;; the seam.
+            (ebb-test-output parser "tail-line\r\n")
+            (ebb-render-refresh render)
+            (should (= (window-start window)
+                       (marker-position
+                        (ebb-render-state-display-begin render))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 (ert-deftest ebb-test-ebb-numeric-prefix-switches-to-existing ()
   "A numeric prefix switches to the Nth session instead of erroring."
   (let ((buffer (generate-new-buffer "*ebb-test-prefix*")))
