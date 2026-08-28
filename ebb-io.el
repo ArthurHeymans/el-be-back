@@ -53,6 +53,11 @@ Each function receives IO, the error value, and its consecutive count.")
 
 ;;;; ---- Customization --------------------------------------------------
 
+(defcustom ebb-scrollback-lines 10000
+  "Maximum number of unwrapped logical scrollback lines."
+  :type 'integer
+  :group 'ebb)
+
 (defcustom ebb-chunk-size 4096
   "Number of bytes to parse per chunk before yielding to the event loop."
   :type 'integer

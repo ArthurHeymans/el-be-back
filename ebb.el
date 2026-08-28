@@ -134,11 +134,6 @@ from OSC titles via `ebb-buffer-name-title-prefix'."
                  function)
   :group 'ebb)
 
-(defcustom ebb-scrollback-lines 10000
-  "Maximum number of unwrapped logical scrollback lines."
-  :type 'integer
-  :group 'ebb)
-
 (defcustom ebb-buffer-name-title-prefix "ebb: "
   "Label prepended to OSC titles by `ebb-buffer-name-by-title'.
 The buffer is named \"*PREFIX TITLE*\"; e.g. \"ssh: \" groups remote

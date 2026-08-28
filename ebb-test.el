@@ -2287,6 +2287,15 @@ Binds `screen' and `parser' in BODY."
     (setq major-mode 'ebb-mode)
     (should-error (ebb-send-key "up") :type 'user-error)))
 
+(ert-deftest ebb-test-io-create-terminal-applies-scrollback-option ()
+  "The standalone I/O constructor applies its scrollback option."
+  (let ((buffer (generate-new-buffer " *ebb-io-create-test*"))
+        (ebb-scrollback-lines 37))
+    (unwind-protect
+        (let ((io (ebb-io-create-terminal buffer #'ignore)))
+          (should (= 37 (ebb-screen-scrollback-max (ebb-io-screen io)))))
+      (kill-buffer buffer))))
+
 (ert-deftest ebb-test-io-send-preserves-bytes ()
   "Process writes preserve unibyte data and UTF-8 encode text."
   (let ((io (make-ebb-io :process 'fake))

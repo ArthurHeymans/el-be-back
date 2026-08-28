@@ -40,7 +40,6 @@
 (defvar ebb--io)
 (defvar ebb--input-mode)
 (defvar ebb--screen)
-(defvar ebb-scrollback-lines)
 (defvar eshell-current-subjob-p)
 (defvar eshell-destroy-buffer-when-process-dies)
 (defvar eshell-interpreter-alist)
