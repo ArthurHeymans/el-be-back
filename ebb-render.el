@@ -547,6 +547,11 @@ visible and jump the window into old history."
     (`(viewport ,row ,column)
      (cons (+ total row) column))))
 
+(defun ebb-render--anchor-history-row (render anchor total)
+  "Return ANCHOR's history row when it lies within RENDER's history."
+  (when-let* ((location (ebb-render--anchor-location render anchor total)))
+    (and (< (car location) total) (car location))))
+
 (defun ebb-render--anchor-buffer-position (render anchor)
   "Return ANCHOR's position when it is present in RENDER's current slab."
   (when-let* ((location
@@ -658,15 +663,16 @@ visible and jump the window into old history."
                                   render (window-start other))
                                  (ebb-render-buffer-anchor
                                   render (window-point other)))))
+         ;; Size the slab from window points too, or a nonselected point
+         ;; parked in another history area loses its anchor in the rebuild.
          (other-rows
           (delq nil
-                (mapcar
-                 (lambda (entry)
-                   (when-let* ((location
-                               (ebb-render--anchor-location
-                                render (nth 1 entry) total)))
-                     (and (< (car location) total) (car location))))
-                 other-windows)))
+                (cl-loop for (nil start-anchor window-point-anchor)
+                         in other-windows
+                         collect (ebb-render--anchor-history-row
+                                  render start-anchor total)
+                         collect (ebb-render--anchor-history-row
+                                  render window-point-anchor total))))
          (wanted-rows (if (< target total)
                           (cons target other-rows)
                         other-rows))
@@ -1393,15 +1399,16 @@ Used after resize when the display area size has changed."
           ;; Materialize a slab covering every window's stable model anchor.
           (let* ((total (ebb-screen-history-row-count screen))
                  (capacity (ebb-render--history-capacity render))
+                 ;; Window points count too; see the scroll-history slab
+                 ;; sizing.
                  (rows
                   (delq nil
-                        (mapcar
-                         (lambda (entry)
-                           (when-let* ((location
-                                       (ebb-render--anchor-location
-                                        render (nth 1 entry) total)))
-                             (and (< (car location) total) (car location))))
-                         saved-windows)))
+                        (cl-loop for (nil start-anchor window-point-anchor)
+                                 in saved-windows
+                                 collect (ebb-render--anchor-history-row
+                                          render start-anchor total)
+                                 collect (ebb-render--anchor-history-row
+                                          render window-point-anchor total))))
                  (start (if rows
                             (max 0 (- (apply #'min rows) (/ capacity 3)))
                           (max 0 (- total capacity))))
