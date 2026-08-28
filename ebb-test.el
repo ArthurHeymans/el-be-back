@@ -2788,6 +2788,151 @@ Binds `screen' and `parser' in BODY."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest ebb-test-render-nonselected-window-point-survives-refresh ()
+  "Window-point in history survives a scrollback rebuild while unselected."
+  (let* ((screen (ebb-screen-create 20 6))
+         (parser (ebb-parse-create screen))
+         (buffer (generate-new-buffer " *ebb-test-wp*"))
+         (other (generate-new-buffer " *ebb-test-wp-other*")))
+    (cl-flet ((point-line ()
+                (with-current-buffer buffer
+                  (save-excursion
+                    (goto-char (window-point
+                                (get-buffer-window buffer)))
+                    (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))))
+      (unwind-protect
+          (save-window-excursion
+            (delete-other-windows)
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'emacs)
+            (let ((render (ebb-render-create screen buffer)))
+              (setq-local ebb--render render)
+              (dotimes (i 200)
+                (ebb-test-output parser (format "line-%04d\r\n" i)))
+              (ebb-render-refresh render)
+              ;; Read history in this window, then work elsewhere while
+              ;; output keeps arriving.
+              (ebb-render-scroll-history render -60)
+              (let ((line (point-line)))
+                (select-window (split-window))
+                (switch-to-buffer other)
+                (dotimes (i 20)
+                  (ebb-test-output parser (format "more-%04d\r\n" i)))
+                (with-current-buffer buffer
+                  (ebb-render-refresh render))
+                (should (equal line (point-line))))))
+        (when (buffer-live-p buffer) (kill-buffer buffer))
+        (when (buffer-live-p other) (kill-buffer other))))))
+
+(ert-deftest ebb-test-render-scroll-keeps-distant-window-point ()
+  "Scrolling one window preserves another window's distant history point.
+Slab sizing must cover window points as well as window starts, or a
+nonselected point parked far from its window start loses its anchor
+and falls back to the window start."
+  (let* ((screen (ebb-screen-create 20 6))
+         (parser (ebb-parse-create screen))
+         (buffer (generate-new-buffer " *ebb-test-distant-point*")))
+    (cl-flet ((line-at (position)
+                (with-current-buffer buffer
+                  (save-excursion
+                    (goto-char position)
+                    (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))))
+      (unwind-protect
+          (save-window-excursion
+            (delete-other-windows)
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'emacs)
+            (let ((render (ebb-render-create screen buffer))
+                  (other (split-window)))
+              (setq-local ebb--render render)
+              (set-window-buffer other buffer)
+              (dotimes (i 400)
+                (ebb-test-output parser (format "line-%04d\r\n" i)))
+              (ebb-render-refresh render)
+              (let ((total (ebb-screen-history-row-count screen)))
+                ;; Materialize the whole history so both positions exist,
+                ;; then park the other window reading near the bottom with
+                ;; its point far above the reading position.
+                (ebb-render--rebuild-scrollback
+                 render 0 total total
+                 (ebb-screen-history-generation screen))
+                (let ((region-begin
+                       (ebb-render-state-region-begin render)))
+                  (set-window-start
+                   other
+                   (with-current-buffer buffer
+                     (save-excursion
+                       (goto-char region-begin)
+                       (forward-line 330)
+                       (point)))
+                   t)
+                  (set-window-point
+                   other
+                   (with-current-buffer buffer
+                     (save-excursion
+                       (goto-char region-begin)
+                       (forward-line 90)
+                       (point)))))
+                (set-window-start (selected-window)
+                                  (ebb-render-state-display-begin render) t)
+                (let ((line (line-at (window-point other))))
+                  ;; Scroll the selected window to a region that excludes
+                  ;; the other window's point unless points are sized in.
+                  (should (= 200 (ebb-render-scroll-history
+                                  render (- 200 total))))
+                  (should (equal line (line-at (window-point other))))))))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
+(ert-deftest ebb-test-render-cursor-follow-avoids-slab-seam ()
+  "Following the cursor never lets a window render across the slab seam.
+A far-back scroll materializes a bounded slab that does not extend to
+the viewport.  When output arrives in a live input mode, the window
+must snap to the viewport top rather than letting redisplay scroll
+across the unmaterialized gap."
+  (let* ((screen (ebb-screen-create 20 6))
+         (parser (ebb-parse-create screen))
+         (buffer (generate-new-buffer " *ebb-test-seam*")))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (setq-local ebb--input-mode 'semi-char)
+          (let ((render (ebb-render-create screen buffer))
+                (window (selected-window)))
+            (setq-local ebb--render render)
+            (dotimes (i 2000)
+              (ebb-test-output parser (format "line-%04d\r\n" i)))
+            (ebb-render-refresh render)
+            ;; Scroll far enough back that the slab cannot cover the
+            ;; range up to the viewport.
+            (ebb-render-scroll-history render -1500)
+            (let ((total (ebb-screen-history-row-count screen))
+                  (slab-end (+ (ebb-render-state-history-start-row render)
+                               (ebb-render-state-scrollback-count render))))
+              (should (< slab-end total)))
+            ;; New output: the cursor update must move the reading window
+            ;; to the viewport, not leave it for redisplay to drag across
+            ;; the seam.
+            (ebb-test-output parser "tail-line\r\n")
+            (ebb-render-refresh render)
+            (should (= (window-start window)
+                       (marker-position
+                        (ebb-render-state-display-begin render))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest ebb-test-ebb-numeric-prefix-switches-to-existing ()
+  "A numeric prefix switches to the Nth session instead of erroring."
+  (let ((buffer (generate-new-buffer "*ebb-test-prefix*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'ebb--buffers)
+                   (lambda () (list buffer))))
+          (save-window-excursion
+            (let ((current-prefix-arg 1))
+              (ebb)
+              (should (eq (current-buffer) buffer)))))
+      (kill-buffer buffer))))
+
 (ert-deftest ebb-test-render-emacs-mode-trimmed-point-keeps-viewport ()
   "A trimmed history point does not pull a live window into scrollback."
   (let* ((screen (ebb-screen-create 8 3))

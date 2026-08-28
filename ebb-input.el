@@ -30,6 +30,8 @@
 (declare-function ebb-open-link-at-point "ebb")
 (declare-function ebb-scroll-up "ebb")
 (declare-function ebb-scroll-down "ebb")
+(declare-function ebb-mouse-scroll-up "ebb")
+(declare-function ebb-mouse-scroll-down "ebb")
 (declare-function ebb-copy-region "ebb")
 
 ;;;; ---- Function Key Tables --------------------------------------------
@@ -573,8 +575,12 @@ paste from the kill ring."
     ;; The history buffer is a bounded materialized slab.
     (define-key map [remap scroll-up-command] #'ebb-scroll-up)
     (define-key map [remap scroll-down-command] #'ebb-scroll-down)
-    (define-key map [wheel-up] #'ebb-scroll-down)
-    (define-key map [wheel-down] #'ebb-scroll-up)
+    ;; Scroll the window under the mouse, not the selected window, and
+    ;; cover the double/triple events Emacs generates for fast wheels.
+    (dolist (key '([wheel-up] [double-wheel-up] [triple-wheel-up]))
+      (define-key map key #'ebb-mouse-scroll-down))
+    (dolist (key '([wheel-down] [double-wheel-down] [triple-wheel-down]))
+      (define-key map key #'ebb-mouse-scroll-up))
     (define-key map [remap kill-ring-save] #'ebb-copy-region)
     map)
   "Base keymap for `ebb-mode'.")

@@ -446,9 +446,11 @@ state are reconciled independently so metadata-only updates are visible."
          (windows
           (cl-loop for window in (get-buffer-window-list
                                   (ebb-render-state-buffer render) nil t)
-                   collect (cons window
+                   collect (list window
                                  (ebb-render-buffer-anchor
-                                  render (window-start window)))))
+                                  render (window-start window))
+                                 (ebb-render-buffer-anchor
+                                  render (window-point window)))))
          (point-anchor (ebb-render-buffer-anchor render (point)))
          (mark-anchor (and (mark t)
                            (ebb-render-buffer-anchor render (mark t))))
@@ -457,10 +459,12 @@ state are reconciled independently so metadata-only updates are visible."
          (capacity (ebb-render--history-capacity render))
          (history-locations
           (delq nil
-                (mapcar (lambda (entry)
-                          (ebb-render--anchor-location
-                           render (cdr entry) total))
-                        windows)))
+                (cl-loop for (_window start-anchor window-point-anchor)
+                         in windows
+                         collect (ebb-render--anchor-location
+                                  render start-anchor total)
+                         collect (ebb-render--anchor-location
+                                  render window-point-anchor total))))
          (point-location (ebb-render--anchor-location
                           render point-anchor total))
          (mark-location (ebb-render--anchor-location
@@ -493,12 +497,36 @@ state are reconciled independently so metadata-only updates are visible."
               (/= count (ebb-render-state-scrollback-count render))
               (/= total (ebb-render-state-history-total-rows render)))
       (ebb-render--rebuild-scrollback render start count total generation)
-      (dolist (entry windows)
+      (pcase-dolist (`(,window ,start-anchor ,window-point-anchor) windows)
         (when-let* ((position
                     (ebb-render--anchor-buffer-position
-                     render (cdr entry))))
-          (set-window-start (car entry) position t))))
+                     render start-anchor)))
+          (set-window-start window position t))
+        (ebb-render--restore-window-point render window window-point-anchor))
+      ;; Rebuilding the slab collapsed any point or mark that was inside it
+      ;; to the top of the slab.  Emacs input mode restores them again from
+      ;; its own saved anchors; the live input modes only correct point when
+      ;; the cursor is visible, so re-anchor both here.
+      (when-let* ((position
+                  (ebb-render--anchor-buffer-position render point-anchor)))
+        (goto-char position))
+      (when mark-anchor
+        (when-let* ((position
+                    (ebb-render--anchor-buffer-position render mark-anchor)))
+          (set-marker (mark-marker) position))))
     (ebb-screen-clear-scrollback-dirty screen)))
+
+(defun ebb-render--restore-window-point (render window anchor)
+  "Move WINDOW's point to ANCHOR, falling back to its window-start.
+A rebuilt scrollback slab collapses window-point markers that were inside
+it to the top of the slab; redisplay would then force that stale position
+visible and jump the window into old history."
+  (let ((position
+         (or (and anchor
+                  (ebb-render--anchor-buffer-position render anchor))
+             (window-start window))))
+    (when position
+      (set-window-point window position))))
 
 (defun ebb-render--history-capacity (render)
   "Return the usual bounded number of history rows for RENDER."
@@ -518,6 +546,11 @@ state are reconciled independently so metadata-only updates are visible."
       (ebb-render-state-screen render) id offset))
     (`(viewport ,row ,column)
      (cons (+ total row) column))))
+
+(defun ebb-render--anchor-history-row (render anchor total)
+  "Return ANCHOR's history row when it lies within RENDER's history."
+  (when-let* ((location (ebb-render--anchor-location render anchor total)))
+    (and (< (car location) total) (car location))))
 
 (defun ebb-render--anchor-buffer-position (render anchor)
   "Return ANCHOR's position when it is present in RENDER's current slab."
@@ -596,32 +629,50 @@ state are reconciled independently so metadata-only updates are visible."
          (screen (ebb-render-state-screen render))
          (total (ebb-screen-history-row-count screen))
          (display-begin (ebb-render-state-display-begin render))
-         (slab-start (ebb-render-state-history-start-row render))
+         (window-start (window-start window))
          (current
-          (if (>= (window-start window) (marker-position display-begin))
-              total
-            (+ slab-start
-               (- (line-number-at-pos (window-start window))
-                  (line-number-at-pos
-                   (ebb-render-state-region-begin render))))))
-         (target (ebb--clamp (+ current rows) 0 total))
+          (if (>= window-start (marker-position display-begin))
+              ;; Redisplay may have left window-start below the viewport
+              ;; top; count from display-begin so scrolling stays relative.
+              (+ total
+                 (- (line-number-at-pos window-start)
+                    (line-number-at-pos (marker-position display-begin))))
+            ;; Slab row arithmetic is stale when parsed-but-unrendered
+            ;; output trimmed old history; the line's stable id is not.
+            (or (car (ebb-render--anchor-location
+                      render
+                      (ebb-render-buffer-anchor render window-start)
+                      total))
+                (+ (ebb-render-state-history-start-row render)
+                   (- (line-number-at-pos window-start)
+                      (line-number-at-pos
+                       (ebb-render-state-region-begin render)))))))
+         ;; A window-start below the viewport top (left there by redisplay)
+         ;; may scroll backward relatively; forward it can only stay put.
+         (target (ebb--clamp (+ current rows) 0 (max total current)))
          (capacity (ebb-render--history-capacity render))
+         (point-anchor (ebb-render-buffer-anchor render (point)))
+         (mark-anchor (and (mark t)
+                           (ebb-render-buffer-anchor render (mark t))))
          (other-windows
           (cl-loop for other in (get-buffer-window-list
                                  (ebb-render-state-buffer render) nil t)
                    unless (eq other window)
-                   collect (cons other
+                   collect (list other
                                  (ebb-render-buffer-anchor
-                                  render (window-start other)))))
+                                  render (window-start other))
+                                 (ebb-render-buffer-anchor
+                                  render (window-point other)))))
+         ;; Size the slab from window points too, or a nonselected point
+         ;; parked in another history area loses its anchor in the rebuild.
          (other-rows
           (delq nil
-                (mapcar
-                 (lambda (entry)
-                   (when-let* ((location
-                               (ebb-render--anchor-location
-                                render (cdr entry) total)))
-                     (and (< (car location) total) (car location))))
-                 other-windows)))
+                (cl-loop for (nil start-anchor window-point-anchor)
+                         in other-windows
+                         collect (ebb-render--anchor-history-row
+                                  render start-anchor total)
+                         collect (ebb-render--anchor-history-row
+                                  render window-point-anchor total))))
          (wanted-rows (if (< target total)
                           (cons target other-rows)
                         other-rows))
@@ -641,12 +692,30 @@ state are reconciled independently so metadata-only updates are visible."
             (ebb-render-buffer-location render (mark t))))
     (ebb-render--rebuild-scrollback
      render start count total (ebb-screen-history-generation screen))
-    (dolist (entry other-windows)
+    (pcase-dolist (`(,other ,start-anchor ,window-point-anchor)
+                   other-windows)
       (when-let* ((position
-                  (ebb-render--anchor-buffer-position render (cdr entry))))
-        (set-window-start (car entry) position t)))
-    (if (= target total)
-        (set-window-start window display-begin t)
+                  (ebb-render--anchor-buffer-position render start-anchor)))
+        (set-window-start other position t))
+      (ebb-render--restore-window-point render other window-point-anchor))
+    ;; The rebuild collapsed point and mark positions that were inside the
+    ;; slab; put them back on their lines before deciding visibility.
+    (when-let* ((position
+                (ebb-render--anchor-buffer-position render point-anchor)))
+      (goto-char position))
+    (when mark-anchor
+      (when-let* ((position
+                  (ebb-render--anchor-buffer-position render mark-anchor)))
+        (set-marker (mark-marker) position)))
+    (if (>= target total)
+        (if (= target total)
+            (set-window-start window display-begin t)
+          ;; Keep a start inside the viewport relative instead of
+          ;; snapping it back to the viewport top.
+          (save-excursion
+            (goto-char display-begin)
+            (forward-line (- target total))
+            (set-window-start window (point) t)))
       (save-excursion
         (goto-char (ebb-render-state-region-begin render))
         (forward-line (- target start))
@@ -1239,8 +1308,17 @@ hint at the live terminal position."
             ;; old window-point and look like a second/wrong cursor.
             (setq-local cursor-type nil)
             (goto-char pos)
-            (dolist (win (get-buffer-window-list nil nil t))
-              (set-window-point win pos))))))))
+            (let ((display-start (marker-position display-begin)))
+              (dolist (win (get-buffer-window-list nil nil t))
+                (set-window-point win pos)
+                ;; Pulling window-point to the cursor makes redisplay
+                ;; scroll a history-reading window to the viewport anyway.
+                ;; Do it coherently: the bounded slab does not necessarily
+                ;; extend all the way to the viewport, so redisplay's own
+                ;; minimal scroll can render stale history rows directly
+                ;; above the live screen.
+                (when (< (window-start win) display-start)
+                  (set-window-start win display-start t))))))))))
 
 (defun ebb-render--apply-viewport-reset (render)
   "Apply a pending viewport reset, moving windows to RENDER's display start.
@@ -1307,9 +1385,11 @@ Used after resize when the display area size has changed."
                (saved-mark-active (and preserve-view mark-active))
                (saved-windows
                 (cl-loop for window in (get-buffer-window-list buffer nil t)
-                         collect (cons window
+                         collect (list window
                                        (ebb-render-buffer-anchor
-                                        render (window-start window))))))
+                                        render (window-start window))
+                                       (ebb-render-buffer-anchor
+                                        render (window-point window))))))
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
@@ -1319,15 +1399,16 @@ Used after resize when the display area size has changed."
           ;; Materialize a slab covering every window's stable model anchor.
           (let* ((total (ebb-screen-history-row-count screen))
                  (capacity (ebb-render--history-capacity render))
+                 ;; Window points count too; see the scroll-history slab
+                 ;; sizing.
                  (rows
                   (delq nil
-                        (mapcar
-                         (lambda (entry)
-                           (when-let* ((location
-                                       (ebb-render--anchor-location
-                                        render (cdr entry) total)))
-                             (and (< (car location) total) (car location))))
-                         saved-windows)))
+                        (cl-loop for (nil start-anchor window-point-anchor)
+                                 in saved-windows
+                                 collect (ebb-render--anchor-history-row
+                                          render start-anchor total)
+                                 collect (ebb-render--anchor-history-row
+                                          render window-point-anchor total))))
                  (start (if rows
                             (max 0 (- (apply #'min rows) (/ capacity 3)))
                           (max 0 (- total capacity))))
@@ -1369,8 +1450,6 @@ Used after resize when the display area size has changed."
                 (begin (ebb-render-state-region-begin render)))
             (when ov
               (move-overlay ov begin (1+ begin))))
-          ;; Update cursor
-          (ebb-render--update-cursor render)
             ;; Clear dirty since we just rendered everything
             (ebb-screen-clear-dirty screen)
             (ebb-screen-clear-scrollback-dirty screen))
@@ -1384,14 +1463,20 @@ Used after resize when the display area size has changed."
                   (setq mark-active saved-mark-active))
               (set-marker (mark-marker) nil))
             )
-          (dolist (entry saved-windows)
-            (when (window-live-p (car entry))
+          (pcase-dolist (`(,window ,start-anchor ,window-point-anchor)
+                         saved-windows)
+            (when (window-live-p window)
               (if-let* ((position
                         (ebb-render--anchor-buffer-position
-                         render (cdr entry))))
-                  (set-window-start (car entry) position t)
+                         render start-anchor)))
+                  (set-window-start window position t)
                 (set-window-start
-                 (car entry) (ebb-render-state-display-begin render) t))))
+                 window (ebb-render-state-display-begin render) t))
+              (ebb-render--restore-window-point
+               render window window-point-anchor)))
+          ;; Update the cursor after window restoration so the live input
+          ;; modes can move window-point to the terminal cursor.
+          (ebb-render--update-cursor render)
           (ebb-render--apply-viewport-reset render))))))
 
 (defun ebb-render-resize-height (render)
@@ -1410,9 +1495,11 @@ Used after resize when the display area size has changed."
                (windows
                 (cl-loop for window in (get-buffer-window-list buffer nil t)
                          collect
-                         (cons window
+                         (list window
                                (ebb-render-buffer-anchor
-                                render (window-start window)))))
+                                render (window-start window))
+                               (ebb-render-buffer-anchor
+                                render (window-point window)))))
                ;; A shrinking window may move `window-start' into scrollback
                ;; before this hook runs merely to keep its live cursor visible.
                ;; In terminal input modes window-point identifies windows that
@@ -1439,16 +1526,25 @@ Used after resize when the display area size has changed."
                           ""))
                 (when (< row (1- height)) (insert "\n"))))
             (set-marker-insertion-type display-begin t))
-          (ebb-render--update-cursor render)
-          (dolist (entry windows)
-            (when (window-live-p (car entry))
-              (if (memq (car entry) following-windows)
-                  (set-window-start (car entry) display-begin t)
+          (pcase-dolist (`(,window ,start-anchor ,window-point-anchor)
+                         windows)
+            (when (window-live-p window)
+              (if (memq window following-windows)
+                  (set-window-start window display-begin t)
                 (if-let* ((position
                            (ebb-render--anchor-buffer-position
-                            render (cdr entry))))
-                    (set-window-start (car entry) position t)
-                  (set-window-start (car entry) display-begin t)))))
+                            render start-anchor)))
+                    (set-window-start window position t)
+                  (set-window-start window display-begin t)))
+              ;; Rebuilding the viewport collapsed window-points into
+              ;; display-begin; restore them for every window.  The cursor
+              ;; update below re-targets following windows only while the
+              ;; terminal cursor is visible.
+              (ebb-render--restore-window-point
+               render window window-point-anchor)))
+          ;; Update the cursor after window restoration so the live input
+          ;; modes can move window-point to the terminal cursor.
+          (ebb-render--update-cursor render)
           (ebb-render--apply-viewport-reset render)
           (ebb-screen-clear-dirty screen)
           (ebb-screen-clear-scrollback-dirty screen))))))
