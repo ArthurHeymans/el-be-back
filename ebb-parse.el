@@ -42,8 +42,9 @@
   (dcs-length 0)
   (dcs-params "")
   (dcs-final 0)
+  (control-header-length 0) ; current ESC/CSI/DCS header bytes
   ;; State for ESC inside string sequences
-  (string-state nil)     ; :osc or :dcs when ESC seen inside string
+  (string-state nil)     ; :osc, :dcs, or :ignored when ESC seen in a string
   ;; Charset
   (charset-slot 0))
 
@@ -67,6 +68,16 @@
 (defvar ebb-parse--dec-mode-states
   (make-hash-table :test #'eq :weakness 'key)
   "DEC private mode state maps keyed by terminal screen.")
+
+(defconst ebb-parse--max-control-header-length 1024
+  "Maximum bytes retained from an ESC, CSI, or DCS header.")
+
+(defun ebb-parse--collect-control-header-byte-p (parser)
+  "Record a header byte for PARSER and return non-nil if accepted."
+  (when (< (ebb-parser-control-header-length parser)
+           ebb-parse--max-control-header-length)
+    (cl-incf (ebb-parser-control-header-length parser))
+    t))
 
 (defun ebb-parse--record-mode (table screen mode enabled)
   "Record MODE as ENABLED for SCREEN in TABLE."
@@ -191,6 +202,7 @@ If the parameter is a sub-parameter list, return the first element."
         (ebb-parser-dcs-length parser) 0
         (ebb-parser-dcs-params parser) ""
         (ebb-parser-dcs-final parser) 0
+        (ebb-parser-control-header-length parser) 0
         (ebb-parser-string-state parser) nil
         (ebb-parser-charset-slot parser) 0))
 
@@ -416,9 +428,11 @@ only digits and semicolons."
           (pcase (ebb-parser-state parser)
             (:osc-string :osc)
             (:dcs-passthrough :dcs)
+            (:dcs-ignored :ignored)
             (_ nil)))
     (let ((inside-dcs (eq (ebb-parser-state parser) :dcs-passthrough)))
       (setf (ebb-parser-state parser) :escape)
+      (setf (ebb-parser-control-header-length parser) 0)
       (setf (ebb-parser-param-string parser) "")
       (setf (ebb-parser-private parser) nil)
       ;; Preserve DCS intermediates until ST dispatches the completed string.
@@ -434,7 +448,7 @@ only digits and semicolons."
    ;; C0 controls (0x00-0x1F) handled inline in most states
    ((and (< ch ?\s)
          (memq (ebb-parser-state parser)
-               '(:ground :escape :escape-intermediate
+               '(:ground :escape :escape-intermediate :escape-ignored
                  :csi-entry :csi-param :csi-intermediate :csi-ignored)))
     (ebb-parse--dispatch-c0 parser ch))
 
@@ -448,6 +462,7 @@ only digits and semicolons."
       (:escape            (ebb-parse--escape parser ch))
       (:escape-intermediate
        (ebb-parse--escape-intermediate parser ch))
+      (:escape-ignored     (ebb-parse--escape-ignored parser ch))
       (:csi-entry         (ebb-parse--csi-entry parser ch))
       (:csi-param         (ebb-parse--csi-param parser ch))
       (:csi-intermediate  (ebb-parse--csi-intermediate parser ch))
@@ -456,6 +471,7 @@ only digits and semicolons."
       (:dcs-entry         (ebb-parse--dcs-entry parser ch))
       (:dcs-param         (ebb-parse--dcs-param parser ch))
       (:dcs-passthrough   (ebb-parse--dcs-passthrough parser ch))
+      (:dcs-ignored       (ebb-parse--dcs-ignored parser ch))
       (:charset-designate (ebb-parse--charset-designate parser ch))
       (:sos-pm-apc        (ebb-parse--sos-pm-apc parser ch))))))
 
@@ -526,8 +542,11 @@ only digits and semicolons."
    ;; Other ESC intermediate sequences, such as DECALN (ESC # 8).
    ((and (>= ch ?\s) (<= ch ?/))
     (setf (ebb-parser-string-state parser) nil)
-    (setf (ebb-parser-intermediates parser) (string ch))
-    (setf (ebb-parser-state parser) :escape-intermediate))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (progn
+          (setf (ebb-parser-intermediates parser) (string ch))
+          (setf (ebb-parser-state parser) :escape-intermediate))
+      (setf (ebb-parser-state parser) :escape-ignored)))
    ;; Simple ESC commands
    (t
     (setf (ebb-parser-string-state parser) nil)
@@ -538,13 +557,21 @@ only digits and semicolons."
   "Collect and dispatch an ESC sequence with intermediate bytes."
   (cond
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (ebb-parser-intermediates parser)
-          (concat (ebb-parser-intermediates parser) (string ch))))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (setf (ebb-parser-intermediates parser)
+              (concat (ebb-parser-intermediates parser) (string ch)))
+      (setf (ebb-parser-state parser) :escape-ignored)))
    ((and (>= ch ?0) (<= ch ?~))
     (ebb-parse--dispatch-esc-intermediate parser ch)
     (setf (ebb-parser-state parser) :ground))
    (t
     (setf (ebb-parser-state parser) :ground))))
+
+(defun ebb-parse--escape-ignored (parser ch)
+  "Ignore an overlong ESC sequence through its final byte."
+  (when (or (and (>= ch ?0) (<= ch ?~))
+            (not (and (>= ch ?\s) (<= ch ?/))))
+    (setf (ebb-parser-state parser) :ground)))
 
 (defun ebb-parse--dispatch-esc-intermediate (parser ch)
   "Dispatch an ESC sequence ending in CH after intermediate bytes."
@@ -611,12 +638,18 @@ only digits and semicolons."
     (setf (ebb-parser-state parser) :csi-param))
    ;; Parameter char
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;) (= ch ?:))
-    (setf (ebb-parser-param-string parser) (string ch))
-    (setf (ebb-parser-state parser) :csi-param))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (progn
+          (setf (ebb-parser-param-string parser) (string ch))
+          (setf (ebb-parser-state parser) :csi-param))
+      (setf (ebb-parser-state parser) :csi-ignored)))
    ;; Intermediate byte
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (ebb-parser-intermediates parser) (string ch))
-    (setf (ebb-parser-state parser) :csi-intermediate))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (progn
+          (setf (ebb-parser-intermediates parser) (string ch))
+          (setf (ebb-parser-state parser) :csi-intermediate))
+      (setf (ebb-parser-state parser) :csi-ignored)))
    ;; Final byte -- dispatch immediately
    ((and (>= ch ?@) (<= ch ?~))
     (ebb-parse--dispatch-csi parser ch))
@@ -629,11 +662,16 @@ only digits and semicolons."
   "Collect CSI parameters."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;) (= ch ?:))
-    (setf (ebb-parser-param-string parser)
-          (concat (ebb-parser-param-string parser) (string ch))))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (setf (ebb-parser-param-string parser)
+              (concat (ebb-parser-param-string parser) (string ch)))
+      (setf (ebb-parser-state parser) :csi-ignored)))
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (ebb-parser-intermediates parser) (string ch))
-    (setf (ebb-parser-state parser) :csi-intermediate))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (progn
+          (setf (ebb-parser-intermediates parser) (string ch))
+          (setf (ebb-parser-state parser) :csi-intermediate))
+      (setf (ebb-parser-state parser) :csi-ignored)))
    ((and (>= ch ?@) (<= ch ?~))
     (ebb-parse--dispatch-csi parser ch))
    (t (setf (ebb-parser-state parser) :ground))))
@@ -644,8 +682,10 @@ only digits and semicolons."
   "Collect CSI intermediate bytes."
   (cond
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (ebb-parser-intermediates parser)
-          (concat (ebb-parser-intermediates parser) (string ch))))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (setf (ebb-parser-intermediates parser)
+              (concat (ebb-parser-intermediates parser) (string ch)))
+      (setf (ebb-parser-state parser) :csi-ignored)))
    ((and (>= ch ?@) (<= ch ?~))
     (ebb-parse--dispatch-csi parser ch))
    ;; A parameter byte after an intermediate byte makes the sequence
@@ -684,11 +724,16 @@ in process-char."
   "Handle first char after DCS (ESC P)."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;))
-    (setf (ebb-parser-dcs-params parser) (string ch))
-    (setf (ebb-parser-state parser) :dcs-param))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (progn
+          (setf (ebb-parser-dcs-params parser) (string ch))
+          (setf (ebb-parser-state parser) :dcs-param))
+      (setf (ebb-parser-state parser) :dcs-ignored)))
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (ebb-parser-intermediates parser)
-          (concat (ebb-parser-intermediates parser) (string ch))))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (setf (ebb-parser-intermediates parser)
+              (concat (ebb-parser-intermediates parser) (string ch)))
+      (setf (ebb-parser-state parser) :dcs-ignored)))
    ((and (>= ch ?@) (<= ch ?~))
     (setf (ebb-parser-dcs-final parser) ch)
     (setf (ebb-parser-state parser) :dcs-passthrough))
@@ -700,11 +745,15 @@ in process-char."
   "Collect DCS parameters."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;))
-    (setf (ebb-parser-dcs-params parser)
-          (concat (ebb-parser-dcs-params parser) (string ch))))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (setf (ebb-parser-dcs-params parser)
+              (concat (ebb-parser-dcs-params parser) (string ch)))
+      (setf (ebb-parser-state parser) :dcs-ignored)))
    ((and (>= ch ?\s) (<= ch ?/))
-    (setf (ebb-parser-intermediates parser)
-          (concat (ebb-parser-intermediates parser) (string ch))))
+    (if (ebb-parse--collect-control-header-byte-p parser)
+        (setf (ebb-parser-intermediates parser)
+              (concat (ebb-parser-intermediates parser) (string ch)))
+      (setf (ebb-parser-state parser) :dcs-ignored)))
    ((and (>= ch ?@) (<= ch ?~))
     (setf (ebb-parser-dcs-final parser) ch)
     (setf (ebb-parser-state parser) :dcs-passthrough))
@@ -718,6 +767,9 @@ in process-char."
   (when (< (ebb-parser-dcs-length parser) 1048576)
     (push (string ch) (ebb-parser-dcs-parts parser))
     (cl-incf (ebb-parser-dcs-length parser))))
+
+(defun ebb-parse--dcs-ignored (_parser _ch)
+  "Ignore an overlong DCS through its string terminator.")
 
 ;;;; ---- State: Charset Designate ---------------------------------------
 
