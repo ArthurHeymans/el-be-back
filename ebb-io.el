@@ -53,6 +53,11 @@ Each function receives IO, the error value, and its consecutive count.")
 
 ;;;; ---- Customization --------------------------------------------------
 
+(defcustom ebb-scrollback-lines 10000
+  "Maximum number of unwrapped logical scrollback lines."
+  :type 'natnum
+  :group 'ebb)
+
 (defcustom ebb-chunk-size 4096
   "Number of bytes to parse per chunk before yielding to the event loop."
   :type 'integer
@@ -239,6 +244,8 @@ window currently displaying BUFFER, else the selected window."
          (width (max (window-max-chars-per-line window) 10))
          (height (max (window-body-height window) 3))
          (screen (ebb-screen-create width height)))
+    (unless (natnump ebb-scrollback-lines)
+      (error "`ebb-scrollback-lines' must be a non-negative integer"))
     (setf (ebb-screen-scrollback-max screen) ebb-scrollback-lines)
     (make-ebb-io
      :screen screen

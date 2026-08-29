@@ -1593,6 +1593,52 @@ Binds `screen' and `parser' in BODY."
     (ebb-test-output parser "AB\e[ 3qCD")
     (should (equal "ABCD" (ebb-test-display-line screen 0)))))
 
+(ert-deftest ebb-test-parse-bounds-csi-headers ()
+  "Overlong CSI parameters and intermediates are ignored without growing."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((overlong 1025))
+      (ebb-test-output parser (concat "\e[" (make-string overlong ?1)))
+      (should (eq :csi-ignored (ebb-parser-state parser)))
+      (should (= 1024 (length (ebb-parser-param-string parser))))
+      (ebb-test-output parser "m")
+      (ebb-test-output parser (concat "\e[" (make-string overlong ?/)))
+      (should (eq :csi-ignored (ebb-parser-state parser)))
+      (should (= 1024 (length (ebb-parser-intermediates parser))))
+      (ebb-test-output parser "qX")
+      (should (equal "X" (ebb-test-display-line screen 0))))))
+
+(ert-deftest ebb-test-parse-fast-csi-respects-header-bound ()
+  "The fast CSI path rejects overlong cursor and attribute parameters."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (dolist (final '(?H ?m))
+      (let ((sequence (concat (make-string 1025 ?1) (string final))))
+        (should-not (ebb-parse--fast-csi-at
+                     parser sequence 0 (length sequence)))))))
+
+(ert-deftest ebb-test-parse-bounds-esc-intermediates ()
+  "Overlong ESC intermediates are ignored through their final byte."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((overlong 1025))
+      (ebb-test-output parser (concat "\e" (make-string overlong ?#)))
+      (should (eq :escape-ignored (ebb-parser-state parser)))
+      (should (= 1024 (length (ebb-parser-intermediates parser))))
+      (ebb-test-output parser "0X")
+      (should (equal "X" (ebb-test-display-line screen 0))))))
+
+(ert-deftest ebb-test-parse-bounds-dcs-headers ()
+  "Overlong DCS parameters and intermediates are ignored through ST."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((overlong 1025))
+      (ebb-test-output parser (concat "\eP" (make-string overlong ?1)))
+      (should (eq :dcs-ignored (ebb-parser-state parser)))
+      (should (= 1024 (length (ebb-parser-dcs-params parser))))
+      (ebb-test-output parser "\e\\")
+      (ebb-test-output parser (concat "\eP" (make-string overlong ?/)))
+      (should (eq :dcs-ignored (ebb-parser-state parser)))
+      (should (= 1024 (length (ebb-parser-intermediates parser))))
+      (ebb-test-output parser "\e\\X")
+      (should (equal "X" (ebb-test-display-line screen 0))))))
+
 (ert-deftest ebb-test-parse-c1-st-terminates-osc ()
   "C1 ST (U+009C) terminates a pending OSC string."
   (ebb-test-with-screen (:width 20 :height 6)
@@ -2243,6 +2289,19 @@ Binds `screen' and `parser' in BODY."
     (should-error (ebb-send-key "up") :type 'user-error)
     (setq major-mode 'ebb-mode)
     (should-error (ebb-send-key "up") :type 'user-error)))
+
+(ert-deftest ebb-test-io-create-terminal-applies-scrollback-option ()
+  "The standalone I/O constructor applies valid scrollback limits only."
+  (let ((buffer (generate-new-buffer " *ebb-io-create-test*")))
+    (unwind-protect
+        (progn
+          (let ((ebb-scrollback-lines 37))
+            (let ((io (ebb-io-create-terminal buffer #'ignore)))
+              (should (= 37 (ebb-screen-scrollback-max
+                             (ebb-io-screen io))))))
+          (let ((ebb-scrollback-lines -1))
+            (should-error (ebb-io-create-terminal buffer #'ignore))))
+      (kill-buffer buffer))))
 
 (ert-deftest ebb-test-io-send-preserves-bytes ()
   "Process writes preserve unibyte data and UTF-8 encode text."

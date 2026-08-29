@@ -167,11 +167,16 @@
   (ebb-serial-tests--require-ebb-serial)
   (cl-letf (((symbol-function 'ebb-io-create-terminal) nil))
     (with-temp-buffer
-      (let ((io (ebb-serial--create-terminal)))
-        (should (eq (ebb-io-buffer io) (current-buffer)))
-        (should (ebb-io-screen io))
-        (should (ebb-io-render io))
-        (should (ebb-io-parser io))))))
+      (let ((ebb-scrollback-lines 37))
+        (let ((io (ebb-serial--create-terminal)))
+          (should (eq (ebb-io-buffer io) (current-buffer)))
+          (should (ebb-io-screen io))
+          (should (ebb-io-render io))
+          (should (ebb-io-parser io))
+          (should (= 37 (ebb-screen-scrollback-max
+                         (ebb-io-screen io))))))
+      (let ((ebb-scrollback-lines -1))
+        (should-error (ebb-serial--create-terminal))))))
 
 (ert-deftest ebb-serial-setup-uses-shared-resize-hook ()
   (ebb-serial-tests--require-ebb-serial)
