@@ -372,8 +372,12 @@ so the child process never receives the pasted text."
   (when-let* ((text (nth 1 event)))
     (when (bound-and-true-p xterm-store-paste-on-kill-ring)
       ;; This is incoming clipboard data, not a new copy operation.  Avoid
-      ;; sending it back through `interprogram-cut-function'.
-      (let ((interprogram-cut-function nil))
+      ;; sending it back through `interprogram-cut-function', and keep
+      ;; `save-interprogram-paste-before-kill' from importing whatever the
+      ;; desktop clipboard holds into the kill ring via
+      ;; `interprogram-paste-function'.
+      (let ((interprogram-cut-function nil)
+            (interprogram-paste-function nil))
         (kill-new text)))
     (ebb-paste-string text)))
 
@@ -1100,22 +1104,30 @@ Reports from a non-local HOST become TRAMP paths.  The buffer's remote
 prefix is reused when it targets the reported host (preserves method,
 user, multi-hop); a different host means the user ssh'd onward from
 this buffer's host, so a fresh path is built via
-`ebb-tramp-default-method'.  A local-looking HOST (or none) in a
-remote buffer is the remote shell reporting on itself."
+`ebb-tramp-default-method'.  A HOST naming this machine, in a
+remote buffer, is the local shell back in charge after the user
+left ssh: a plain local path again.  A local-looking HOST (or
+none) in a remote buffer is the remote shell reporting on itself."
   (when (and dir (not (string-empty-p dir)))
     (let ((prefix (file-remote-p default-directory)))
       (cond
+       ;; Preserve an existing remote session even when its target happens
+       ;; to be this machine (for example, /ssh:localhost-name:...).
+       ((and prefix
+             (ebb--same-host-p
+              host (file-remote-p default-directory 'host)))
+        (concat prefix dir))
        ((not (ebb--local-host-p host))
-        (if (and prefix
-                 (equal (downcase host)
-                        (downcase (or (file-remote-p default-directory 'host)
-                                      ""))))
-            (concat prefix dir)
-          (progn
-            (require 'tramp)
-            (format "/%s:%s:%s"
-                    (or ebb-tramp-default-method tramp-default-method)
-                    host dir))))
+        (require 'tramp)
+        (format "/%s:%s:%s"
+                (or ebb-tramp-default-method tramp-default-method)
+                host dir))
+       ;; ssh exited and the local shell talks again, so take the
+       ;; report at face value and drop the stale remote prefix.
+       ((and prefix (ebb--this-host-p host)) dir)
+       ;; Empty and localhost aliases are not `this-host': a remote
+       ;; shell may report those about itself (containers report
+       ;; 127.0.0.1), so stay under its prefix.
        (prefix (concat prefix dir))
        (t dir)))))
 
@@ -1302,15 +1314,40 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
 
 ;;;; ---- Buffer naming --------------------------------------------------
 
+(defun ebb--same-host-p (left right)
+  "Return non-nil when LEFT and RIGHT name the same host.
+Comparison is case-insensitive.  A short name matches the first label of
+an FQDN, but two different FQDNs never match merely because their first
+labels are equal."
+  (when (and left right
+             (not (string-empty-p left))
+             (not (string-empty-p right)))
+    (let* ((left (downcase left))
+           (right (downcase right))
+           (left-short (car (split-string left "\\.")))
+           (right-short (car (split-string right "\\.")))
+           (left-fqdn-p (string-match-p "\\." left))
+           (right-fqdn-p (string-match-p "\\." right)))
+      (or (equal left right)
+          (and (not left-fqdn-p) (equal left right-short))
+          (and (not right-fqdn-p) (equal right left-short))))))
+
+(defun ebb--this-host-p (host)
+  "Return non-nil if HOST names this machine.
+A short HOST may match the first label of an FQDN `(system-name)' and
+vice versa.  Unlike `ebb--local-host-p', localhost aliases do not count:
+a remote shell may report those about itself, so they are excluded even
+when `(system-name)' is itself `localhost'."
+  (and host (not (string-empty-p host))
+       (not (member (downcase host) '("localhost" "127.0.0.1" "::1")))
+       (ebb--same-host-p host (system-name))))
+
 (defun ebb--local-host-p (host)
   "Return non-nil if HOST is this machine or empty/localhost."
   (or (null host)
       (string-empty-p host)
-      (member (downcase host) '("localhost" "127.0.0.1" "::1"))
-      (eq t (compare-strings host nil nil (system-name) nil nil t))
-      (eq t (compare-strings host nil nil
-                             (car (split-string (system-name) "\\."))
-                             nil nil t))))
+      (ebb--this-host-p host)
+      (member (downcase host) '("localhost" "127.0.0.1" "::1"))))
 
 (defun ebb--format-title-for-buffer (title)
   "Return TITLE with local user@host: stripped; keep remote host."

@@ -2293,7 +2293,9 @@ Binds `screen' and `parser' in BODY."
   (let ((kill-ring nil)
         (kill-ring-yank-pointer nil)
         (xterm-store-paste-on-kill-ring t)
+        (save-interprogram-paste-before-kill t)
         clipboard-writes
+        (clipboard-reads 0)
         sent)
     (with-temp-buffer
       (setq major-mode 'ebb-mode)
@@ -2304,10 +2306,16 @@ Binds `screen' and `parser' in BODY."
                 ((symbol-function 'ebb-io-send)
                  (lambda (_io string) (setq sent string)))
                 (interprogram-cut-function
-                 (lambda (text) (push text clipboard-writes))))
+                 (lambda (text) (push text clipboard-writes)))
+                ;; Incoming paste is not a yank: pasting must not import
+                ;; whatever the desktop clipboard currently holds.
+                (interprogram-paste-function
+                 (lambda () (cl-incf clipboard-reads) "desktop-clipboard")))
         (ebb-xterm-paste '(xterm-paste "hello"))))
     (should (equal sent "\e[200~hello\e[201~"))
     (should (equal (car kill-ring) "hello"))
+    (should (equal (length kill-ring) 1))
+    (should (equal clipboard-reads 0))
     (should-not clipboard-writes)))
 
 (ert-deftest ebb-test-public-input-api-requires-running-terminal ()
@@ -4119,21 +4127,61 @@ across the unmaterialized gap."
     (should-not (ebb--cwd-to-path "" "box"))
     (should-not (ebb--cwd-to-path nil nil)))
   (with-temp-buffer
-    ;; Remote buffer: reuse the full prefix (method, user, multi-hop).
-    (setq-local default-directory "/ssh:user@box:/tmp/")
-    (should (equal "/ssh:user@box:/home/u"
-                   (ebb--cwd-to-path "/home/u" "box")))
-    ;; Empty host in a remote buffer is the remote shell reporting.
-    (should (equal "/ssh:user@box:/home/u"
-                   (ebb--cwd-to-path "/home/u" "")))
-    ;; Localhost aliases in a remote buffer also mean the remote shell
-    ;; (containers often report 127.0.0.1).
-    (should (equal "/ssh:user@box:/home/u"
-                   (ebb--cwd-to-path "/home/u" "127.0.0.1")))
-    ;; A different host means the user ssh'd onward: fresh TRAMP path.
-    (let ((ebb-tramp-default-method "ssh"))
-      (should (equal "/ssh:other:/home/u"
-                     (ebb--cwd-to-path "/home/u" "other"))))))
+    (cl-letf (((symbol-function 'system-name)
+               (lambda () "local.example.org")))
+      ;; Remote buffer: reuse the full prefix (method, user, multi-hop).
+      (setq-local default-directory "/ssh:user@box:/tmp/")
+      (should (equal "/ssh:user@box:/home/u"
+                     (ebb--cwd-to-path "/home/u" "box")))
+      ;; Empty host in a remote buffer is the remote shell reporting.
+      (should (equal "/ssh:user@box:/home/u"
+                     (ebb--cwd-to-path "/home/u" "")))
+      ;; Localhost aliases in a remote buffer also mean the remote shell
+      ;; (containers often report 127.0.0.1).
+      (should (equal "/ssh:user@box:/home/u"
+                     (ebb--cwd-to-path "/home/u" "127.0.0.1")))
+      ;; A different host means the user ssh'd onward: fresh TRAMP path.
+      (let ((ebb-tramp-default-method "ssh"))
+        (should (equal "/ssh:other:/home/u"
+                       (ebb--cwd-to-path "/home/u" "other"))))
+      ;; The report names this machine again: the user left ssh and the
+      ;; local shell is reporting, so the path is plain local.
+      (should (equal "/home/u"
+                     (ebb--cwd-to-path "/home/u" (system-name))))
+      ;; ...also when `system-name' is a FQDN and the report is short.
+      (should (equal "/home/u"
+                     (ebb--cwd-to-path "/home/u" "local")))))
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'system-name)
+               (lambda () "box.example.org")))
+      ;; A remote session targeting this machine remains remote.
+      (setq-local default-directory "/ssh:user@box.example.org:/tmp/")
+      (should (equal "/ssh:user@box.example.org:/home/u"
+                     (ebb--cwd-to-path "/home/u" "box.example.org")))
+      (should (equal "/ssh:user@box.example.org:/home/u"
+                     (ebb--cwd-to-path "/home/u" "box")))
+      ;; Equal first labels do not make distinct FQDNs the same host.
+      (let ((ebb-tramp-default-method "ssh"))
+        (should (equal "/ssh:box.example.net:/home/u"
+                       (ebb--cwd-to-path "/home/u"
+                                         "box.example.net")))))))
+
+(ert-deftest ebb-test-this-host-excludes-localhost-aliases ()
+  "localhost aliases are not `this machine' in a remote buffer.
+A remote shell may report them about itself, so `ebb--this-host-p'
+must not treat them as the local name even when `(system-name)' is a
+localhost alias; only a real host name reverts the TRAMP prefix."
+  (should-not (ebb--this-host-p "localhost"))
+  (should-not (ebb--this-host-p "127.0.0.1"))
+  (should-not (ebb--this-host-p "::1"))
+  ;; They still count as local for `ebb--local-host-p'.
+  (should (ebb--local-host-p "localhost"))
+  ;; The machine's own names still match.
+  (should (ebb--this-host-p (system-name)))
+  (should (ebb--this-host-p
+           (car (split-string (system-name) "\\."))))
+  (should-not (ebb--this-host-p ""))
+  (should-not (ebb--this-host-p nil)))
 
 (ert-deftest ebb-test-remote-login-shell ()
   "`getent passwd' replies are accepted only when they name one user."
