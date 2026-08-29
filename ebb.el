@@ -124,7 +124,8 @@ nil to leave the buffer name alone.  Set to nil to disable auto-rename.
 
 Defaults to directory naming like ghostel users typically want: local
 buffers show an abbreviated path without the hostname; remote paths keep
-the TRAMP host."
+the TRAMP host.  The `ebb-buffer-name-by-title' choice names buffers
+from OSC titles via `ebb-buffer-name-title-prefix'."
   :type '(choice (const :tag "Disabled" nil)
                  (function-item :tag "By directory"
                                 ebb-buffer-name-by-directory)
@@ -136,6 +137,13 @@ the TRAMP host."
 (defcustom ebb-scrollback-lines 10000
   "Maximum number of unwrapped logical scrollback lines."
   :type 'integer
+  :group 'ebb)
+
+(defcustom ebb-buffer-name-title-prefix "ebb: "
+  "Label prepended to OSC titles by `ebb-buffer-name-by-title'.
+The buffer is named \"*PREFIX TITLE*\"; e.g. \"ssh: \" groups remote
+sessions as \"*ssh: user@host*\" for easy filtering in `ibuffer'."
+  :type 'string
   :group 'ebb)
 
 (defcustom ebb-default-input-mode 'semi-char
@@ -1314,9 +1322,10 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
           trimmed))))
 
 (defun ebb-buffer-name-by-title (title)
-  "Return \"*ebb: TITLE*\", stripping local user@host from TITLE."
+  "Return \"*PREFIX TITLE*\" from OSC TITLE per `ebb-buffer-name-title-prefix'.
+Local user@host is stripped from TITLE; remote hosts are kept."
   (when-let* ((pretty (ebb--format-title-for-buffer title)))
-    (format "*ebb: %s*" pretty)))
+    (concat "*" ebb-buffer-name-title-prefix pretty "*")))
 
 (defun ebb-buffer-name-by-directory (&optional _title)
   "Return \"*ebb: DIR*\" from abbreviated `default-directory'.

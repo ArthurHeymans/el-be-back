@@ -3619,6 +3619,9 @@ across the unmaterialized gap."
                     (format "%s@%s:~/src/ebb$" user host))))
     (should (equal (format "*ebb: alice@otherbox:~/x*")
                    (ebb-buffer-name-by-title "alice@otherbox:~/x")))
+    (let ((ebb-buffer-name-title-prefix "ssh: "))
+      (should (equal "*ssh: alice@otherbox:~/x*"
+                     (ebb-buffer-name-by-title "alice@otherbox:~/x"))))
     (let ((default-directory (expand-file-name "src/ebb/" "~")))
       (should (equal "*ebb: ~/src/ebb*"
                      (ebb-buffer-name-by-directory nil))))
