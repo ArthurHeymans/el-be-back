@@ -377,6 +377,27 @@ Binds `screen' and `parser' in BODY."
     (should (equal "C" (ebb-test-display-line screen 2)))
     (should (equal "" (ebb-test-display-line screen 3)))))
 
+(ert-deftest ebb-test-insert-delete-lines-move-kitty-placements ()
+  "Whole-row insert/delete operations keep graphics attached to moved text."
+  (ebb-test-with-screen (:width 5 :height 4)
+    (let* ((graphics (ebb-screen-graphics screen))
+           (placement (make-ebb-graphics-placement
+                       :image-id 1 :row 1 :column 0 :columns 1 :rows 1)))
+      (setf (ebb-graphics-state-placements graphics) (list placement))
+      (ebb-screen-cursor-goto screen 1 0)
+      (ebb-screen-insert-lines screen 1)
+      (should (= 2 (ebb-graphics-placement-row placement)))
+      (ebb-screen-cursor-goto screen 1 0)
+      (ebb-screen-delete-lines screen 1)
+      (should (= 1 (ebb-graphics-placement-row placement)))
+      ;; A placement spanning the movement boundary cannot be represented
+      ;; without splitting, so discard it instead of misaligning it.
+      (setf (ebb-graphics-state-placements graphics)
+            (list (make-ebb-graphics-placement
+                   :image-id 2 :row 0 :column 0 :columns 1 :rows 2)))
+      (ebb-screen-insert-lines screen 1)
+      (should-not (ebb-graphics-state-placements graphics)))))
+
 (ert-deftest ebb-test-insert-delete-chars ()
   "Insert and delete characters on a line."
   (ebb-test-with-screen (:width 10 :height 3)
@@ -1742,6 +1763,1392 @@ Binds `screen' and `parser' in BODY."
       (should (equal '((pause 75) (indeterminate 42) (error 0)
                        (set 100) (remove 0))
                      events)))))
+
+(ert-deftest ebb-test-parse-sos-does-not-dispatch-kitty-payload ()
+  "An SOS string beginning with G is not mistaken for a Kitty APC."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser) (lambda (response) (push response responses)))
+      (ebb-test-output parser "\eXGa=q,i=7;\e\\")
+      (should-not responses))))
+
+(ert-deftest ebb-test-parse-kitty-query-response ()
+  "The canonical Kitty support query is answered without storing an image."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser) (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e_Gi=7,s=1,v=1,a=q,t=d,f=24;AAAA\e\\")
+      (should (equal '("\e_Gi=7;OK\e\\") responses))
+      (should (= 0 (hash-table-count
+                    (ebb-graphics-state-images (ebb-screen-graphics screen))))))))
+
+(defconst ebb-test-kitty-png-base64
+  "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg=="
+  "A 2x1 RGB PNG (red, blue) as base64.")
+
+(ert-deftest ebb-test-parse-kitty-direct-png-transmit ()
+  "A direct PNG transmission is retained with its IHDR dimensions."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((data (base64-decode-string ebb-test-kitty-png-base64))
+          responses)
+      (setf (ebb-parser-write-fn parser) (lambda (response) (push response responses)))
+      (ebb-test-output parser (format "\e_Ga=t,f=100,i=9;%s\e\\"
+                                      ebb-test-kitty-png-base64))
+      (let* ((graphics (ebb-screen-graphics screen))
+             (image (gethash 9 (ebb-graphics-state-images graphics))))
+        (should image)
+        (should (= 100 (ebb-graphics-image-format image)))
+        (should (= 2 (ebb-graphics-image-width image)))
+        (should (= 1 (ebb-graphics-image-height image)))
+        (should (equal data (ebb-graphics-image-data image)))
+        (should (= (length data) (ebb-graphics-state-byte-count graphics))))
+      (should (equal '("\e_Gi=9;OK\e\\") responses))
+      ;; Data that is not a PNG is rejected rather than stored.
+      (setq responses nil)
+      (ebb-test-output parser (format "\e_Ga=t,f=100,i=10;%s\e\\"
+                                      (base64-encode-string "nope" t)))
+      (should-not (gethash 10 (ebb-graphics-state-images
+                               (ebb-screen-graphics screen))))
+      (should (equal '("\e_Gi=10;EINVAL:invalid PNG data\e\\") responses)))))
+
+(ert-deftest ebb-test-kitty-anonymous-transmit-does-not-acknowledge ()
+  "A transmission without i or I creates an anonymous image without an ACK."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e_Ga=t,f=24,s=1,v=1;AQID\e\\")
+      (should (= 1 (hash-table-count
+                    (ebb-graphics-state-images (ebb-screen-graphics screen)))))
+      (should-not responses))))
+
+(ert-deftest ebb-test-kitty-image-number-response-includes-id-and-number ()
+  "An I request is acknowledged with both the allocated i and original I."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e_Ga=t,f=24,s=1,v=1,I=13;AQID\e\\")
+      (should (equal '("\e_Gi=1,I=13;OK\e\\") responses)))))
+
+(ert-deftest ebb-test-kitty-placement-geometry-follows-kitty ()
+  "Unspecified c/r preserve aspect ratio; a complete cell box stretches."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((encoded (base64-encode-string (make-string (* 16 32 3) 0) t))
+          (graphics (ebb-screen-graphics screen)))
+      (setf (ebb-parser-emit-fn parser)
+            (lambda (type &rest args)
+              (when (and (eq type 'pixel-size) (eq (car args) 'cell))
+                '(10 . 20))))
+      (ebb-test-output
+       parser (format "\e_Ga=T,f=24,s=16,v=32,i=1,C=1;%s\e\\" encoded))
+      (let ((natural (car (ebb-graphics-state-placements graphics))))
+        (should (= 2 (ebb-graphics-placement-columns natural)))
+        (should (= 2 (ebb-graphics-placement-rows natural)))
+        (should (= 16 (ebb-graphics-placement-pixel-width natural)))
+        (should (= 32 (ebb-graphics-placement-pixel-height natural))))
+      (ebb-test-output parser "\e_Ga=p,i=1,c=4,C=1;\e\\")
+      (let ((by-columns (car (ebb-graphics-state-placements graphics))))
+        (should (= 4 (ebb-graphics-placement-columns by-columns)))
+        (should (= 4 (ebb-graphics-placement-rows by-columns)))
+        (should (= 40 (ebb-graphics-placement-pixel-width by-columns)))
+        (should (= 80 (ebb-graphics-placement-pixel-height by-columns))))
+      (ebb-test-output parser "\e_Ga=p,i=1,c=4,r=1,C=1;\e\\")
+      (let ((boxed (car (ebb-graphics-state-placements graphics))))
+        (should (= 4 (ebb-graphics-placement-columns boxed)))
+        (should (= 1 (ebb-graphics-placement-rows boxed)))
+        (should (= 10 (ebb-graphics-placement-pixel-width boxed)))
+        (should (= 20 (ebb-graphics-placement-pixel-height boxed))))
+      ;; Partial final cells are represented by padding in the renderer's
+      ;; cell-box-sized image rather than by changing the image aspect ratio.
+      (ebb-test-output
+       parser (format "\e_Ga=T,f=24,s=16,v=28,i=2,C=1;%s\e\\"
+                      (base64-encode-string (make-string (* 16 28 3) 0) t)))
+      (let ((natural (car (ebb-graphics-state-placements graphics))))
+        (should (= 2 (ebb-graphics-placement-columns natural)))
+        (should (= 2 (ebb-graphics-placement-rows natural)))
+        (should (= 16 (ebb-graphics-placement-pixel-width natural)))
+        (should (= 28 (ebb-graphics-placement-pixel-height natural))))
+      (ebb-test-output parser "\e_Ga=p,i=2,c=2,C=1;\e\\")
+      (let ((snapped (car (ebb-graphics-state-placements graphics))))
+        (should (= 2 (ebb-graphics-placement-columns snapped)))
+        (should (= 2 (ebb-graphics-placement-rows snapped)))
+        (should (= 20 (ebb-graphics-placement-pixel-width snapped)))
+        (should (= 35 (ebb-graphics-placement-pixel-height snapped)))))))
+
+(ert-deftest ebb-test-parse-kitty-zlib-payload ()
+  "An o=z payload is inflated before validation and storage."
+  (skip-unless (zlib-available-p))
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((compressed (unibyte-string 120 156 99 100 98 6 0 0 13 0 7))
+          responses)
+      (setf (ebb-parser-write-fn parser) (lambda (response) (push response responses)))
+      (ebb-test-output
+       parser (format "\e_Ga=t,f=24,s=1,v=1,i=5,o=z;%s\e\\"
+                      (base64-encode-string compressed t)))
+      (should (equal (unibyte-string 1 2 3)
+                     (ebb-graphics-image-data
+                      (gethash 5 (ebb-graphics-state-images
+                                  (ebb-screen-graphics screen))))))
+      (should (equal '("\e_Gi=5;OK\e\\") responses)))))
+
+(ert-deftest ebb-test-kitty-zlib-output-is-bounded-before-allocation ()
+  "Compressed data expanding past the image limit is rejected by the helper."
+  (skip-unless (executable-find "python3"))
+  (let ((ebb-kitty-graphics-image-limit 8)
+        (compressed
+         (with-temp-buffer
+           (set-buffer-multibyte nil)
+           (call-process "python3" nil t nil "-c"
+                         (concat "import sys,zlib;"
+                                 "sys.stdout.buffer.write(zlib.compress(b'x'*64))"))
+           (buffer-string))))
+    (should (equal '(error . "EFBIG:inflated image too large")
+                   (ebb-graphics--inflate compressed)))))
+
+(ert-deftest ebb-test-kitty-decoded-dimensions-are-bounded ()
+  "Raw and PNG dimensions are rejected before backend image allocation."
+  (let ((ebb-kitty-graphics-image-limit 16)
+        (raw (make-hash-table :test #'eql))
+        (png (make-hash-table :test #'eql)))
+    (puthash ?f "32" raw)
+    (puthash ?s "1000000" raw)
+    (puthash ?v "1000000" raw)
+    (should (equal '(error . "EFBIG:decoded image too large")
+                   (ebb-graphics--prepare-image raw "x")))
+    (puthash ?f "100" png)
+    (let ((header (make-string 24 0)))
+      (aset header 0 #x89)
+      (setf (substring header 1 4) "PNG"
+            (substring header 12 16) "IHDR")
+      ;; 1000 x 1000, big-endian.
+      (aset header 18 3) (aset header 19 232)
+      (aset header 22 3) (aset header 23 232)
+      (should (equal '(error . "EFBIG:decoded PNG too large")
+                     (ebb-graphics--prepare-image png header))))))
+
+(ert-deftest ebb-test-kitty-png-quota-charges-decoded-surface ()
+  "Compressed PNG data is charged by decoded surface size."
+  (let ((ebb-kitty-graphics-storage-limit 100)
+        (state (ebb-graphics-create))
+        (params (make-hash-table :test #'eql)))
+    (puthash ?i "1" params)
+    (should-not (ebb-graphics--store-image state params 100 10 10 "tiny"))
+    (should (= 0 (ebb-graphics-state-byte-count state)))))
+
+(ert-deftest ebb-test-kitty-oversized-replacement-is-atomic ()
+  "A rejected replacement preserves old data, placements, and accounting."
+  (let ((ebb-kitty-graphics-storage-limit 4)
+        (state (ebb-graphics-create))
+        (params (make-hash-table :test #'eql)))
+    (puthash ?i "1" params)
+    (should (ebb-graphics--store-image state params 24 1 1 "abc"))
+    (let ((placement (make-ebb-graphics-placement
+                      :image-id 1 :row 0 :column 0 :columns 1 :rows 1)))
+      (push placement (ebb-graphics-state-placements state))
+      (should-not (ebb-graphics--store-image state params 24 2 1 "abcde"))
+      (should (equal "abc"
+                     (ebb-graphics-image-data
+                      (gethash 1 (ebb-graphics-state-images state)))))
+      (should (eq placement (car (ebb-graphics-state-placements state))))
+      (should (= 3 (ebb-graphics-state-byte-count state))))))
+
+(ert-deftest ebb-test-parse-kitty-file-mediums ()
+  "File mediums read regular files, delete temporary ones, refuse sensitive paths."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let* ((ebb-kitty-graphics-allow-files t)
+           (temporary (make-temp-file "tty-graphics-protocol-ebb"))
+           (plain (make-temp-file "ebb-kitty-plain"))
+           (data (unibyte-string 9 8 7 6 5 4))
+           responses)
+      (unwind-protect
+          (progn
+            (dolist (file (list temporary plain))
+              (with-temp-file file
+                (set-buffer-multibyte nil)
+                (insert data)))
+            (setf (ebb-parser-write-fn parser)
+                  (lambda (response) (push response responses)))
+            (ebb-test-output
+             parser (format "\e_Ga=t,f=24,s=1,v=1,i=1,t=t,O=3;%s\e\\"
+                            (base64-encode-string temporary t)))
+            (should (equal (unibyte-string 6 5 4)
+                           (ebb-graphics-image-data
+                            (gethash 1 (ebb-graphics-state-images
+                                        (ebb-screen-graphics screen))))))
+            (should-not (file-exists-p temporary))
+            (ebb-test-output
+             parser (format "\e_Ga=q,f=24,s=2,v=1,i=2,t=f;%s\e\\"
+                            (base64-encode-string plain t)))
+            (should (file-exists-p plain))
+            (should-not (gethash 2 (ebb-graphics-state-images
+                                    (ebb-screen-graphics screen))))
+            (ebb-test-output
+             parser (format "\e_Ga=t,f=100,i=3,t=f;%s\e\\"
+                            (base64-encode-string "/proc/self/status" t)))
+            (should (equal '("\e_Gi=3;EPERM:refusing to read from a sensitive path\e\\"
+                             "\e_Gi=2;OK\e\\"
+                             "\e_Gi=1;OK\e\\")
+                           responses)))
+        (ignore-errors (delete-file temporary))
+        (ignore-errors (delete-file plain))))))
+
+(ert-deftest ebb-test-kitty-temporary-medium-rejects-ordinary-paths ()
+  "The temporary-file medium cannot be relabeled to read an arbitrary file."
+  (let ((plain (make-temp-file "ebb-kitty-plain")))
+    (unwind-protect
+        (ebb-test-with-screen (:width 20 :height 6)
+          (let (responses)
+            (with-temp-file plain
+              (set-buffer-multibyte nil)
+              (insert (unibyte-string 1 2 3)))
+            (setf (ebb-parser-write-fn parser)
+                  (lambda (response) (push response responses)))
+            (ebb-test-output
+             parser (format "\e_Ga=t,f=24,s=1,v=1,i=1,t=t;%s\e\\"
+                            (base64-encode-string plain t)))
+            (should (file-exists-p plain))
+            (should-not (gethash 1 (ebb-graphics-state-images
+                                    (ebb-screen-graphics screen))))
+            (should (equal '("\e_Gi=1;EPERM:invalid temporary-file path\e\\")
+                           responses))))
+      (ignore-errors (delete-file plain)))))
+
+(ert-deftest ebb-test-kitty-sensitive-path-resolves-symlinks ()
+  "A /dev/shm-style exemption cannot hide a symlink to a sensitive file."
+  (let ((link (make-temp-name
+               (expand-file-name "ebb-kitty-sensitive-"
+                                 temporary-file-directory))))
+    (unwind-protect
+        (progn
+          (make-symbolic-link "/proc/self/status" link)
+          (should (ebb-graphics--sensitive-path-p link)))
+      (ignore-errors (delete-file link)))))
+
+(ert-deftest ebb-test-kitty-temporary-file-symlink-to-sensitive-is-refused ()
+  "A t=t path whose truename resolves to a sensitive area is refused."
+  (let ((link (expand-file-name
+               (make-temp-name "ebb-kitty-tty-graphics-protocol-")
+               temporary-file-directory)))
+    (unwind-protect
+        (progn
+          (make-symbolic-link "/proc/self/status" link)
+          (ebb-test-with-screen (:width 20 :height 6)
+            (let (responses)
+              (setf (ebb-parser-write-fn parser)
+                    (lambda (response) (push response responses)))
+              (ebb-test-output
+               parser (format "\e_Ga=q,f=24,s=1,v=1,i=11,t=t;%s\e\\"
+                              (base64-encode-string link t)))
+              (should (equal '("\e_Gi=11;EPERM:refusing to read from a sensitive path\e\\")
+                             responses)))))
+      (ignore-errors (delete-file link)))))
+
+(ert-deftest ebb-test-parse-kitty-shared-memory-medium ()
+  "The t=s medium reads and unlinks a local POSIX shared-memory object."
+  (skip-unless (file-writable-p "/dev/shm"))
+  (let* ((name (format "ebb-kitty-%d" (emacs-pid)))
+         (path (expand-file-name name "/dev/shm"))
+         (data (unibyte-string 1 2 3)))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (set-buffer-multibyte nil)
+            (insert data))
+          (ebb-test-with-screen (:width 20 :height 6)
+            (let (responses)
+              (setf (ebb-parser-write-fn parser)
+                    (lambda (response) (push response responses)))
+              (ebb-test-output
+               parser (format "\e_Ga=q,f=24,s=1,v=1,i=7,t=s;%s\e\\"
+                              (base64-encode-string name t)))
+              (should (equal '("\e_Gi=7;OK\e\\") responses))
+              (should-not (file-exists-p path)))))
+      (ignore-errors (delete-file path)))))
+
+(ert-deftest ebb-test-parse-kitty-rejects-id-with-number ()
+  "Specifying both i and I is an error, and query validates its payload."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser) (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e_Ga=q,i=1,I=2;AAAA\e\\")
+      (ebb-test-output parser "\e_Ga=q,i=3,f=24,s=2,v=2;AAAA\e\\")
+      ;; q=1 silences OK, q=2 silences everything.
+      (ebb-test-output parser "\e_Ga=q,i=4,f=24,s=1,v=1,q=1;AAAA\e\\")
+      (ebb-test-output parser "\e_Ga=q,i=5,f=24,s=2,v=2,q=1;AAAA\e\\")
+      (ebb-test-output parser "\e_Ga=q,i=6,f=24,s=2,v=2,q=2;AAAA\e\\")
+      (should (equal '("\e_Gi=5;ENODATA:insufficient image data\e\\"
+                       "\e_Gi=3;ENODATA:insufficient image data\e\\"
+                       "\e_Gi=1,I=2;EINVAL:cannot specify both image id and number\e\\")
+                     responses)))))
+
+(ert-deftest ebb-test-parse-kitty-chunked-rgb-placement ()
+  "Chunked raw image data is joined once and can create a placement."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let* ((first (unibyte-string 1 2))
+           (last (unibyte-string 3))
+           responses)
+      (setf (ebb-parser-write-fn parser) (lambda (response) (push response responses)))
+      (ebb-test-output
+       parser
+       (format "\e_Ga=T,f=24,s=1,v=1,i=4,p=2,c=3,r=2,m=1;%s\e\\"
+               (base64-encode-string first t)))
+      (should (ebb-graphics-state-upload (ebb-screen-graphics screen)))
+      (ebb-test-output
+       parser
+       (format "\e_Gm=0;%s\e\\" (base64-encode-string last t)))
+      (let* ((graphics (ebb-screen-graphics screen))
+             (image (gethash 4 (ebb-graphics-state-images graphics)))
+             (placement (car (ebb-graphics-state-placements graphics))))
+        (should (equal (unibyte-string 1 2 3)
+                       (ebb-graphics-image-data image)))
+        (should (= 4 (ebb-graphics-placement-image-id placement)))
+        (should (= 2 (ebb-graphics-placement-placement-id placement)))
+        (should (= 3 (ebb-graphics-placement-columns placement)))
+        (should (= 2 (ebb-graphics-placement-rows placement))))
+      (should (equal '("\e_Gi=4,p=2;OK\e\\") responses)))))
+
+(ert-deftest ebb-test-kitty-new-transmission-aborts-partial-upload ()
+  "A complete new transmission is not appended to an older partial image."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((graphics (ebb-screen-graphics screen)))
+      (ebb-test-output parser "\e_Ga=t,f=24,s=2,v=1,i=1,m=1;AAAA\e\\")
+      (should (ebb-graphics-state-upload graphics))
+      (ebb-test-output parser "\e_Ga=t,f=24,s=1,v=1,i=2;AQID\e\\")
+      (should-not (ebb-graphics-state-upload graphics))
+      (should-not (gethash 1 (ebb-graphics-state-images graphics)))
+      (should (equal (unibyte-string 1 2 3)
+                     (ebb-graphics-image-data
+                      (gethash 2 (ebb-graphics-state-images graphics))))))))
+
+(ert-deftest ebb-test-kitty-chunked-query-retains-first-chunk ()
+  "Query validation joins all direct-upload chunks before replying."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e_Ga=q,f=24,s=1,v=1,i=8,m=1;AQI=\e\\")
+      (should (ebb-graphics-state-upload (ebb-screen-graphics screen)))
+      (ebb-test-output parser "\e_Gm=0;Aw==\e\\")
+      (should-not (ebb-graphics-state-upload (ebb-screen-graphics screen)))
+      (should (equal '("\e_Gi=8;OK\e\\") responses)))))
+
+(ert-deftest ebb-test-kitty-chunked-placement-uses-final-anchor ()
+  "A chunked a=T command uses the final packet's cursor and cell geometry."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output
+     parser "\e_Ga=T,f=24,s=1,v=1,i=8,c=2,r=1,m=1;AQI=\e\\")
+    (ebb-screen-cursor-goto screen 4 7)
+    (ebb-test-output parser "\e_Gm=0;Aw==\e\\")
+    (let ((placement (car (ebb-graphics-state-placements
+                           (ebb-screen-graphics screen)))))
+      (should (= 4 (ebb-graphics-placement-row placement)))
+      (should (= 7 (ebb-graphics-placement-column placement)))
+      (should (equal '(9 . 4) (ebb-test-cursor screen))))))
+
+(ert-deftest ebb-test-kitty-can-aborts-upload-and-recovers ()
+  "CAN inside an APC aborts the upload transaction and returns to text."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e_Ga=t,f=24,s=1,v=1,i=1,m=1;AQI=\x18")
+    (should-not (ebb-graphics-state-upload (ebb-screen-graphics screen)))
+    (should (eq :ground (ebb-parser-state parser)))
+    (ebb-test-output parser "X")
+    (should (equal "X" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-kitty-duplicate-control-keys-are-rejected ()
+  "Duplicate keys fail parsing without mutating graphics state."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output
+       parser "\e_Ga=t,f=24,s=1,v=1,i=1,i=2;AQID\e\\")
+      (should (= 0 (hash-table-count
+                    (ebb-graphics-state-images (ebb-screen-graphics screen)))))
+      ;; A malformed header cannot reliably provide identifiers for the reply.
+      (should (equal '("\e_G;EINVAL:malformed control data\e\\")
+                     responses)))))
+
+(ert-deftest ebb-test-kitty-non-kitty-strings-clear-cursor-placement-state ()
+  "SOS, PM, and non-Kitty APC strings cannot repeat stale cursor movement."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=3,r=2;AQID\e\\")
+    (dolist (sequence '("\eXfoo\e\\" "\e^foo\e\\" "\e_foo\e\\"))
+      (ebb-screen-cursor-goto screen 0 0)
+      (ebb-test-output parser sequence)
+      (should (equal '(0 . 0) (ebb-test-cursor screen))))))
+
+(ert-deftest ebb-test-kitty-invalid-numeric-control-data-is-rejected ()
+  "Malformed numeric keys do not allocate images or produce success replies."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e_Ga=t,f=24,s=1,v=1,i=abc;AQID\e\\")
+      (should (= 0 (hash-table-count
+                    (ebb-graphics-state-images (ebb-screen-graphics screen)))))
+      (should (equal '("\e_G;EINVAL:invalid control data\e\\") responses)))))
+
+(ert-deftest ebb-test-kitty-oversized-apc-replies-with-error ()
+  "An oversized Kitty APC is rejected instead of silently disappearing."
+  (let ((ebb-kitty-graphics-apc-limit 16384))
+    (ebb-test-with-screen (:width 20 :height 6)
+      (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output
+       parser (concat "\e_Ga=q,i=9;" (make-string 17000 ?A) "\e\\"))
+      (should (equal '("\e_Gi=9;EFBIG:APC payload too large\e\\") responses))
+      ;; Placement identifiers survive truncation the same way image ids do.
+      (ebb-test-output
+       parser (concat "\e_Ga=q,i=9,p=7;" (make-string 17000 ?A) "\e\\"))
+      (should (equal "\e_Gi=9,p=7;EFBIG:APC payload too large\e\\"
+                       (car responses)))
+      (ebb-test-output parser "X")
+        (should (equal "X" (ebb-test-display-line screen 0)))))))
+
+(ert-deftest ebb-test-kitty-apc-ignores-c0-bytes ()
+  "C0 controls embedded in an APC are not included in its base64 payload."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e_Ga=q,f=24,s=1,v=1,i=3;AA\aAA\e\\")
+      (should (equal '("\e_Gi=3;OK\e\\") responses)))))
+
+(ert-deftest ebb-test-kitty-zero-cell-size-uses-fallback ()
+  "A custom pixel-size callback returning zero cannot drop a placement."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (setf (ebb-parser-emit-fn parser)
+          (lambda (type &rest _)
+            (when (eq type 'pixel-size) '(0 . 0))))
+    (ebb-test-output parser "\e_Ga=T,f=24,s=1,v=1,i=1;AQID\e\\")
+    (should (ebb-graphics-state-placements (ebb-screen-graphics screen)))))
+
+(ert-deftest ebb-test-kitty-remote-file-media-is-disabled ()
+  "A remote child cannot make the local Emacs host read a file."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((ebb-kitty-graphics-allow-files t)
+          responses)
+      (setf (ebb-parser-graphics-file-media-enabled parser) nil
+            (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output
+       parser (format "\e_Ga=q,f=100,i=4,t=f;%s\e\\"
+                      (base64-encode-string "/tmp/image.png" t)))
+      (should (equal
+               '("\e_Gi=4;EPERM:file media disabled for remote terminals\e\\")
+               responses)))))
+
+(ert-deftest ebb-test-kitty-negative-z-index-is-rejected ()
+  "Unsupported under-text placements fail rather than replacing the text."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser
+                       "\e_Ga=T,f=24,s=1,v=1,i=1,z=-1;AQID\e\\")
+      (should-not (ebb-graphics-state-placements (ebb-screen-graphics screen)))
+      (should (equal
+               '("\e_Gi=1;EINVAL:invalid placement parameters\e\\")
+               responses)))))
+
+(ert-deftest ebb-test-kitty-quota-keeps-referenced-images ()
+  "Quota eviction never blanks an image referenced by a placement."
+  (let ((ebb-kitty-graphics-storage-limit 4)
+        (state (ebb-graphics-create)))
+    (let ((first (make-hash-table :test #'eql))
+          (second (make-hash-table :test #'eql)))
+      (puthash ?i "1" first)
+      (puthash ?i "2" second)
+      (should (ebb-graphics--store-image state first 24 1 1 "abc"))
+      (push (make-ebb-graphics-placement :image-id 1 :row 0 :rows 1)
+            (ebb-graphics-state-placements state))
+      (should-not (ebb-graphics--store-image state second 24 1 1 "def"))
+      (should (gethash 1 (ebb-graphics-state-images state))))))
+
+(ert-deftest ebb-test-kitty-placement-resources-are-bounded ()
+  "Surface dimensions and retained placement count have independent limits."
+  (let ((ebb-kitty-graphics-placement-limit 2)
+        (ebb-kitty-graphics-surface-limit 4096))
+    (ebb-test-with-screen (:width 20 :height 6)
+      (let (responses)
+        (setf (ebb-parser-write-fn parser)
+              (lambda (response) (push response responses)))
+        (ebb-test-output
+         parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=1000,r=1000;AQID\e\\")
+        (should-not (gethash 1 (ebb-graphics-state-images
+                                (ebb-screen-graphics screen))))
+        (ebb-test-output parser "\e_Ga=t,f=24,s=1,v=1,i=2;AQID\e\\")
+        (ebb-test-output parser "\e_Ga=p,i=2,C=1;\e\\")
+        (ebb-test-output parser "\e_Ga=p,i=2,C=1;\e\\")
+        (ebb-test-output parser "\e_Ga=p,i=2,C=1;\e\\")
+        (should (= 2 (length (ebb-graphics-state-placements
+                              (ebb-screen-graphics screen)))))
+        (should (string-match-p "EINVAL:invalid placement parameters"
+                                (car responses)))))))
+
+(ert-deftest ebb-test-kitty-failed-display-replacement-is-atomic ()
+  "An invalid a=T placement cannot replace existing image data or placements."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let* ((graphics (ebb-screen-graphics screen))
+           (old-placement nil))
+      (ebb-test-output parser "\e_Ga=T,f=24,s=1,v=1,i=1,C=1;AQID\e\\")
+      (setq old-placement (car (ebb-graphics-state-placements graphics)))
+      (ebb-test-output parser "\e_Ga=T,f=24,s=1,v=1,i=1,z=-1;BAUG\e\\")
+      (should (equal (unibyte-string 1 2 3)
+                     (ebb-graphics-image-data
+                      (gethash 1 (ebb-graphics-state-images graphics)))))
+      (should (eq old-placement (car (ebb-graphics-state-placements graphics)))))))
+
+(ert-deftest ebb-test-kitty-noop-scroll-keeps-generation ()
+  "Scrolls that cannot move a placement do not invalidate renderer caches."
+  (let* ((state (ebb-graphics-create))
+         (virtual (make-ebb-graphics-placement :image-id 1 :virtual t)))
+    (setf (ebb-graphics-state-placements state) (list virtual))
+    (ebb-graphics-scroll state 'up 0 10 1)
+    (should (= 0 (ebb-graphics-state-generation state)))))
+
+(ert-deftest ebb-test-kitty-invalid-placement-parameters-are-atomic ()
+  "Placement validation fails before image storage or lookup side effects."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((encoded (base64-encode-string (unibyte-string 1 2 3) t))
+          responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output
+       parser (format "\e_Ga=T,f=24,s=1,v=1,i=1,C=2;%s\e\\" encoded))
+      (should-not (gethash 1 (ebb-graphics-state-images
+                              (ebb-screen-graphics screen))))
+      (ebb-test-output parser "\e_Ga=p,i=1,C=2;\e\\")
+      (should (equal '("\e_Gi=1;EINVAL:invalid control data\e\\"
+                       "\e_Gi=1;EINVAL:invalid control data\e\\")
+                     responses)))))
+
+(ert-deftest ebb-test-kitty-unsupported-geometry-is-rejected ()
+  "Unsupported source rectangles, offsets, and relative placement never ACK."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (dolist (control '("x=1" "y=1" "w=1" "h=1" "X=1" "Y=1"
+                         "P=1" "Q=1" "H=1" "V=1"))
+        (ebb-test-output
+         parser (format "\e_Ga=T,f=24,s=1,v=1,i=1,%s;AQID\e\\"
+                        control)))
+      (should (= 10 (length responses)))
+      (should (cl-every
+               (lambda (response)
+                 (string-match-p "EINVAL:invalid control data" response))
+               responses))
+      (should (= 0 (hash-table-count
+                    (ebb-graphics-state-images
+                     (ebb-screen-graphics screen))))))))
+
+(ert-deftest ebb-test-kitty-non-transmit-command-aborts-upload ()
+  "An interleaved placement command discards an incomplete direct upload."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((graphics (ebb-screen-graphics screen)))
+      (ebb-test-output parser "\e_Ga=t,f=24,s=1,v=1,i=1,m=1;AQ==\e\\")
+      (should (ebb-graphics-state-upload graphics))
+      (ebb-test-output parser "\e_Ga=p,i=99;\e\\")
+      (should-not (ebb-graphics-state-upload graphics)))))
+
+(ert-deftest ebb-test-kitty-placement-cursor-policy ()
+  "Kitty placements move the cursor unless C=1 suppresses movement."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((encoded (base64-encode-string (unibyte-string 1 2 3) t)))
+      (ebb-test-output
+       parser
+       (format "\e_Ga=T,f=24,s=1,v=1,i=1,c=3,r=2;%s\e\\" encoded))
+      ;; Like kitty: past the right edge, on the placement's last row.
+      (should (equal '(3 . 1) (ebb-test-cursor screen)))
+      (ebb-screen-cursor-goto screen 0 0)
+      (ebb-test-output parser "\e_Ga=p,i=1,c=2,r=1,C=1;\e\\")
+      (should (equal '(0 . 0) (ebb-test-cursor screen))))))
+
+(ert-deftest ebb-test-kitty-placements-scroll-and-clip-with-region ()
+  "Graphics placements follow terminal scrolling and retain slice offsets."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-screen-enter-alt screen)
+    (let* ((graphics (ebb-screen-graphics screen))
+           (placement (make-ebb-graphics-placement
+                       :image-id 1 :row 1 :column 0 :columns 2 :rows 3)))
+      (setf (ebb-graphics-state-placements graphics) (list placement))
+      (ebb-screen-scroll screen 'up 2)
+      (should (= 0 (ebb-graphics-placement-row placement)))
+      (should (= 2 (ebb-graphics-placement-rows placement)))
+      (should (= 1 (ebb-graphics-placement-row-offset placement))))))
+
+(ert-deftest ebb-test-render-kitty-clipping-preserves-backing-canvas ()
+  "Clipping visible rows does not shrink the image object's backing canvas."
+  (let* ((screen (ebb-screen-create 4 2))
+         (render (make-ebb-render-state
+                  :screen screen
+                  :graphics-cache (make-hash-table :test #'equal)
+                  :graphics-cache-sizes (make-hash-table :test #'equal)))
+         (image (make-ebb-graphics-image
+                 :id 1 :format 24 :width 1 :height 1 :data "abc"))
+         (placement (make-ebb-graphics-placement
+                     :image-id 1 :columns 2 :rows 2
+                     :box-columns 2 :box-rows 3
+                     :pixel-width 8 :pixel-height 48 :row-offset 1))
+         svg)
+    (cl-letf (((symbol-function 'ebb-render-cell-pixel-size)
+               (lambda (_) '(8 . 16)))
+              ((symbol-function 'ebb-render--graphics-background)
+               (lambda () '(0 0 0)))
+              ((symbol-function 'ebb-render--graphics-raw-png-helper)
+               (lambda (_) "png"))
+              ((symbol-function 'image-type-available-p) (lambda (_) t))
+              ((symbol-function 'create-image)
+               (lambda (data &rest _)
+                 (setq svg data)
+                 'mock-image)))
+      (ebb-render--graphics-image-object render image placement))
+    (should (string-match-p "height='48'" svg))))
+
+(ert-deftest ebb-test-kitty-main-scroll-preserves-history-anchor ()
+  "A placement entering main-screen history keeps its combined row anchor."
+  (ebb-test-with-screen (:width 4 :height 2)
+    (let* ((data (unibyte-string 1 2 3))
+           (encoded (base64-encode-string data t)))
+      (ebb-test-output
+       parser (format "\e_Ga=T,f=24,s=1,v=1,i=1,c=1,r=1;%s\e\\" encoded))
+      (let ((placement (car (ebb-graphics-state-placements
+                             (ebb-screen-graphics screen)))))
+        (should (= 0 (ebb-graphics-placement-row placement)))
+        (ebb-test-output parser "A\r\nB\r\n")
+        (should (> (ebb-screen-history-row-count screen) 0))
+        (should (= 0 (ebb-graphics-placement-row placement)))))))
+
+(ert-deftest ebb-test-kitty-delete-row-selectors-use-viewport-coordinates ()
+  "The y selector is offset by scrollback rather than deleting history rows."
+  (ebb-test-with-screen (:width 4 :height 2)
+    (ebb-test-output parser "A\r\nB\r\n")
+    (let* ((graphics (ebb-screen-graphics screen))
+           (base (ebb-screen-history-row-count screen))
+           (history (make-ebb-graphics-placement
+                     :image-id 1 :row 0 :column 0 :columns 1 :rows 1))
+           (viewport (make-ebb-graphics-placement
+                      :image-id 2 :row base :column 0 :columns 1 :rows 1)))
+      (setf (ebb-graphics-state-placements graphics)
+            (list viewport history))
+      (ebb-test-output parser "\e_Ga=d,d=y,y=1;\e\\")
+      (should (equal (list history)
+                     (ebb-graphics-state-placements graphics))))))
+
+(ert-deftest ebb-test-kitty-delete-all-keeps-scrollback-placements ()
+  "The d=a selector removes only placements visible in the viewport."
+  (ebb-test-with-screen (:width 4 :height 2)
+    (ebb-test-output parser "A\r\nB\r\n")
+    (let* ((graphics (ebb-screen-graphics screen))
+           (base (ebb-screen-history-row-count screen))
+           (history (make-ebb-graphics-placement
+                     :image-id 1 :row 0 :column 0 :columns 1 :rows 1))
+           (viewport (make-ebb-graphics-placement
+                      :image-id 2 :row base :column 0 :columns 1 :rows 1)))
+      (setf (ebb-graphics-state-placements graphics)
+            (list viewport history))
+      (ebb-test-output parser "\e_Ga=d,d=a;\e\\")
+      (should (equal (list history)
+                     (ebb-graphics-state-placements graphics))))))
+
+(ert-deftest ebb-test-kitty-top-region-scroll-keeps-history-graphics ()
+  "A top-anchored partial scroll preserves anchors entering history."
+  (ebb-test-with-screen (:width 4 :height 4)
+    (let* ((graphics (ebb-screen-graphics screen))
+           (top (make-ebb-graphics-placement
+                 :image-id 1 :row 0 :column 0 :columns 1 :rows 1))
+           (below (make-ebb-graphics-placement
+                   :image-id 2 :row 3 :column 0 :columns 1 :rows 1))
+           (crossing (make-ebb-graphics-placement
+                      :image-id 3 :row 1 :column 0 :columns 1 :rows 2)))
+      (setf (ebb-graphics-state-placements graphics)
+            (list below crossing top)
+            (ebb-screen-scroll-top screen) 0
+            (ebb-screen-scroll-bottom screen) 1)
+      (ebb-screen-scroll screen 'up 1)
+      (should (= 0 (ebb-graphics-placement-row top)))
+      (should (= 4 (ebb-graphics-placement-row below)))
+      (should-not (memq crossing
+                        (ebb-graphics-state-placements graphics))))))
+
+(ert-deftest ebb-test-kitty-main-and-alt-screens-have-separate-state ()
+  "Alternate-screen graphics start empty and main graphics return on exit."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((main (ebb-screen-graphics screen)))
+      (puthash 1 (make-ebb-graphics-image :id 1 :format 100 :data "main")
+               (ebb-graphics-state-images main))
+      (ebb-screen-enter-alt screen)
+      (should-not (eq main (ebb-screen-graphics screen)))
+      (should (= 0 (hash-table-count
+                    (ebb-graphics-state-images (ebb-screen-graphics screen)))))
+      (puthash 2 (make-ebb-graphics-image :id 2 :format 100 :data "alt")
+               (ebb-graphics-state-images (ebb-screen-graphics screen)))
+      (ebb-screen-leave-alt screen)
+      (should (eq main (ebb-screen-graphics screen)))
+      (should (gethash 1 (ebb-graphics-state-images main)))
+      (should-not (gethash 2 (ebb-graphics-state-images main))))))
+
+(ert-deftest ebb-test-kitty-main-and-alt-share-storage-budget ()
+  "Main and alternate image stores cannot each consume the full quota."
+  (let ((ebb-kitty-graphics-storage-limit 4))
+    (ebb-test-with-screen (:width 20 :height 6)
+      (let ((params (make-hash-table :test #'eql))
+            (main (ebb-screen-graphics screen)))
+        (puthash ?i "1" params)
+        (should (ebb-graphics--store-image main params 24 1 1 "abc"))
+        (ebb-screen-enter-alt screen)
+        (puthash ?i "2" params)
+        (should-not
+         (ebb-graphics--store-image
+          (ebb-screen-graphics screen) params 24 1 1 "def"))
+        (should (= 3 (ebb-graphics-state-byte-count main)))
+        (ebb-screen-leave-alt screen)
+        (should (gethash 1 (ebb-graphics-state-images main)))
+        (should (= 3 (ebb-graphics-state-byte-count main)))))))
+
+(ert-deftest ebb-test-kitty-alt-screen-round-trip-restores-budget ()
+  "A successful alternate-screen store is fully refunded on exit."
+  (let ((ebb-kitty-graphics-storage-limit 10))
+    (ebb-test-with-screen (:width 20 :height 6)
+      (let ((params (make-hash-table :test #'eql))
+            (main (ebb-screen-graphics screen)))
+        (puthash ?i "1" params)
+        (should (ebb-graphics--store-image main params 24 1 1 "abc"))
+        (ebb-screen-enter-alt screen)
+        (puthash ?i "2" params)
+        (should (ebb-graphics--store-image
+                  (ebb-screen-graphics screen) params 24 1 1 "def"))
+        (should (= 6 (ebb-graphics-state-byte-count main)))
+        (ebb-screen-leave-alt screen)
+        (should (gethash 1 (ebb-graphics-state-images main)))
+        (should (= 3 (ebb-graphics-state-byte-count main)))))))
+
+(ert-deftest ebb-test-kitty-eviction-is-per-screen ()
+  "One screen never evicts images stored by another screen.
+The shared quota is conservative: a full main screen leaves an
+ alternate-screen upload with ENOSPC instead of deleting main's
+ unreferenced images, which a sibling screen may still display."
+  (let ((ebb-kitty-graphics-storage-limit 4))
+    (ebb-test-with-screen (:width 20 :height 6)
+      (let ((params (make-hash-table :test #'eql))
+            (main (ebb-screen-graphics screen)))
+        (puthash ?i "1" params)
+        (should (ebb-graphics--store-image main params 24 1 1 "abc"))
+        (ebb-screen-enter-alt screen)
+        (let ((alt (ebb-screen-graphics screen)))
+          (puthash ?i "2" params)
+          (should-not (ebb-graphics--store-image alt params 24 1 1 "def"))
+          (should (= 0 (hash-table-count
+                          (ebb-graphics-state-images alt))))
+          (should (gethash 1 (ebb-graphics-state-images main))))
+        (ebb-screen-leave-alt screen)
+        (should (= 3 (ebb-graphics-state-byte-count main)))))))
+
+(ert-deftest ebb-test-render-kitty-layout-cache-is-bounded ()
+  "Scrolling without graphics changes cannot grow the layout cache."
+  (let ((ebb-kitty-graphics-layout-cache-limit 4))
+    (ebb-test-with-screen (:width 6 :height 2)
+      (let ((render (make-ebb-render-state
+                     :screen screen
+                     :graphics-cache (make-hash-table :test #'equal)
+                     :graphics-generation -1)))
+        (ebb-test-output
+         parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=1,r=1,C=1;AQID\e\\")
+        (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                  ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                  ((symbol-function 'frame-char-height) (lambda (&rest _) 16)))
+          (dotimes (_ 12)
+            (ebb-test-output parser "x\r\n")
+            (ebb-render--apply-graphics render 1 "      "))
+          (should (<= (hash-table-count
+                       (ebb-render-state-graphics-layout-cache render))
+                      4))
+          ;; An evicted row intersecting the placement recomputes correctly.
+          (ebb-render--apply-graphics render 0 "      " t)
+          (let ((owners (gethash (cons 0 6)
+                                 (ebb-render-state-graphics-layout-cache render))))
+            (should (= 1 (ebb-graphics-placement-image-id (aref owners 0))))))))))
+
+(ert-deftest ebb-test-render-kitty-screen-switch-invalidates-layout-cache ()
+  "Equal generations on distinct main/alternate states cannot share owners."
+  (ebb-test-with-screen (:width 6 :height 2)
+    (let ((render (make-ebb-render-state
+                   :screen screen
+                   :graphics-cache (make-hash-table :test #'equal)
+                   :graphics-generation -1)))
+      (ebb-test-output
+       parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=1,r=1,C=1;AQID\e\\")
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image)))
+        (ebb-render--apply-graphics render 0 "      ")
+        (ebb-screen-enter-alt screen)
+        (ebb-test-output parser "\e[4G")
+        (ebb-test-output
+         parser "\e_Ga=T,f=24,s=1,v=1,i=2,c=1,r=1,C=1;AQID\e\\")
+        (ebb-render--apply-graphics render 0 "      ")
+        (ebb-screen-leave-alt screen)
+        (ebb-render--apply-graphics render 0 "      ")
+        (let ((owners (gethash (cons 0 6)
+                               (ebb-render-state-graphics-layout-cache render))))
+          (should (= 1 (ebb-graphics-placement-image-id (aref owners 0))))
+          (should-not (aref owners 3)))))))
+
+(ert-deftest ebb-test-kitty-delete-selectors-and-data-lifetime ()
+  "Lowercase deletes retain image data; uppercase deletes may free it."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let* ((encoded (base64-encode-string (unibyte-string 1 2 3) t))
+           (graphics (ebb-screen-graphics screen)))
+      (ebb-test-output
+       parser (format "\e_Ga=T,f=24,s=1,v=1,i=1,p=7;%s\e\\" encoded))
+      (ebb-test-output parser "\e_Ga=d,d=i,i=1,p=7;\e\\")
+      (should-not (ebb-graphics-state-placements graphics))
+      (should (gethash 1 (ebb-graphics-state-images graphics)))
+      (ebb-test-output parser "\e_Ga=p,i=1,p=8,C=1;\e\\")
+      (should (ebb-graphics-state-placements graphics))
+      (ebb-test-output parser "\e_Ga=d,d=I,i=1;\e\\")
+      (should-not (gethash 1 (ebb-graphics-state-images graphics)))
+      (should-not (ebb-graphics-state-placements graphics)))))
+
+(ert-deftest ebb-test-kitty-delete-selector-coverage ()
+  "Coordinate, z-index, placement, and image-range selectors are covered."
+  (cl-labels
+      ((make-state
+        ()
+        (let ((state (ebb-graphics-create)))
+          (setf (ebb-graphics-state-image-order state) '(2 1)
+                (ebb-graphics-state-placements state)
+                (list
+                 (make-ebb-graphics-placement
+                  :image-id 2 :placement-id 22 :row 2 :column 2
+                  :columns 2 :rows 2 :z-index 2)
+                 (make-ebb-graphics-placement
+                  :image-id 1 :placement-id 11 :row 0 :column 0
+                  :columns 2 :rows 2 :z-index 1)
+                 (make-ebb-graphics-placement
+                  :image-id 1 :placement-id 11 :virtual t
+                  :columns 2 :rows 2 :z-index 1)))
+          state))
+       (apply-delete
+        (command &optional row column)
+        (let* ((state (make-state))
+               (params (ebb-graphics--parse-params command)))
+          (ebb-graphics--handle-delete
+           state params (or row 0) (or column 0) 0 10 10)
+          (ebb-graphics-state-placements state))))
+    (dolist (case '(("d=c" 0 0)
+                    ("d=p,i=1,p=11" 0 0)
+                    ("d=p,x=1,y=1" 0 0)
+                    ("d=q,x=1,y=1,z=1" 0 0)
+                    ("d=x,x=1" 0 0)
+                    ("d=y,y=1" 0 0)
+                    ("d=z,z=1" 0 0)))
+      (let ((remaining
+             (apply-delete (nth 0 case) (nth 1 case) (nth 2 case))))
+        (should (= 2 (length remaining)))
+        (should (cl-find-if #'ebb-graphics-placement-virtual remaining))))
+    ;; Image ranges intentionally include virtual placements.
+    (let ((remaining (apply-delete "d=r,x=1,y=1")))
+      (should (= 1 (length remaining)))
+      (should (= 2 (ebb-graphics-placement-image-id (car remaining)))))
+    ;; Protocol coordinates are one-based and invalid values are not clamped.
+    (should (= 3 (length (apply-delete "d=x,x=0"))))
+    ;; Irrelevant coordinate keys do not suppress non-coordinate selectors.
+    (should (= 1 (length (apply-delete "d=a,x=0,y=0"))))
+    (let ((remaining (apply-delete "d=i,i=1,x=0,y=0")))
+      (should (= 1 (length remaining)))
+      (should (= 2 (ebb-graphics-placement-image-id (car remaining)))))))
+
+(ert-deftest ebb-test-kitty-deleting-non-first-placement-bumps-generation ()
+  "Deleting a placement from the middle invalidates renderer caches."
+  (let* ((state (ebb-graphics-create))
+         (first (make-ebb-graphics-placement :image-id 1 :placement-id 1))
+         (middle (make-ebb-graphics-placement :image-id 2 :placement-id 2))
+         (last (make-ebb-graphics-placement :image-id 3 :placement-id 3)))
+    (setf (ebb-graphics-state-placements state) (list first middle last))
+    (let ((generation (ebb-graphics-state-generation state)))
+      (ebb-graphics--remove-placements
+       state (lambda (placement) (eq placement middle)) nil)
+      (should (= (1+ generation) (ebb-graphics-state-generation state)))
+      (should (equal (list first last)
+                     (ebb-graphics-state-placements state))))))
+
+(ert-deftest ebb-test-kitty-ed2-clears-placements-but-retains-images ()
+  "ED 2 removes visible graphics without discarding reusable image data."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((graphics (ebb-screen-graphics screen)))
+      (puthash 1 (make-ebb-graphics-image :id 1 :format 100 :data "png")
+               (ebb-graphics-state-images graphics))
+      (setf (ebb-graphics-state-placements graphics)
+            (list (make-ebb-graphics-placement :image-id 1 :row 0 :rows 1)))
+      (ebb-screen-erase-in-display screen 2)
+      ;; ED 2 preserves the old viewport in Emacs-mode history, including its
+      ;; image placement, while the new viewport is clear.
+      (should (= 1 (length (ebb-graphics-state-placements graphics))))
+      (should (> (ebb-screen-history-row-count screen) 0))
+      (should (gethash 1 (ebb-graphics-state-images graphics))))))
+
+(ert-deftest ebb-test-kitty-partial-ed-leaves-independent-placements ()
+  "ED 0 and ED 1 erase text without deleting Kitty placement objects."
+  (dolist (mode '(0 1))
+    (ebb-test-with-screen (:width 10 :height 3)
+      (let* ((graphics (ebb-screen-graphics screen))
+             (placement (make-ebb-graphics-placement
+                         :image-id 1 :row 0 :column 0 :columns 2 :rows 2)))
+        (setf (ebb-graphics-state-placements graphics) (list placement))
+        (ebb-screen-erase-in-display screen mode)
+        (should (eq placement
+                    (car (ebb-graphics-state-placements graphics))))))))
+
+(ert-deftest ebb-test-parse-winops-reports-pixel-geometry ()
+  "XTWINOPS pixel queries use geometry supplied by the display callback."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser) (lambda (response) (push response responses))
+            (ebb-parser-emit-fn parser)
+            (lambda (type kind)
+              (when (eq type 'pixel-size)
+                (pcase kind ('text-area '(800 . 480)) ('cell '(10 . 20))))))
+      (ebb-test-output parser "\e[14t\e[16t")
+      (should (equal '("\e[6;20;10t" "\e[4;480;800t") responses)))))
+
+(ert-deftest ebb-test-parse-winops-pixel-geometry-reports-unknown ()
+  "XTWINOPS pixel queries report zero rather than invented dimensions."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output parser "\e[14t\e[16t")
+      (should (equal '("\e[6;0;0t" "\e[4;0;0t") responses)))))
+
+(ert-deftest ebb-test-render-kitty-placement-as-row-slices ()
+  "Static Kitty placements render as cell-sized image slices per row."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let* ((data (unibyte-string 1 2 3))
+           (encoded (base64-encode-string data t))
+           (render (make-ebb-render-state
+                    :screen screen
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1)))
+      (ebb-test-output
+       parser
+       (format "\e_Ga=T,f=24,s=1,v=1,i=4,c=3,r=2;%s\e\\" encoded))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p)
+                 (lambda (&rest _) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image)))
+        (let ((top (ebb-render--apply-graphics render 0 ""))
+              (bottom (ebb-render--apply-graphics render 1 "")))
+          (should (= 3 (length top)))
+          (should (equal '((slice 0 0 24 16) mock-image)
+                         (get-text-property 0 'display top)))
+          (should (equal '((slice 0 16 24 16) mock-image)
+                         (get-text-property 0 'display bottom))))))))
+
+(ert-deftest ebb-test-render-kitty-slices-have-real-cell-box-geometry ()
+  "GUI redisplay gives every requested row the complete placement width."
+  (skip-unless (and (display-graphic-p)
+                    (image-type-available-p 'svg)
+                    (fboundp 'string-pixel-width)))
+  (ebb-test-with-screen (:width 10 :height 3)
+    (let* ((render (make-ebb-render-state
+                    :screen screen
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1))
+           (cell-width (frame-char-width)))
+      (ebb-test-output
+       parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=3,r=2,C=1;AQID\e\\")
+      (let* ((top (ebb-render--apply-graphics render 0 "   "))
+             (bottom (ebb-render--apply-graphics render 1 "   "))
+             (object (cadr (get-text-property 0 'display top))))
+        (should (equal (cons (* 3 cell-width) (* 2 (frame-char-height)))
+                       (image-size object t)))
+        (should (= (* 3 cell-width) (string-pixel-width top)))
+        (should (= (* 3 cell-width) (string-pixel-width bottom)))))))
+
+(ert-deftest ebb-test-render-kitty-static-placement-follows-combining-cell ()
+  "Static placement columns are mapped past combining characters."
+  (ebb-test-with-screen (:width 6 :height 2)
+    (let ((render (make-ebb-render-state
+                   :screen screen
+                   :graphics-cache (make-hash-table :test #'equal)
+                   :graphics-generation -1)))
+      (ebb-test-output parser "e\u0301")
+      (ebb-test-output parser "\e_Ga=T,f=24,s=1,v=1,i=1,C=1;AQID\e\\")
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image)))
+        (let* ((line (ebb-screen-get-line screen 0))
+               (string (ebb-render--line-to-string line 6))
+               (row (ebb-render--apply-graphics render 0 string)))
+          (should-not (get-text-property 1 'display row))
+          (should (get-text-property 2 'display row)))))))
+
+(ert-deftest ebb-test-render-kitty-static-placement-follows-wide-scrollback-cell ()
+  "Static placement columns map through compact wide history characters."
+  (ebb-test-with-screen (:width 6 :height 2)
+    (ebb-test-output parser "中\r\nx\r\n")
+    (let* ((graphics (ebb-screen-graphics screen))
+           (image (make-ebb-graphics-image
+                   :id 1 :format 24 :width 1 :height 1
+                   :data (unibyte-string 1 2 3)))
+           (placement (make-ebb-graphics-placement
+                       :image-id 1 :row 0 :column 2 :columns 1 :rows 1
+                       :pixel-width 8 :pixel-height 16))
+           (render (make-ebb-render-state
+                    :screen screen
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1))
+           (line (ebb-screen-history-render-row screen 0))
+           (string (ebb-render--line-to-string-scrollback line 6)))
+      (puthash 1 image (ebb-graphics-state-images graphics))
+      (setf (ebb-graphics-state-placements graphics) (list placement))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image)))
+        (let ((row (ebb-render--apply-graphics render 0 string t)))
+          (should (get-text-property 1 'display row)))))))
+
+(ert-deftest ebb-test-render-kitty-placeholder-renders-in-scrollback ()
+  "A diacritic-addressed Unicode placeholder keeps its image in history."
+  (ebb-test-with-screen (:width 4 :height 2)
+    (let* ((placeholder
+            (string #x10eeee
+                    (aref ebb-render--placeholder-diacritics 0)
+                    (aref ebb-render--placeholder-diacritics 0)))
+           (render (make-ebb-render-state
+                    :screen screen
+                    :history-cache (make-hash-table :test #'equal)
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1)))
+      (ebb-test-output
+       parser "\e_Ga=T,f=24,s=1,v=1,i=42,U=1,c=1,r=1,C=1;AQID\e\\")
+      (ebb-test-output parser (concat "\e[38;2;0;0;42m" placeholder
+                                      "\e[39m\r\nx\r\n"))
+      (should (> (ebb-screen-history-row-count screen) 0))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image)))
+        (let ((history (ebb-render--history-row-string render 0)))
+          (should (get-text-property 0 'display history)))))))
+
+(ert-deftest ebb-test-render-kitty-placeholder-inherits-row-in-scrollback ()
+  "Compact placeholder cells inherit omitted coordinates in history."
+  (ebb-test-with-screen (:width 4 :height 2)
+    (let* ((first
+            (string #x10eeee
+                    (aref ebb-render--placeholder-diacritics 0)
+                    (aref ebb-render--placeholder-diacritics 0)))
+           (placeholder (string #x10eeee))
+           (render (make-ebb-render-state
+                    :screen screen
+                    :history-cache (make-hash-table :test #'equal)
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1)))
+      (ebb-test-output
+       parser "\e_Ga=T,f=24,s=1,v=1,i=42,U=1,c=2,r=1,C=1;AQID\e\\")
+      (ebb-test-output
+       parser (concat "\e[38;2;0;0;42m" first placeholder
+                      "\e[39m\r\nx\r\n"))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image))
+                ((symbol-function 'ebb-render--graphics-raw-png-helper)
+                 (lambda (_) "png")))
+        (let* ((history (ebb-render--history-row-string render 0))
+               (second (string-search placeholder history 1)))
+          (should (get-text-property 0 'display history))
+          (should second)
+          (should (get-text-property second 'display history)))))))
+
+(ert-deftest ebb-test-render-kitty-raw-images-use-png-in-svg ()
+  "Raw RGB/RGBA sources are embedded using a librsvg-supported PNG URI."
+  (skip-unless (executable-find "python3"))
+  (let* ((screen (ebb-screen-create 2 1))
+         (render (make-ebb-render-state
+                  :screen screen
+                  :graphics-cache (make-hash-table :test #'equal)
+                  :graphics-cache-sizes (make-hash-table :test #'equal)))
+         (image (make-ebb-graphics-image
+                 :id 1 :format 24 :width 1 :height 1
+                 :data (unibyte-string 255 0 0)))
+         (placement (make-ebb-graphics-placement
+                     :image-id 1 :columns 1 :rows 1
+                     :pixel-width 8 :pixel-height 16))
+         svg)
+    (cl-letf (((symbol-function 'ebb-render-cell-pixel-size)
+               (lambda (_) '(8 . 16)))
+              ((symbol-function 'ebb-render--graphics-background)
+               (lambda () '(0 0 0)))
+              ((symbol-function 'image-type-available-p) (lambda (_) t))
+              ((symbol-function 'create-image)
+               (lambda (data &rest _)
+                 (setq svg data)
+                 'mock-image)))
+      (ebb-render--graphics-image-object render image placement))
+    (should (string-search "data:image/png;base64," svg))
+    (should-not (string-search "image/x-portable-pixmap" svg))))
+
+(ert-deftest ebb-test-render-kitty-placeholder-decodes-high-image-id-byte ()
+  "The third placeholder diacritic contributes the image ID's high byte."
+  (let* ((cell (make-ebb-cell
+                :char #x10eeee :width 1
+                :combining
+                (string (aref ebb-render--placeholder-diacritics 1)
+                        (aref ebb-render--placeholder-diacritics 2)
+                        (aref ebb-render--placeholder-diacritics 7))))
+         (decoded (ebb-render--placeholder-coordinates cell)))
+    (should (equal '(1 2 7) decoded))))
+
+(ert-deftest ebb-test-render-kitty-overlapping-placements ()
+  "A newer placement covers an older one; the visible remainder keeps its offset."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let* ((data (unibyte-string 1 2 3))
+           (encoded (base64-encode-string data t))
+           (render (make-ebb-render-state
+                    :screen screen
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1)))
+      (ebb-test-output
+       parser (format "\e_Ga=T,f=24,s=1,v=1,i=1,c=6,r=1,C=1;%s\e\\" encoded))
+      (ebb-test-output parser "\e[3G")
+      (ebb-test-output
+       parser (format "\e_Ga=T,f=24,s=2,v=1,i=2,c=2,r=1,z=1,C=1;%s\e\\"
+                      (base64-encode-string (unibyte-string 1 2 3 4 5 6) t)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p)
+                 (lambda (&rest _) t))
+                ((symbol-function 'create-image)
+                 (lambda (data &rest _) (intern (format "image-%d" (length data))))))
+        (let ((row (ebb-render--apply-graphics render 0 "")))
+          (should (= 6 (length row)))
+          (let ((left (get-text-property 0 'display row))
+                (middle (get-text-property 2 'display row))
+                (right (get-text-property 4 'display row)))
+            (should (equal '(slice 0 0 16 16) (car left)))
+          (should (equal '(slice 0 0 16 16) (car middle)))
+          (should (equal '(slice 32 0 16 16) (car right)))
+            (should (eq (cadr left) (cadr right)))
+            (should-not (eq (cadr left) (cadr middle)))))))))
+
+(ert-deftest ebb-test-render-kitty-generation-keeps-image-object-cache ()
+  "Moving placements does not recomposite unchanged image data."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (let* ((render (make-ebb-render-state
+                    :screen screen
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1))
+           (creates 0))
+      (ebb-test-output
+       parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=1,r=1,C=1;AQID\e\\")
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'create-image)
+                 (lambda (&rest _)
+                   (cl-incf creates)
+                   'mock-image)))
+        (ebb-render--apply-graphics render 0 " ")
+        (cl-incf (ebb-graphics-state-generation
+                  (ebb-screen-graphics screen)))
+        (ebb-render--apply-graphics render 0 " ")
+        (should (= 1 creates))))))
+
+(ert-deftest ebb-test-render-kitty-object-cache-has-byte-budget ()
+  "Scaled image objects are evicted under the configured render-cache budget."
+  (let* ((ebb-kitty-graphics-render-cache-limit 1000)
+         (screen (ebb-screen-create 4 2))
+         (render (make-ebb-render-state
+                  :screen screen
+                  :graphics-cache (make-hash-table :test #'equal)
+                  :graphics-cache-sizes (make-hash-table :test #'equal)))
+         (placement (make-ebb-graphics-placement
+                     :image-id 1 :columns 1 :rows 1
+                     :pixel-width 8 :pixel-height 16))
+         (first (make-ebb-graphics-image
+                 :id 1 :format 24 :width 1 :height 1 :data "abc"))
+         (second (make-ebb-graphics-image
+                  :id 2 :format 24 :width 1 :height 1 :data "def"))
+         (creates 0))
+    (cl-letf (((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+              ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+              ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _)
+                 (cl-incf creates)
+                 (list 'image creates))))
+      (ebb-render--graphics-image-object render first placement)
+      (setf (ebb-graphics-placement-image-id placement) 2)
+      (ebb-render--graphics-image-object render second placement)
+      (setf (ebb-graphics-placement-image-id placement) 1)
+      (ebb-render--graphics-image-object render first placement)
+      (should (= 3 creates))
+      (should (= 1 (hash-table-count
+                    (ebb-render-state-graphics-cache render))))
+      (should (<= (ebb-render-state-graphics-cache-bytes render)
+                  ebb-kitty-graphics-render-cache-limit)))))
+
+(ert-deftest ebb-test-render-kitty-z-ties-put-higher-image-id-on-top ()
+  "Equal z-index placements follow Kitty's effective image-ID z-order."
+  (ebb-test-with-screen (:width 6 :height 2)
+    (let ((render (make-ebb-render-state
+                   :screen screen
+                   :graphics-cache (make-hash-table :test #'equal)
+                   :graphics-generation -1)))
+      (ebb-test-output
+       parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=4,r=1,C=1;AQID\e\\")
+      (ebb-test-output parser "\e[2G")
+      (ebb-test-output
+       parser "\e_Ga=T,f=24,s=1,v=1,i=2,c=2,r=1,C=1;AQID\e\\")
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image)))
+        (ebb-render--apply-graphics render 0 "      ")
+        (let ((owners (gethash (cons 0 6)
+                               (ebb-render-state-graphics-layout-cache render))))
+          (should (= 2 (ebb-graphics-placement-image-id (aref owners 1)))))))))
+
+(ert-deftest ebb-test-render-only-history-graphics-rebuild-scrollback ()
+  "Viewport-only graphics changes do not rebuild the materialized history."
+  (ebb-test-with-screen (:width 10 :height 4)
+    (ebb-test-output parser "a\r\nb\r\nc\r\nd\r\n")
+    (with-temp-buffer
+      (let* ((graphics (ebb-screen-graphics screen))
+             (render (ebb-render-create screen (current-buffer)))
+             (original (symbol-function 'ebb-render--rebuild-scrollback))
+             (rebuilds 0))
+        (ebb-render--update-scrollback render)
+        (cl-incf (ebb-graphics-state-generation graphics))
+        (cl-letf (((symbol-function 'ebb-render--rebuild-scrollback)
+                   (lambda (&rest args)
+                     (cl-incf rebuilds)
+                     (apply original args))))
+          (ebb-render--update-scrollback render)
+          (should (= 0 rebuilds))
+          (let ((image (make-ebb-graphics-image
+                        :id 1 :format 24 :width 1 :height 1 :data "abc")))
+            (puthash 1 image (ebb-graphics-state-images graphics))
+            (push (make-ebb-graphics-placement
+                   :image-id 1 :row 0 :column 0 :columns 1 :rows 1
+                   :pixel-width 8 :pixel-height 16)
+                  (ebb-graphics-state-placements graphics))
+            (cl-incf (ebb-graphics-state-generation graphics)))
+          (ebb-render--update-scrollback render))
+        (should (= 1 rebuilds))))))
+
+(ert-deftest ebb-test-render-kitty-unicode-placeholders ()
+  "Virtual placements render U+10EEEE cells as image tiles."
+  (ebb-test-with-screen (:width 10 :height 4)
+    (let* ((data (unibyte-string 1 2 3))
+           (encoded (base64-encode-string data t))
+           (placeholder (string #x10eeee))
+           (render (make-ebb-render-state
+                    :screen screen
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1)))
+      (ebb-test-output
+       parser
+       (format "\e_Ga=T,f=24,s=1,v=1,i=42,c=2,r=2,U=1;%s\e\\" encoded))
+      (should (equal '(0 . 0) (ebb-test-cursor screen)))
+      (ebb-test-output
+       parser (concat "\e[38;5;42m" placeholder placeholder "\r\n"
+                      placeholder placeholder))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image)))
+        (let ((top (ebb-render--apply-graphics
+                    render 0 (concat placeholder placeholder)))
+              (bottom (ebb-render--apply-graphics
+                       render 1 (concat placeholder placeholder))))
+          (should (equal '((slice 0 0 8 16) mock-image)
+                         (get-text-property 0 'display top)))
+          (should (equal '((slice 8 0 8 16) mock-image)
+                         (get-text-property 1 'display top)))
+          (should (equal '((slice 0 16 8 16) mock-image)
+                         (get-text-property 0 'display bottom))))))))
+
+(ert-deftest ebb-test-render-kitty-virtual-graphics-pads-trimmed-carrier ()
+  "A carrier shorter than its reserved columns cannot break placeholder rendering."
+  (ebb-test-with-screen (:width 4 :height 2)
+    (let* ((data (unibyte-string 1 2 3))
+           (encoded (base64-encode-string data t))
+           (placeholder (string #x10eeee))
+           (render (make-ebb-render-state
+                    :screen screen
+                    :graphics-cache (make-hash-table :test #'equal)
+                    :graphics-generation -1)))
+      (ebb-test-output
+       parser
+       (format "\e_Ga=T,f=24,s=1,v=1,i=42,c=2,r=1,U=1;%s\e\\" encoded))
+      (ebb-test-output
+       parser (concat "\e[38;5;42m" placeholder placeholder "\r\n"))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 8))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 16))
+                ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+                ((symbol-function 'ebb-render--graphics-raw-png-helper)
+                 (lambda (_) "png"))
+                ((symbol-function 'create-image) (lambda (&rest _) 'mock-image)))
+        ;; One-character carrier on a row with two placeholder cells: the
+        ;; second column addresses past the end of the string.
+        (let ((result (ebb-render--apply-graphics render 0 placeholder)))
+          (should (>= (length result) 2))
+          (should (get-text-property 0 'display result))
+          (should (get-text-property 1 'display result)))))))
+
+(ert-deftest ebb-test-render-kitty-placeholders-separate-placement-ids ()
+  "Placeholder tile rows do not bleed between placements of one image."
+  (ebb-test-with-screen (:width 4 :height 3)
+    (let* ((graphics (ebb-screen-graphics screen))
+           (first (make-ebb-graphics-placement
+                   :image-id 42 :placement-id 1 :virtual t :columns 1 :rows 2))
+           (second (make-ebb-graphics-placement
+                    :image-id 42 :placement-id 2 :virtual t :columns 1 :rows 2))
+           (render (make-ebb-render-state :screen screen)))
+      (setf (ebb-graphics-state-placements graphics) (list second first))
+      (setf (ebb-line-cells (ebb-screen-get-line screen 0))
+            (vector (make-ebb-cell
+                     :char #x10eeee :width 1
+                     :attr (make-ebb-attr :fg 42 :ul-color 1))))
+      (should (= 1 (ebb-render--placeholder-tile-row
+                    render screen graphics 1 first)))
+      (should (= 0 (ebb-render--placeholder-tile-row
+                    render screen graphics 1 second))))))
+
+(ert-deftest ebb-test-screen-reset-clears-kitty-graphics ()
+  "RIS clears stored Kitty image data and partial uploads."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (progn
+      (ebb-test-output parser (format "\e_Ga=t,f=100,i=3;%s\e\\"
+                                      ebb-test-kitty-png-base64))
+      (should (gethash 3 (ebb-graphics-state-images
+                          (ebb-screen-graphics screen))))
+      (ebb-screen-reset screen)
+      (should (= 0 (hash-table-count
+                    (ebb-graphics-state-images
+                     (ebb-screen-graphics screen))))))))
 
 (ert-deftest ebb-test-parse-error-recovery ()
   "Parser recovers from malformed sequences."
@@ -3256,6 +4663,17 @@ across the unmaterialized gap."
       (should (eq 'existing (ebb-io-process io)))
       (should (eq (current-buffer) (ebb-io-buffer io))))))
 
+(ert-deftest ebb-test-io-attach-disables-file-media-remotely ()
+  "Attaching an Eshell-style remote process preserves the TRAMP boundary."
+  (let* ((screen (ebb-screen-create 5 2))
+         (parser (ebb-parse-create screen))
+         (io (make-ebb-io :screen screen :parser parser)))
+    (with-temp-buffer
+      (setq default-directory "/ssh:example.invalid:/tmp/")
+      (ebb-io-attach io 'existing (current-buffer))
+      (should (ebb-io-remote io))
+      (should-not (ebb-parser-graphics-file-media-enabled parser)))))
+
 (ert-deftest ebb-test-trace-records-process-output ()
   "Tracing uses the terminal buffer instead of the process context."
   (let ((terminal (generate-new-buffer " *ebb-trace-terminal*"))
@@ -3280,6 +4698,62 @@ across the unmaterialized gap."
       (cancel-timer (ebb-io-render-timer io)))
     (should (equal '("abc" "def") (ebb-io-pending-chunks io)))
     (should (= 0 (ebb-io-pending-offset io)))))
+
+(ert-deftest ebb-test-io-pixel-size-updates-are-coalesced ()
+  "Repeated resizes leave only one pending pixel-size helper launch.
+Rows and columns are still applied synchronously on every call; only
+the pixel helper is coalesced."
+  (let* ((io (make-ebb-io :process 'pty :render 'render))
+         scheduled
+         (cancelled 0)
+         (spawns 0)
+         (resizes 0)
+         helper-command)
+    (cl-letf (((symbol-function 'set-process-window-size)
+               (lambda (&rest _) (cl-incf resizes)))
+              ((symbol-function 'display-graphic-p) (lambda () t))
+              ((symbol-function 'ebb-render-cell-pixel-size)
+               (lambda (_) '(10 . 20)))
+              ((symbol-function 'process-tty-name) (lambda (_) "/dev/pts/1"))
+              ((symbol-function 'ebb-io--pixel-size-helper)
+               (lambda () '("helper")))
+              ((symbol-function 'run-with-idle-timer)
+               (lambda (_delay _repeat function &rest args)
+                 (setq scheduled (cons function args))
+                 (list 'timer args)))
+              ((symbol-function 'cancel-timer)
+               (lambda (_) (cl-incf cancelled)))
+              ((symbol-function 'process-live-p) (lambda (_) t))
+              ((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (cl-incf spawns)
+                 (setq helper-command (plist-get args :command))
+                 'helper-process)))
+      (ebb-io-set-window-size io 'pty 20 80)
+      (ebb-io-set-window-size io 'pty 21 81)
+      (should (= 1 cancelled))
+      (should (= 0 spawns))
+      ;; The base resize is synchronous even while the pixel helper waits.
+      (should (= 2 resizes))
+      (apply (car scheduled) (cdr scheduled))
+      (should (= 1 spawns))
+      (should (equal '("helper" "/dev/pts/1" "21" "81" "10" "20")
+                     helper-command)))))
+
+(ert-deftest ebb-test-io-pixel-size-failure-disables-retries ()
+  "The first helper failure disables later launches for the terminal."
+  (let ((io (make-ebb-io :process 'pty :render 'render))
+        scheduled)
+    (cl-letf (((symbol-function 'process-status) (lambda (_) 'exit))
+              ((symbol-function 'process-exit-status) (lambda (_) 1))
+              ((symbol-function 'message) #'ignore))
+      (ebb-io--pixel-size-sentinel io 'helper "failed"))
+    (should (ebb-io-pixel-size-error io))
+    (cl-letf (((symbol-function 'set-process-window-size) #'ignore)
+              ((symbol-function 'run-with-idle-timer)
+               (lambda (&rest _) (setq scheduled t))))
+      (ebb-io-set-window-size io 'pty 20 80))
+    (should-not scheduled)))
 
 (ert-deftest ebb-test-io-runs-post-render-functions ()
   "Post-render integration uses the documented abnormal hook."

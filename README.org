@@ -45,6 +45,55 @@ Or with plain =package-vc=:
 (package-vc-install '(ebb :url "https://github.com/ArthurHeymans/el-be-back"))
 #+end_src
 
+* Kitty graphics
+
+Ebb implements the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]] on graphical frames: PNG, RGB and
+RGBA images over direct, temporary-file and shared-memory media, bounded
+zlib-compressed payloads, placements, Unicode placeholders (including their
+row/column diacritics), scrollback, and deletion.  Ordinary =t=f= file reads
+are opt-in through =ebb-kitty-graphics-allow-files=; all file media are refused
+for remote/TRAMP terminals so a remote process cannot address local paths.
+Tools such as =chafa -f kitty=, =timg= and =kitten icat= work without enabling
+ordinary file reads.  Temporary-file transfers are accepted only from known
+temporary directories when their basename contains =tty-graphics-protocol=;
+the file is unlinked only while the path still identifies the opened inode.
+RGBA data is composited over Ebb's current background.
+
+Animation, relative placements, source rectangles, in-cell offsets, and
+negative z-index (under-text) placements are not implemented.  Their control
+keys are rejected rather than silently ignored; unsupported negative z-index
+placements receive =EINVAL= rather than replacing the text.
+Explicit =c,r= boxes preserve aspect ratio and are centered with letterbox or
+pillarbox padding; natural and single-dimension placements use the same padded
+cell-canvas rendering.
+Set =ebb-kitty-graphics-storage-limit= to 0 to disable graphics.  The quota is
+shared by main and alternate screens and charges PNGs by their estimated
+decoded surface size.  The decoded per-image bound is
+=ebb-kitty-graphics-image-limit=, while =ebb-kitty-graphics-apc-limit= controls
+the configurable per-control-string parser bound.  Placement count and backend surface size are
+bounded by =ebb-kitty-graphics-placement-limit= and
+=ebb-kitty-graphics-surface-limit=; scaled objects use the separate
+=ebb-kitty-graphics-render-cache-limit= LRU budget.  Pixel reporting is controlled by
+=ebb-report-pixel-size= and =ebb-pixel-size-idle-delay=.  Unknown CSI pixel
+queries report zero unless =ebb-report-fallback-pixel-size= is enabled; custom
+renderers can set =ebb-graphics-fallback-cell-size= to their actual cell
+geometry.  Bounded zlib decoding and race-safe file acquisition require
+=python3=; file media return =ENOTSUP= when that helper is unavailable.
+
+Row/column resizes apply synchronously; the pixel helper only augments the
+size afterwards on a coalesced idle timer, so a helper failure never loses
+a resize.  Eviction is per-screen even though the storage quota is shared:
+one screen never deletes images backing another screen's placements, so a
+full main screen can leave an alternate-screen upload with =ENOSPC=.
+
+Image decoding (zlib inflate, file acquisition, raw RGB/RGBA to PNG) runs
+synchronously on the Emacs main thread.  Quotas bound memory but not CPU:
+a hostile child emitting many unique graphics uploads can block the UI with
+back-to-back helper spawns.  Do not run untrusted programs in Ebb with
+graphics enabled; =ebb-kitty-graphics-storage-limit= set to 0 is the
+kill-switch, and =ebb-kitty-graphics-allow-slow-rgba= disables the slowest
+fallback for machines without =python3=.
+
 * Tests
 
 #+begin_src sh

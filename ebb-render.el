@@ -300,6 +300,47 @@ background, font, or size than the rest of Emacs."
   "Face for the terminal cursor."
   :group 'ebb)
 
+(defcustom ebb-kitty-graphics-render-cache-limit (* 64 1024 1024)
+  "Approximate byte limit for cached scaled Kitty image objects.
+The estimate includes encoded source bytes and a four-byte-per-pixel backend
+surface.  Oversized objects can render once but are not retained."
+  :type 'integer
+  :group 'ebb)
+
+(defcustom ebb-kitty-graphics-render-entry-limit (* 16 1024 1024)
+  "Maximum estimated bytes for one cached scaled Kitty image object.
+Larger objects still render once per row but are never retained, so one
+huge image cannot evict the whole LRU cache.  Must be positive to cache
+anything; zero disables render caching while leaving rendering intact."
+  :type 'integer
+  :group 'ebb)
+
+(defcustom ebb-kitty-graphics-layout-cache-limit 1024
+  "Maximum rows retained in one render state's graphics layout cache.
+Layout keys use absolute model rows, which advance with scrollback even
+when the graphics generation is unchanged; without a bound a long session
+with a static image would accumulate one entry per scrolled row.  When the
+limit is exceeded the cache is dropped (it is purely recomputable) rather
+than evicted selectively.  Zero disables layout caching."
+  :type 'integer
+  :group 'ebb)
+
+(defcustom ebb-kitty-graphics-elisp-rgba-pixel-limit (* 512 512)
+  "Maximum RGBA pixels composited by the slow Elisp fallback.
+Larger raw RGBA images require the fast PNG helper rather than blocking the
+Emacs main thread with a multi-million-iteration compositing loop."
+  :type 'integer
+  :group 'ebb)
+
+(defcustom ebb-kitty-graphics-allow-slow-rgba t
+  "If non-nil, composite raw RGBA images in Elisp when the PNG helper is
+unavailable.  The fallback blocks the main thread proportionally to the
+image size (bounded by `ebb-kitty-graphics-elisp-rgba-pixel-limit'); set
+to nil on machines without python3 if hostile programs might send raw
+RGBA graphics.  PNG and RGB images are unaffected."
+  :type 'boolean
+  :group 'ebb)
+
 ;;;; ---- Render State ---------------------------------------------------
 
 (cl-defstruct (ebb-render-state (:copier nil))
@@ -314,8 +355,19 @@ background, font, or size than the rest of Emacs."
   (history-start-row 0)  ; absolute physical row of first materialized row
   (history-total-rows 0)
   (history-generation -1)
+  (history-graphics-generation -1)
   (virtual-mark nil)
-  (history-cache nil))
+  (history-cache nil)
+  (graphics-cache nil)
+  (graphics-cache-sizes nil)
+  (graphics-cache-order nil)
+  (graphics-cache-bytes 0)
+  (graphics-state nil)
+  (graphics-generation -1)
+  (graphics-placement-order nil)
+  (graphics-layout-cache nil)
+  (placeholder-row-cache nil)
+  (placeholder-history-row-cache nil))
 
 ;;;; ---- Constructor ----------------------------------------------------
 
@@ -326,7 +378,13 @@ When BEGIN and END are non-nil, render only that buffer region.  This lets
 Eshell retain everything outside an inline terminal."
   (let ((render (make-ebb-render-state
                  :screen screen :buffer buffer
-                 :history-cache (make-hash-table :test #'equal)))
+                 :history-cache (make-hash-table :test #'equal)
+                 :graphics-cache (make-hash-table :test #'equal)
+                 :graphics-cache-sizes (make-hash-table :test #'equal)
+                 :graphics-layout-cache (make-hash-table :test #'equal)
+                 :placeholder-row-cache (make-hash-table :test #'eql)
+                 :placeholder-history-row-cache
+                 (make-hash-table :test #'eql)))
         (h (ebb-screen-height screen)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t)
@@ -355,6 +413,22 @@ Eshell retain everything outside an inline terminal."
             (overlay-put ov 'priority 100)
             (setf (ebb-render-state-cursor-overlay render) ov)))))
     render))
+
+(defun ebb-render-text-area-pixel-size (render)
+  "Return RENDER's visible text area as (WIDTH . HEIGHT) pixels."
+  (when-let* ((buffer (ebb-render-state-buffer render))
+              (window (car (get-buffer-window-list buffer nil t))))
+    (cons (window-body-width window t)
+          (window-body-height window t))))
+
+(defun ebb-render-cell-pixel-size (render)
+  "Return RENDER's terminal cell size as (WIDTH . HEIGHT) pixels."
+  (when-let* ((buffer (ebb-render-state-buffer render))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (if (ebb-render--glyph-cache-valid-p)
+          (cons ebb-render--cell-pixel-width ebb-render--cell-pixel-height)
+        (cons (frame-char-width) (frame-char-height))))))
 
 ;;;; ---- Main Refresh ---------------------------------------------------
 
@@ -385,6 +459,15 @@ state are reconciled independently so metadata-only updates are visible."
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
+            ;; Placeholder row prefixes depend on viewport text and are shared
+            ;; by every dirty row rendered in this refresh.
+            (clrhash (or (ebb-render-state-placeholder-row-cache render)
+                         (setf (ebb-render-state-placeholder-row-cache render)
+                               (make-hash-table :test #'eql))))
+            (clrhash
+             (or (ebb-render-state-placeholder-history-row-cache render)
+                 (setf (ebb-render-state-placeholder-history-row-cache render)
+                       (make-hash-table :test #'eql))))
             ;; Reconcile scrollback independently of dirty display rows.
             (ebb-render--update-scrollback render)
             ;; Render dirty display lines.
@@ -437,6 +520,30 @@ state are reconciled independently so metadata-only updates are visible."
 
 ;;;; ---- Scrollback Rendering -------------------------------------------
 
+(defun ebb-render--history-graphics-signature (screen)
+  "Return a stable signature for graphics that can affect SCREEN history."
+  (let* ((graphics (ebb-screen-graphics screen))
+         (limit (ebb-screen-history-row-count screen)))
+    (delq
+     nil
+     (mapcar
+      (lambda (placement)
+        (when (or (ebb-graphics-placement-virtual placement)
+                  (< (ebb-graphics-placement-row placement) limit))
+          (let ((image (gethash (ebb-graphics-placement-image-id placement)
+                                (ebb-graphics-state-images graphics))))
+            (list (ebb-graphics-placement-image-id placement)
+                  (ebb-graphics-placement-placement-id placement)
+                  (ebb-graphics-placement-row placement)
+                  (ebb-graphics-placement-column placement)
+                  (ebb-graphics-placement-columns placement)
+                  (ebb-graphics-placement-rows placement)
+                  (ebb-graphics-placement-row-offset placement)
+                  (ebb-graphics-placement-z-index placement)
+                  (ebb-graphics-placement-virtual placement)
+                  (and image (ebb-graphics-image-cache-token image))))))
+      (ebb-graphics-state-placements graphics)))))
+
 (defun ebb-render--update-scrollback (render)
   "Materialize the history range needed by every window showing RENDER."
   (let* ((screen (ebb-render-state-screen render))
@@ -456,6 +563,7 @@ state are reconciled independently so metadata-only updates are visible."
                            (ebb-render-buffer-anchor render (mark t))))
          (total (ebb-screen-history-row-count screen))
          (generation (ebb-screen-history-generation screen))
+         (graphics-generation (ebb-render--history-graphics-signature screen))
          (capacity (ebb-render--history-capacity render))
          (history-locations
           (delq nil
@@ -493,10 +601,14 @@ state are reconciled independently so metadata-only updates are visible."
                      (max capacity (- needed-end start)))))
     (when (or (/= generation
                   (ebb-render-state-history-generation render))
+              (not (equal graphics-generation
+                          (ebb-render-state-history-graphics-generation
+                           render)))
               (/= start (ebb-render-state-history-start-row render))
               (/= count (ebb-render-state-scrollback-count render))
               (/= total (ebb-render-state-history-total-rows render)))
-      (ebb-render--rebuild-scrollback render start count total generation)
+      (ebb-render--rebuild-scrollback
+       render start count total generation graphics-generation)
       (pcase-dolist (`(,window ,start-anchor ,window-point-anchor) windows)
         (when-let* ((position
                     (ebb-render--anchor-buffer-position
@@ -574,23 +686,31 @@ visible and jump the window into old history."
           (move-to-column column)
           (point))))))
 
-(defun ebb-render--history-row-string (render row)
-  "Return cached rendered history ROW for RENDER."
+(defun ebb-render--history-row-string (render row &optional graphics-signature)
+  "Return cached rendered history ROW for RENDER.
+GRAPHICS-SIGNATURE is a precomputed `ebb-render--history-graphics-signature'
+value for the current screen; it is computed on demand when absent.  Callers
+rendering many rows in a loop should compute it once and pass it in."
   (let* ((screen (ebb-render-state-screen render))
          (width (ebb-screen-width screen))
          (location (ebb-screen-history-row-location screen row))
          (logical (car location))
          (key (list (ebb-history-line-id logical)
                     (ebb-history-line-generation logical)
+                    (or graphics-signature
+                        (ebb-render--history-graphics-signature screen))
                     (cdr location) width))
          (cache (ebb-render-state-history-cache render)))
     (or (gethash key cache)
         (let* ((line (ebb-screen-history-render-row screen row))
                (string (concat
                         (ebb-render--trim-trailing
-                         (ebb-render--apply-line-metadata
-                          line
-                          (ebb-render--line-to-string-scrollback line width)))
+                         (ebb-render--apply-graphics
+                          render row
+                          (ebb-render--apply-line-metadata
+                           line
+                           (ebb-render--line-to-string-scrollback line width))
+                          t))
                         "\n")))
           (put-text-property 0 (length string) 'ebb-history-id
                              (ebb-history-line-id logical) string)
@@ -603,7 +723,7 @@ visible and jump the window into old history."
           string))))
 
 (defun ebb-render--rebuild-scrollback
-    (render &optional start count total generation)
+    (render &optional start count total generation graphics-generation)
   "Replace RENDER's bounded history slab from START for COUNT rows."
   (let* ((screen (ebb-render-state-screen render))
          (display-begin (ebb-render-state-display-begin render))
@@ -611,16 +731,23 @@ visible and jump the window into old history."
          (start (or start (max 0 (- total (ebb-render--history-capacity render)))))
          (count (or count (min (ebb-render--history-capacity render)
                                (- total start))))
-         (generation (or generation (ebb-screen-history-generation screen))))
+         (generation (or generation (ebb-screen-history-generation screen)))
+         (graphics-generation
+          (if (null graphics-generation)
+              (ebb-render--history-graphics-signature screen)
+            graphics-generation)))
     (save-excursion
       (delete-region (ebb-render-state-region-begin render) display-begin)
       (goto-char (ebb-render-state-region-begin render))
       (dotimes (offset count)
-        (insert (ebb-render--history-row-string render (+ start offset)))))
+        (insert (ebb-render--history-row-string
+                 render (+ start offset) graphics-generation))))
     (setf (ebb-render-state-history-start-row render) start
           (ebb-render-state-scrollback-count render) count
           (ebb-render-state-history-total-rows render) total
-          (ebb-render-state-history-generation render) generation)))
+          (ebb-render-state-history-generation render) generation
+          (ebb-render-state-history-graphics-generation render)
+          graphics-generation)))
 
 (defun ebb-render-scroll-history (render rows)
   "Scroll RENDER's selected window by virtual history ROWS."
@@ -945,6 +1072,616 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
                                'ebb-shell-prompt-end t result))))
       result)))
 
+;;;; ---- Terminal Graphics ----------------------------------------------
+
+(defconst ebb-render--placeholder-diacritics
+  [#x305 #x30d #x30e #x310 #x312 #x33d #x33e #x33f #x346 #x34a #x34b #x34c
+   #x350 #x351 #x352 #x357 #x35b #x363 #x364 #x365 #x366 #x367 #x368 #x369
+   #x36a #x36b #x36c #x36d #x36e #x36f #x483 #x484 #x485 #x486 #x487 #x592
+   #x593 #x594 #x595 #x597 #x598 #x599 #x59c #x59d #x59e #x59f #x5a0 #x5a1
+   #x5a8 #x5a9 #x5ab #x5ac #x5af #x5c4 #x610 #x611 #x612 #x613 #x614 #x615
+   #x616 #x617 #x657 #x658 #x659 #x65a #x65b #x65d #x65e #x6d6 #x6d7 #x6d8
+   #x6d9 #x6da #x6db #x6dc #x6df #x6e0 #x6e1 #x6e2 #x6e4 #x6e7 #x6e8 #x6eb
+   #x6ec #x730 #x732 #x733 #x735 #x736 #x73a #x73d #x73f #x740 #x741 #x743
+   #x745 #x747 #x749 #x74a #x7eb #x7ec #x7ed #x7ee #x7ef #x7f0 #x7f1 #x7f3
+   #x816 #x817 #x818 #x819 #x81b #x81c #x81d #x81e #x81f #x820 #x821 #x822
+   #x823 #x825 #x826 #x827 #x829 #x82a #x82b #x82c #x82d #x951 #x953 #x954
+   #xf82 #xf83 #xf86 #xf87 #x135d #x135e #x135f #x17dd #x193a #x1a17 #x1a75 #x1a76
+   #x1a77 #x1a78 #x1a79 #x1a7a #x1a7b #x1a7c #x1b6b #x1b6d #x1b6e #x1b6f #x1b70 #x1b71
+   #x1b72 #x1b73 #x1cd0 #x1cd1 #x1cd2 #x1cda #x1cdb #x1ce0 #x1dc0 #x1dc1 #x1dc3 #x1dc4
+   #x1dc5 #x1dc6 #x1dc7 #x1dc8 #x1dc9 #x1dcb #x1dcc #x1dd1 #x1dd2 #x1dd3 #x1dd4 #x1dd5
+   #x1dd6 #x1dd7 #x1dd8 #x1dd9 #x1dda #x1ddb #x1ddc #x1ddd #x1dde #x1ddf #x1de0 #x1de1
+   #x1de2 #x1de3 #x1de4 #x1de5 #x1de6 #x1dfe #x20d0 #x20d1 #x20d4 #x20d5 #x20d6 #x20d7
+   #x20db #x20dc #x20e1 #x20e7 #x20e9 #x20f0 #x2cef #x2cf0 #x2cf1 #x2de0 #x2de1 #x2de2
+   #x2de3 #x2de4 #x2de5 #x2de6 #x2de7 #x2de8 #x2de9 #x2dea #x2deb #x2dec #x2ded #x2dee
+   #x2def #x2df0 #x2df1 #x2df2 #x2df3 #x2df4 #x2df5 #x2df6 #x2df7 #x2df8 #x2df9 #x2dfa
+   #x2dfb #x2dfc #x2dfd #x2dfe #x2dff #xa66f #xa67c #xa67d #xa6f0 #xa6f1 #xa8e0 #xa8e1
+   #xa8e2 #xa8e3 #xa8e4 #xa8e5 #xa8e6 #xa8e7 #xa8e8 #xa8e9 #xa8ea #xa8eb #xa8ec #xa8ed
+   #xa8ee #xa8ef #xa8f0 #xa8f1 #xaab0 #xaab2 #xaab3 #xaab7 #xaab8 #xaabe #xaabf #xaac1
+   #xfe20 #xfe21 #xfe22 #xfe23 #xfe24 #xfe25 #xfe26 #x10a0f #x10a38 #x1d185 #x1d186
+   #x1d187 #x1d188 #x1d189 #x1d1aa #x1d1ab #x1d1ac #x1d1ad #x1d242 #x1d243 #x1d244]
+  "Kitty canonical row/column diacritics for byte-sized indices.")
+
+(defconst ebb-render--placeholder-diacritic-indices
+  (let ((table (make-hash-table :test #'eql)))
+    (dotimes (index (length ebb-render--placeholder-diacritics))
+      (puthash (aref ebb-render--placeholder-diacritics index) index table))
+    table)
+  "Reverse lookup table for Kitty placeholder diacritics.")
+
+(defvar ebb-render--graphics-background-cache nil
+  "Cached terminal background as (FACE-COLOR . RGB).")
+
+(defun ebb-render--graphics-background ()
+  "Return the terminal background as (RED GREEN BLUE) in 0..255."
+  (let ((color (or (face-background 'ebb-default nil t) "black")))
+    (if (equal color (car ebb-render--graphics-background-cache))
+        (cdr ebb-render--graphics-background-cache)
+      (let* ((values (color-values color))
+             (rgb (if values
+                      (mapcar (lambda (component) (ash component -8)) values)
+                    '(0 0 0))))
+        (setq ebb-render--graphics-background-cache (cons color rgb))
+        rgb))))
+
+(defun ebb-render--graphics-raw-png-helper (image)
+  "Encode raw RGB or RGBA IMAGE as PNG using native zlib operations."
+  (when-let* ((python (executable-find "python3")))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert (ebb-graphics-image-data image))
+      (let ((status
+             (call-process-region
+              (point-min) (point-max) python t t nil "-c"
+              (concat
+               "import binascii,struct,sys,zlib\n"
+               "w,h,c=map(int,sys.argv[1:4]); src=sys.stdin.buffer.read(); stride=w*c\n"
+               "raw=b''.join(b'\\0'+src[y*stride:(y+1)*stride] for y in range(h))\n"
+               "def chunk(t,d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',binascii.crc32(t+d)&0xffffffff)\n"
+               "ihdr=struct.pack('>IIBBBBB',w,h,8,2 if c==3 else 6,0,0,0)\n"
+               "sys.stdout.buffer.write(b'\\x89PNG\\r\\n\\x1a\\n'+chunk(b'IHDR',ihdr)+chunk(b'IDAT',zlib.compress(raw,1))+chunk(b'IEND',b''))\n")
+              (number-to-string (ebb-graphics-image-width image))
+              (number-to-string (ebb-graphics-image-height image))
+              (number-to-string (/ (ebb-graphics-image-format image) 8)))))
+        (and (eq status 0) (buffer-string))))))
+
+(defun ebb-render--graphics-ppm-data (image background)
+  "Return IMAGE as PPM bytes, or nil when its format is unsupported.
+RGBA pixels are composited over BACKGROUND, a (RED GREEN BLUE) list, since
+PPM carries no alpha channel.  The RGBA path runs synchronously on the
+main thread and is skipped unless `ebb-kitty-graphics-allow-slow-rgba'
+is non-nil; the RGB path is a plain header prepend and always available."
+  (let ((format (ebb-graphics-image-format image))
+        (width (ebb-graphics-image-width image))
+        (height (ebb-graphics-image-height image))
+        (data (ebb-graphics-image-data image)))
+    (pcase format
+      (24 (concat (format "P6\n%d %d\n255\n" width height) data))
+      (32
+       (let ((pixels (* width height)))
+         (when (and ebb-kitty-graphics-allow-slow-rgba
+                    (<= pixels ebb-kitty-graphics-elisp-rgba-pixel-limit))
+           (let ((rgb (make-string (* pixels 3) 0)))
+             (dotimes (pixel pixels)
+               (let* ((source (* pixel 4))
+                      (target (* pixel 3))
+                      (alpha (aref data (+ source 3))))
+                 (if (= alpha 255)
+                     (progn
+                       (aset rgb target (aref data source))
+                       (aset rgb (1+ target) (aref data (1+ source)))
+                       (aset rgb (+ target 2) (aref data (+ source 2))))
+                   (dotimes (channel 3)
+                     (aset rgb (+ target channel)
+                           (/ (+ (* alpha (aref data (+ source channel)))
+                                 (* (- 255 alpha) (nth channel background)))
+                              255))))))
+             (concat (format "P6\n%d %d\n255\n" width height)
+                     (encode-coding-string rgb 'binary))))))
+      (_ nil))))
+
+(defun ebb-render--graphics-cache-touch (render key)
+  "Mark cached graphics KEY as most recently used in RENDER."
+  (setf (ebb-render-state-graphics-cache-order render)
+        (cons key (delete key (ebb-render-state-graphics-cache-order render)))))
+
+(defun ebb-render--graphics-cache-put (render key object bytes)
+  "Cache OBJECT under KEY in RENDER when its estimated BYTES fit.
+Objects larger than `ebb-kitty-graphics-render-entry-limit' render once
+but are never retained, so one huge image cannot evict the whole cache."
+  (when (and (> ebb-kitty-graphics-render-cache-limit 0)
+             (> ebb-kitty-graphics-render-entry-limit 0)
+             (<= bytes ebb-kitty-graphics-render-entry-limit)
+             (<= bytes ebb-kitty-graphics-render-cache-limit))
+    (let ((cache (ebb-render-state-graphics-cache render))
+          (sizes (or (ebb-render-state-graphics-cache-sizes render)
+                     (setf (ebb-render-state-graphics-cache-sizes render)
+                           (make-hash-table :test #'equal)))))
+      (while (and (ebb-render-state-graphics-cache-order render)
+                  (> (+ (ebb-render-state-graphics-cache-bytes render) bytes)
+                     ebb-kitty-graphics-render-cache-limit))
+        (let* ((old-key (car (last
+                              (ebb-render-state-graphics-cache-order render))))
+               (old-size (gethash old-key sizes 0)))
+          (setf (ebb-render-state-graphics-cache-order render)
+                (delete old-key
+                        (ebb-render-state-graphics-cache-order render)))
+          (remhash old-key cache)
+          (remhash old-key sizes)
+          (cl-decf (ebb-render-state-graphics-cache-bytes render) old-size)))
+      (puthash key object cache)
+      (puthash key bytes sizes)
+      (cl-incf (ebb-render-state-graphics-cache-bytes render) bytes)
+      (ebb-render--graphics-cache-touch render key))))
+
+(defun ebb-render--graphics-image-object (render image placement)
+  "Return a cached, cell-box-sized Emacs image for IMAGE and PLACEMENT.
+The box-sized SVG canvas is essential: Emacs clamps slices to the backing
+image dimensions rather than stretching them over the propertized text run."
+  (let* ((cell (or (ebb-render-cell-pixel-size render)
+                   (cons (frame-char-width) (frame-char-height))))
+         (cell-width (max 1 (car cell)))
+         (cell-height (max 1 (cdr cell)))
+         (draw-width (ebb-graphics-placement-pixel-width placement))
+         (draw-height (ebb-graphics-placement-pixel-height placement))
+         (width (* (or (ebb-graphics-placement-box-columns placement)
+                       (ebb-graphics-placement-columns placement))
+                   cell-width))
+         (height (* (or (ebb-graphics-placement-box-rows placement)
+                        (ebb-graphics-placement-rows placement))
+                    cell-height))
+         (background (ebb-render--graphics-background))
+         (key (list (ebb-graphics-image-cache-token image)
+                    width height draw-width draw-height background))
+         (cache (ebb-render-state-graphics-cache render))
+         (missing (make-symbol "missing"))
+         (cached (gethash key cache missing)))
+    (if (not (eq cached missing))
+        (progn
+          (ebb-render--graphics-cache-touch render key)
+          (unless (eq cached :failed) cached))
+      (let* ((source-key
+              (list (ebb-graphics-image-format image)
+                    (and (= (ebb-graphics-image-format image) 32) background)))
+             (source-info
+              (if (equal source-key
+                         (ebb-graphics-image-render-source-key image))
+                  (ebb-graphics-image-render-source image)
+                (let* ((format (ebb-graphics-image-format image))
+                       (png (and (memq format '(24 32))
+                                 (ebb-render--graphics-raw-png-helper image)))
+                       (converted
+                        (cond
+                         ((= format 100)
+                          (cons "image/png" (ebb-graphics-image-data image)))
+                         (png (cons "image/png" png))
+                         (t
+                          (when-let* ((ppm (ebb-render--graphics-ppm-data
+                                            image background)))
+                            (cons "image/x-portable-pixmap" ppm))))))
+                  (setf (ebb-graphics-image-render-source-key image) source-key
+                        (ebb-graphics-image-render-source image) converted)
+                  converted)))
+             (mime (car-safe source-info))
+             (source (cdr-safe source-info))
+             (fill (format "#%02x%02x%02x"
+                           (nth 0 background) (nth 1 background)
+                           (nth 2 background)))
+             (draw-x (max 0 (/ (- width draw-width) 2)))
+             (draw-y (max 0 (/ (- height draw-height) 2)))
+             (svg
+              (and source (equal mime "image/png")
+                   (format
+                    (concat "<svg xmlns='http://www.w3.org/2000/svg' "
+                            "width='%d' height='%d' viewBox='0 0 %d %d'>"
+                            "<rect width='100%%' height='100%%' fill='%s'/>"
+                            "<image x='%d' y='%d' width='%d' height='%d' "
+                            "preserveAspectRatio='none' href='data:%s;base64,%s'/>"
+                            "</svg>")
+                    width height width height fill draw-x draw-y
+                    draw-width draw-height mime
+                    (base64-encode-string source t))))
+             (object
+              (condition-case nil
+                  (cond
+                   ((and svg (image-type-available-p 'svg))
+                    (create-image svg 'svg t :ascent 'center))
+                   (source
+                    ;; Reduced fallback for builds without SVG support.  It
+                    ;; keeps slice geometry correct, though partial-cell
+                    ;; padding is stretched rather than blank.
+                    (create-image
+                     source
+                     (if (equal mime "image/png") 'png 'pbm)
+                     t :width width :height height :scale 1 :ascent 'center)))
+                (error nil))))
+        (ebb-render--graphics-cache-put
+         render key (or object :failed)
+         (if object
+             (+ (length source) (length (or svg "")) (* width height 4))
+           0))
+        object))))
+
+(defun ebb-render--graphics-color-id (color)
+  "Decode Kitty image or placement ID from terminal COLOR."
+  (cond
+   ((integerp color) color)
+   ((and (listp color) (= (length color) 3))
+    (+ (ash (nth 0 color) 16) (ash (nth 1 color) 8) (nth 2 color)))
+   (t nil)))
+
+(defun ebb-render--virtual-placement (graphics image-id placement-id)
+  "Find the newest virtual placement matching IMAGE-ID and PLACEMENT-ID."
+  (cl-find-if
+   (lambda (placement)
+     (and (ebb-graphics-placement-virtual placement)
+          (= image-id (ebb-graphics-placement-image-id placement))
+          (or (null placement-id)
+              (zerop placement-id)
+              (eql placement-id
+                   (ebb-graphics-placement-placement-id placement)))))
+   (ebb-graphics-state-placements graphics)))
+
+(defun ebb-render--line-has-placeholder-placement-p
+    (screen graphics row target &optional absolute)
+  "Return non-nil when ROW contains a placeholder for TARGET.
+ROW addresses history when ABSOLUTE is non-nil."
+  (let* ((line (ebb-render--graphics-line screen row absolute))
+         (cells (and line (ebb--line-ensure-cells line (ebb-screen-width screen))))
+         (column 0)
+         (limit (and cells (length cells)))
+         found)
+    (while (and (< column (or limit 0)) (not found))
+      (let* ((cell (aref cells column))
+             (attr (ebb-cell-attr cell))
+             (low-id (and attr
+                          (ebb-render--graphics-color-id (ebb-attr-fg attr))))
+             (marks (and (= (ebb-cell-char cell) #x10eeee)
+                         (string-to-list (or (ebb-cell-combining cell) ""))))
+             (high (and (cddr marks)
+                        (ebb-render--placeholder-diacritic-index
+                         (nth 2 marks))))
+             (image-id (and low-id (+ low-id (ash (or high 0) 24))))
+             (placement-id
+              (and attr
+                   (ebb-render--graphics-color-id (ebb-attr-ul-color attr)))))
+        (when (and (= (ebb-cell-char cell) #x10eeee)
+                   image-id
+                   (eq target (ebb-render--virtual-placement
+                               graphics image-id placement-id)))
+          (setq found t)))
+      (cl-incf column))
+    found))
+
+(defun ebb-render--placeholder-tile-row
+    (render screen graphics row placement &optional absolute)
+  "Return PLACEMENT's tile row before ROW, caching line prefixes.
+ROW addresses history when ABSOLUTE is non-nil."
+  (let* ((cache
+          (if absolute
+              (or (ebb-render-state-placeholder-history-row-cache render)
+                  (setf (ebb-render-state-placeholder-history-row-cache render)
+                        (make-hash-table :test #'eql)))
+            (or (ebb-render-state-placeholder-row-cache render)
+                (setf (ebb-render-state-placeholder-row-cache render)
+                      (make-hash-table :test #'eql)))))
+         (limit (if absolute (1+ row) (ebb-screen-height screen)))
+         (entry (gethash placement cache)))
+    (when (or (null entry) (< (length (cdr entry)) (1+ limit)))
+      (let ((replacement (make-vector (1+ limit) 0)))
+        (when entry
+          (cl-replace replacement (cdr entry)))
+        (setq entry (cons (or (car-safe entry) 0) replacement))
+        (puthash placement entry cache)))
+    (let ((computed (car entry))
+          (counts (cdr entry)))
+      (while (< computed row)
+        (aset counts (1+ computed)
+              (+ (aref counts computed)
+                 (if (ebb-render--line-has-placeholder-placement-p
+                      screen graphics computed placement absolute)
+                     1 0)))
+        (cl-incf computed))
+      (setcar entry computed)
+      (aref counts row))))
+
+(defun ebb-render--graphics-line (screen row absolute)
+  "Return the model line for ROW, interpreting it as ABSOLUTE when non-nil."
+  (if absolute
+      (ebb-screen-history-render-row screen row)
+    (ebb-screen-get-line screen row)))
+
+(defun ebb-render--graphics-column-indices (line string width scrollback)
+  "Map terminal column boundaries to character indices in STRING.
+LINE supplies cell widths and combining suffixes.  SCROLLBACK accounts for
+the compact history path, where a wide cell is one character carrying an
+`ebb-cell-width' property instead of a character plus invisible spacers."
+  (let ((indices (make-vector (1+ width) (length string)))
+        (cells (and line (ebb--line-ensure-cells line width)))
+        (column 0)
+        (position 0)
+        (limit (length string)))
+    (while (and cells (< column width) (< position limit))
+      (let* ((cell (aref cells column))
+             (cell-width (max 1 (ebb-cell-width cell)))
+             (combining-length (length (or (ebb-cell-combining cell) "")))
+             (compact-wide
+              (and scrollback
+                   (get-text-property position 'ebb-cell-width string))))
+        (aset indices column position)
+        (dotimes (extra (1- cell-width))
+          (aset indices (+ column extra 1)
+                (if compact-wide
+                    position
+                  (min limit (+ position 1 combining-length extra)))))
+        (setq position
+              (min limit (+ position 1 combining-length
+                            (if (and (> cell-width 1) (not compact-wide))
+                                (1- cell-width)
+                              0))))
+        (cl-incf column cell-width)))
+    ;; Renderers may pass a trimmed or empty carrier string.  Reserve one
+    ;; character per remaining terminal column; callers pad to these indices
+    ;; before applying a display property.
+    (while (< column width)
+      (aset indices column position)
+      (cl-incf column)
+      (cl-incf position))
+    (aset indices width position)
+    indices))
+
+(defun ebb-render--placeholder-diacritic-index (character)
+  "Return Kitty's numeric index for combining CHARACTER, or nil."
+  (gethash character ebb-render--placeholder-diacritic-indices))
+
+(defun ebb-render--placeholder-coordinates (cell)
+  "Decode (ROW COLUMN HIGH-ID-BYTE) from CELL's Kitty diacritics."
+  (let* ((marks (string-to-list (or (ebb-cell-combining cell) "")))
+         (row (and marks
+                   (ebb-render--placeholder-diacritic-index (nth 0 marks))))
+         (column (and (cdr marks)
+                      (ebb-render--placeholder-diacritic-index (nth 1 marks))))
+         (high (and (cddr marks)
+                    (ebb-render--placeholder-diacritic-index (nth 2 marks)))))
+    (when (and high (> high 255))
+      (setq high nil))
+    (list row column high)))
+
+(defun ebb-render--apply-virtual-graphics
+    (render row string graphics cell-width cell-height &optional absolute)
+  "Apply Unicode-placeholder graphics on ROW of STRING.
+ROW is history-absolute when ABSOLUTE is non-nil."
+  (let* ((screen (ebb-render-state-screen render))
+         (line (ebb-render--graphics-line screen row absolute))
+         (cells (and line (ebb--line-ensure-cells line (ebb-screen-width screen))))
+         (result string)
+         (indices (ebb-render--graphics-column-indices
+                   line string (ebb-screen-width screen) absolute))
+         (per-placement-columns (make-hash-table :test #'eq))
+         previous-placeholder previous-low-id previous-placement-id
+         previous-row previous-column previous-high-byte)
+    (when (and cells (string-search (string #x10eeee) result))
+      (dotimes (column (length cells))
+        (let* ((cell (aref cells column))
+               (attr (ebb-cell-attr cell)))
+          (if (not (and (= (ebb-cell-char cell) #x10eeee) attr))
+              (setq previous-placeholder nil)
+            (pcase-let* ((`(,encoded-row ,encoded-column ,encoded-high-byte)
+                          (ebb-render--placeholder-coordinates cell))
+                         (low-id (ebb-render--graphics-color-id
+                                  (ebb-attr-fg attr)))
+                         (placement-id
+                          (ebb-render--graphics-color-id
+                           (ebb-attr-ul-color attr)))
+                         (same-colors
+                          (and previous-placeholder
+                               (equal low-id previous-low-id)
+                               (equal placement-id previous-placement-id)))
+                         (tile-row
+                          (or encoded-row (and same-colors previous-row)))
+                         (tile-column
+                          (or encoded-column
+                              (and same-colors tile-row
+                                   (eql tile-row previous-row)
+                                   (integerp previous-column)
+                                   (1+ previous-column))))
+                         (high-byte
+                          (or encoded-high-byte
+                              (and same-colors tile-row tile-column
+                                   (eql tile-row previous-row)
+                                   (integerp previous-column)
+                                   (= tile-column (1+ previous-column))
+                                   previous-high-byte)
+                              0))
+                         (image-id (and low-id
+                                        (+ low-id (ash high-byte 24))))
+                         (placement (and image-id
+                                         (ebb-render--virtual-placement
+                                          graphics image-id placement-id))))
+              (when placement
+                (let* ((fallback-column
+                        (gethash placement per-placement-columns 0))
+                       (tile-column (or tile-column fallback-column))
+                       (tile-row
+                        (or tile-row
+                            (ebb-render--placeholder-tile-row
+                             render screen graphics row placement absolute)))
+                       (columns (ebb-graphics-placement-columns placement))
+                       (rows (ebb-graphics-placement-rows placement))
+                       (image (gethash image-id
+                                       (ebb-graphics-state-images graphics))))
+                  (puthash placement (1+ tile-column) per-placement-columns)
+                  (setq previous-row tile-row
+                        previous-column tile-column)
+                  (when (and image tile-row
+                             (< tile-column columns) (< tile-row rows))
+                    (when-let* ((object
+                                 (ebb-render--graphics-image-object
+                                  render image placement)))
+                      (unless (multibyte-string-p result)
+                        (setq result (string-to-multibyte result)))
+                      ;; The carrier string may be trimmed or empty while
+                      ;; indices reserve one character per terminal column.
+                      ;; Pad first: positions past the end of the string
+                      ;; would otherwise signal args-out-of-range here and
+                      ;; break the whole refresh.
+                      (let* ((text-start (aref indices column))
+                             (text-end (max (1+ text-start)
+                                            (aref indices (min (1+ column)
+                                                               (1- (length indices)))))))
+                        (when (< (length result) text-end)
+                          (setq result
+                                (concat result
+                                        (make-string
+                                         (- text-end (length result)) ?\s))))
+                        (put-text-property
+                         text-start text-end 'display
+                         (list (list 'slice
+                                     (* tile-column cell-width)
+                                     (* tile-row cell-height)
+                                     cell-width cell-height)
+                               object)
+                         result))))))
+              (setq previous-placeholder t
+                    previous-low-id low-id
+                    previous-placement-id placement-id
+                    previous-row (or tile-row previous-row)
+                    previous-column (or tile-column previous-column)
+                    previous-high-byte high-byte))))))
+    result))
+
+(defun ebb-render--apply-graphics (render row string &optional absolute)
+  "Return STRING with graphics placements intersecting ROW.
+ROW is viewport-relative unless ABSOLUTE is non-nil."
+  (if (not (display-graphic-p))
+      string
+    (let* ((screen (ebb-render-state-screen render))
+           (graphics (ebb-screen-graphics screen))
+           (generation (ebb-graphics-state-generation graphics))
+           (model-row (if (or absolute (ebb-screen-alt-screen screen))
+                          row
+                        (+ (ebb-screen-history-row-count screen) row)))
+           (cell (or (ebb-render-cell-pixel-size render)
+                     (cons (frame-char-width) (frame-char-height))))
+           (cell-width (max 1 (car cell)))
+           (cell-height (max 1 (cdr cell)))
+           (width (ebb-screen-width screen))
+           (line (ebb-render--graphics-line screen row absolute))
+           (result string)
+           (indices (ebb-render--graphics-column-indices
+                     line string width absolute)))
+      (unless (and (eq graphics (ebb-render-state-graphics-state render))
+                   (= generation
+                      (ebb-render-state-graphics-generation render)))
+        ;; Bottom-most first: ascending z-index, and among equal z-index the
+        ;; older placement (later in the newest-first list) below.  Cache this
+        ;; order and each row's owner vector for the whole model generation.
+        (setf (ebb-render-state-graphics-state render) graphics
+              (ebb-render-state-graphics-generation render) generation
+              (ebb-render-state-graphics-placement-order render)
+              (sort
+               (cl-remove-if #'ebb-graphics-placement-virtual
+                             (reverse
+                              (ebb-graphics-state-placements graphics)))
+               (lambda (left right)
+                 (let ((left-z (ebb-graphics-placement-z-index left))
+                       (right-z (ebb-graphics-placement-z-index right)))
+                   (if (= left-z right-z)
+                       ;; Lower image IDs have the lower effective z-index, so
+                       ;; they are visited first in this bottom-to-top order.
+                       (< (ebb-graphics-placement-image-id left)
+                          (ebb-graphics-placement-image-id right))
+                     (< left-z right-z))))))
+        (if (ebb-render-state-graphics-layout-cache render)
+            (clrhash (ebb-render-state-graphics-layout-cache render))
+          (setf (ebb-render-state-graphics-layout-cache render)
+                (make-hash-table :test #'equal))))
+      (let* ((layout-cache (or (ebb-render-state-graphics-layout-cache render)
+                               (setf (ebb-render-state-graphics-layout-cache
+                                      render)
+                                     (make-hash-table :test #'equal))))
+             (layout-key (cons model-row width))
+             (missing (make-symbol "missing"))
+             (owners (gethash layout-key layout-cache missing)))
+        (when (eq owners missing)
+          ;; Absolute model rows advance with scrollback while the graphics
+          ;; generation stays unchanged.  Bound the cache: drop everything
+          ;; and recompute the one needed row rather than growing one entry
+          ;; per scrolled row over a long session.
+          (when (>= (hash-table-count layout-cache)
+                    (max 1 ebb-kitty-graphics-layout-cache-limit))
+            (clrhash layout-cache))
+          (setq owners (make-vector width nil))
+          (dolist (placement
+                   (ebb-render-state-graphics-placement-order render))
+            (when (and (<= (ebb-graphics-placement-row placement) model-row)
+                       (< model-row
+                          (+ (ebb-graphics-placement-row placement)
+                             (ebb-graphics-placement-rows placement))))
+              (let ((start (max 0 (ebb-graphics-placement-column placement)))
+                    (end (min width
+                              (+ (ebb-graphics-placement-column placement)
+                                 (ebb-graphics-placement-columns placement)))))
+                (cl-loop for index from start below end
+                         do (aset owners index placement)))))
+          ;; A zero limit disables retention while keeping single-row
+          ;; recomputation correct.
+          (when (> ebb-kitty-graphics-layout-cache-limit 0)
+            (puthash layout-key owners layout-cache)))
+      (when (cl-find-if #'identity owners)
+        ;; Resolve which placement is visible in each column, then emit one
+        ;; image slice per run of columns owned by the same placement.  A
+        ;; partially covered placement thus shows the correct part of its
+        ;; image rather than restarting from its left edge.
+        (let ((column 0))
+          (while (< column width)
+            (if-let* ((owner (aref owners column)))
+                (let ((start column))
+                  (while (and (< column width) (eq (aref owners column) owner))
+                    (cl-incf column))
+                  ;; Preserve the placement's cell run even when its image is
+                  ;; temporarily unavailable.  Otherwise later placements are
+                  ;; rendered against shifted string indices.
+                  (when (< (length result) (aref indices column))
+                    (setq result
+                          (concat result
+                                  (make-string
+                                   (- (aref indices column) (length result))
+                                   ?\s))))
+                  (when-let* ((image
+                               (gethash (ebb-graphics-placement-image-id owner)
+                                        (ebb-graphics-state-images graphics)))
+                              (object (ebb-render--graphics-image-object
+                                       render image owner)))
+                    (let ((slice-row (+ (ebb-graphics-placement-row-offset owner)
+                                        (- model-row
+                                           (ebb-graphics-placement-row owner))))
+                          (slice-column
+                           (- start (ebb-graphics-placement-column owner))))
+                      (unless (multibyte-string-p result)
+                        (setq result (string-to-multibyte result)))
+                      (let* ((text-start (aref indices start))
+                             (text-end (max (1+ text-start)
+                                            (aref indices column))))
+                        (when (< (length result) text-end)
+                          (setq result
+                                (concat result
+                                        (make-string
+                                         (- text-end (length result)) ?\s))))
+                        (put-text-property
+                         text-start text-end 'display
+                         (list (list 'slice
+                                     (* slice-column cell-width)
+                                     (* slice-row cell-height)
+                                     (* (- column start) cell-width)
+                                     cell-height)
+                               object)
+                         result)))))
+              (cl-incf column)))))
+      )
+      (ebb-render--apply-virtual-graphics
+       render row result graphics cell-width cell-height absolute))))
+
 ;;;; ---- Display Line Rendering -----------------------------------------
 
 (defun ebb-render--trim-trailing (string)
@@ -982,8 +1719,10 @@ empty padding significant."
                          (marker-position
                           (ebb-render-state-region-end render))))
                (new (ebb-render--trim-trailing
-                     (ebb-render--apply-line-metadata
-                      line (ebb-render--line-to-string line width)))))
+                     (ebb-render--apply-graphics
+                      render row
+                      (ebb-render--apply-line-metadata
+                       line (ebb-render--line-to-string line width))))))
           ;; TUI programs often repaint rows with identical content.  Avoid a
           ;; buffer modification when the rendered text/properties are already
           ;; correct; cursor overlay movement is handled separately.
@@ -1341,6 +2080,7 @@ visibility."
   "Clear theme-derived caches and fully redraw live Ebb render states."
   (fillarray ebb-render--indexed-color-cache nil)
   (clrhash ebb-render--attr-face-cache)
+  (setq ebb-render--graphics-background-cache nil)
   (when (boundp 'ebb--render)
     (dolist (buffer (buffer-list))
       (when (buffer-live-p buffer)
@@ -1414,15 +2154,21 @@ Used after resize when the display area size has changed."
                                  (min total (+ (apply #'max rows) capacity))
                                total))
                  (count (min (- total start)
-                             (max capacity (- needed-end start)))))
+                             (max capacity (- needed-end start))))
+                 ;; One signature for the whole slab: it is identical for
+                 ;; every row of a single rebuild.
+                 (graphics-signature
+                  (ebb-render--history-graphics-signature screen)))
             (dotimes (offset count)
               (insert (ebb-render--history-row-string
-                       render (+ start offset))))
+                       render (+ start offset) graphics-signature)))
             (setf (ebb-render-state-history-start-row render) start
                   (ebb-render-state-scrollback-count render) count
                   (ebb-render-state-history-total-rows render) total
                   (ebb-render-state-history-generation render)
-                  (ebb-screen-history-generation screen)))
+                  (ebb-screen-history-generation screen)
+                  (ebb-render-state-history-graphics-generation render)
+                  (ebb-render--history-graphics-signature screen)))
           ;; Place display-begin marker
           (let ((m (ebb-render-state-display-begin render)))
             (set-marker m (point))
@@ -1434,8 +2180,10 @@ Used after resize when the display area size has changed."
             (let ((line (ebb-screen-get-line screen i)))
               (insert (if line
                           (ebb-render--trim-trailing
-                           (ebb-render--apply-line-metadata
-                            line (ebb-render--line-to-string line w)))
+                           (ebb-render--apply-graphics
+                            render i
+                            (ebb-render--apply-line-metadata
+                             line (ebb-render--line-to-string line w))))
                         ""))
               (when (< i (1- h))
                 (insert "\n"))))
@@ -1518,8 +2266,10 @@ Used after resize when the display area size has changed."
               (let ((line (ebb-screen-get-line screen row)))
                 (insert (if line
                             (ebb-render--trim-trailing
-                             (ebb-render--apply-line-metadata
-                              line (ebb-render--line-to-string line width)))
+                             (ebb-render--apply-graphics
+                              render row
+                              (ebb-render--apply-line-metadata
+                               line (ebb-render--line-to-string line width))))
                           ""))
                 (when (< row (1- height)) (insert "\n"))))
             (set-marker-insertion-type display-begin t))
