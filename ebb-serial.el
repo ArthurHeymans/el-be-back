@@ -6,8 +6,8 @@
 ;; Maintainer: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.1.1
 ;; Keywords: terminals, serial, processes
-;; Package-Requires: ((emacs "30.1") (ebb "0.1.0"))
-;; URL: https://github.com/ArthurHeymans/ebb-serial
+;; Package-Requires: ((emacs "29.1"))
+;; URL: https://github.com/ArthurHeymans/el-be-back
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
@@ -244,27 +244,8 @@ Emacs does not currently expose a portable serial-break primitive."
     (_ (ebb-semi-char-mode))))
 
 (defun ebb-serial--create-terminal ()
-  "Create an Ebb terminal stack for the current buffer.
-Use the shared constructor when available, while remaining compatible with
-Ebb 0.1.0 as declared in `Package-Requires'."
-  (if (fboundp 'ebb-io-create-terminal)
-      (ebb-io-create-terminal (current-buffer) #'ebb--handle-event)
-    (let* ((window (or (get-buffer-window (current-buffer))
-                       (selected-window)))
-           (width (max (window-max-chars-per-line window) 10))
-           (height (max (window-body-height window) 3))
-           (screen (ebb-screen-create width height)))
-      (unless (natnump ebb-scrollback-lines)
-        (error "`ebb-scrollback-lines' must be a non-negative integer"))
-      (setf (ebb-screen-scrollback-max screen) ebb-scrollback-lines)
-      (make-ebb-io
-       :screen screen
-       :parser (ebb-parse-create screen nil #'ebb--handle-event)
-       :render (ebb-render-create screen (current-buffer))
-       :buffer (current-buffer)
-       :chunk-size ebb-chunk-size
-       :min-latency ebb-minimum-latency
-       :max-latency ebb-maximum-latency))))
+  "Create an Ebb terminal stack for the current buffer."
+  (ebb-io-create-terminal (current-buffer) #'ebb--handle-event))
 
 (defun ebb-serial--ensure-terminal ()
   "Ensure the current buffer has a Ebb terminal stack."
