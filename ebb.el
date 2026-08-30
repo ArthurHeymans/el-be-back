@@ -713,8 +713,8 @@ selected window."
   (when-let* ((proc (and ebb--io (ebb-io-process ebb--io))))
     (when (and (process-live-p proc)
                (ebb-io--pty-process-p proc))
-      (set-process-window-size
-       proc
+      (ebb-io-set-window-size
+       ebb--io proc
        (ebb-screen-height ebb--screen)
        (ebb-screen-width ebb--screen))))
   (when (and ebb--io (ebb-io-render ebb--io))
@@ -757,6 +757,11 @@ selected window."
      (ebb--sync-model-size))
     ('resize-request
      (ebb--sync-model-size))
+    ('pixel-size
+     (when ebb--render
+       (pcase (car args)
+         ('text-area (ebb-render-text-area-pixel-size ebb--render))
+         ('cell (ebb-render-cell-pixel-size ebb--render)))))
     ('process-exit
      (let ((event (car args)))
        (when (buffer-live-p (current-buffer))
