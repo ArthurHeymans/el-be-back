@@ -24,7 +24,26 @@ comparison.
 * Requirements
 
 - Emacs 29.1 or newer
-- Emacs 30.1 or newer for =ebb-serial=
+
+* Installation
+
+Ebb is not on a package archive yet.  Install it from this repository with
+=package-vc= (Emacs 29+).  The package is named =ebb=, which differs from the
+repository name, so the name must be given explicitly -- a bare URL install
+guesses the wrong package name and fails.
+
+With =use-package= (Emacs 30+):
+
+#+begin_src elisp
+(use-package ebb
+  :vc (:url "https://github.com/ArthurHeymans/el-be-back" :rev :newest))
+#+end_src
+
+Or with plain =package-vc=:
+
+#+begin_src elisp
+(package-vc-install '(ebb :url "https://github.com/ArthurHeymans/el-be-back"))
+#+end_src
 
 * Tests
 
