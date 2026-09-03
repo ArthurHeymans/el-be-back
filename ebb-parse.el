@@ -23,6 +23,20 @@
   :type 'boolean
   :group 'ebb)
 
+(defcustom ebb-report-fallback-pixel-size nil
+  "If non-nil, answer pixel queries with the configured fallback geometry.
+When nil, unknown pixel dimensions are reported as zero instead of claiming
+that the terminal uses `ebb-graphics-fallback-cell-size'."
+  :type 'boolean
+  :group 'ebb)
+
+(defcustom ebb-kitty-graphics-apc-limit (* 256 1024)
+  "Maximum bytes retained from one Kitty graphics APC control string.
+Conforming large direct transfers should use 4096-byte chunks, but a larger
+configurable bound improves compatibility with clients that send larger APCs."
+  :type 'integer
+  :group 'ebb)
+
 ;;;; ---- Data Structures ------------------------------------------------
 
 (cl-defstruct (ebb-parser (:copier nil))
@@ -31,6 +45,7 @@
   (screen nil)           ; ebb-screen to operate on
   (write-fn nil)         ; (lambda (string)) send bytes to PTY
   (emit-fn nil)          ; (lambda (type &rest args)) event callback
+  (graphics-file-media-enabled t) ; nil for remote processes
   ;; CSI collection
   (param-string "")      ; digits, semicolons, colons
   (private nil)          ; ?/>/= prefix char or nil
@@ -42,9 +57,13 @@
   (dcs-length 0)
   (dcs-params "")
   (dcs-final 0)
+  (apc-parts nil)        ; reversed single-char chunks of an APC payload
+  (apc-length 0)
+  (apc-overflow nil)
+  (apc-active nil)       ; non-nil for APC, nil for ignored SOS/PM strings
   (control-header-length 0) ; current ESC/CSI/DCS header bytes
   ;; State for ESC inside string sequences
-  (string-state nil)     ; :osc, :dcs, or :ignored when ESC seen in a string
+  (string-state nil)     ; :osc, :dcs, :apc, or :ignored after ESC in a string
   ;; Charset
   (charset-slot 0))
 
@@ -202,6 +221,10 @@ If the parameter is a sub-parameter list, return the first element."
         (ebb-parser-dcs-length parser) 0
         (ebb-parser-dcs-params parser) ""
         (ebb-parser-dcs-final parser) 0
+        (ebb-parser-apc-parts parser) nil
+        (ebb-parser-apc-length parser) 0
+        (ebb-parser-apc-overflow parser) nil
+        (ebb-parser-apc-active parser) nil
         (ebb-parser-control-header-length parser) 0
         (ebb-parser-string-state parser) nil
         (ebb-parser-charset-slot parser) 0))
@@ -236,7 +259,8 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
           (when (= ch #x9c)
             (pcase (ebb-parser-state parser)
               (:osc-string (ebb-parse--dispatch-osc parser))
-              (:dcs-passthrough (ebb-parse--dispatch-dcs parser)))
+              (:dcs-passthrough (ebb-parse--dispatch-dcs parser))
+              (:sos-pm-apc (ebb-parse--dispatch-apc parser)))
             ;; An ESC inside a string defers the dispatch to the terminator;
             ;; complete the pending string here, as the 7-bit ST (ESC \\) does.
             (when (ebb-parser-string-state parser)
@@ -291,8 +315,19 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
                         (ebb-screen-carriage-return screen)
                         (ebb-screen-index screen)
                         (cl-incf i 2)))))
-              (ebb-parse--process-char parser ch)
-              (cl-incf i)))))))
+              ;; Kitty graphics arrive as long base64 APC payloads; collect a
+              ;; whole printable run at once rather than one byte at a time.
+              (if (and (eq (ebb-parser-state parser) :sos-pm-apc)
+                       (>= ch ?\s) (< ch ?\x7f))
+                  (let ((run-start i))
+                    (while (and (< i e)
+                                (let ((c (aref string i)))
+                                  (and (>= c ?\s) (< c ?\x7f))))
+                      (cl-incf i))
+                    (ebb-parse--apc-collect
+                     parser (substring string run-start i)))
+                (ebb-parse--process-char parser ch)
+                (cl-incf i))))))))
     (- i (or start 0))))
 
 (defsubst ebb-parse--cup-coords (string start end)
@@ -433,6 +468,7 @@ only digits and semicolons."
             (:osc-string :osc)
             (:dcs-passthrough :dcs)
             (:dcs-ignored :ignored)
+            (:sos-pm-apc :apc)
             (_ nil)))
     (let ((inside-dcs (eq (ebb-parser-state parser) :dcs-passthrough)))
       (setf (ebb-parser-state parser) :escape)
@@ -447,6 +483,10 @@ only digits and semicolons."
    ;; or control string and return to the ground state.
    ((memq ch '(?\x18 ?\x1a))
     (unless (eq (ebb-parser-state parser) :ground)
+      (when (eq (ebb-parser-state parser) :sos-pm-apc)
+        (setf (ebb-graphics-state-upload
+               (ebb-screen-graphics (ebb-parser-screen parser)))
+              nil))
       (ebb-parse-cancel-sequence parser)))
 
    ;; C0 controls (0x00-0x1F) handled inline in most states
@@ -539,10 +579,14 @@ only digits and semicolons."
     (setf (ebb-parser-string-state parser) nil)
     (setf (ebb-parser-charset-slot parser) ch)
     (setf (ebb-parser-state parser) :charset-designate))
-   ;; SOS / PM / APC
+   ;; SOS / PM / APC.  Only APC is retained; SOS and PM remain ignored.
    ((memq ch '(?X ?^ ?_))
-    (setf (ebb-parser-string-state parser) nil)
-    (setf (ebb-parser-state parser) :sos-pm-apc))
+    (setf (ebb-parser-string-state parser) nil
+          (ebb-parser-apc-active parser) (= ch ?_)
+          (ebb-parser-apc-parts parser) nil
+          (ebb-parser-apc-length parser) 0
+          (ebb-parser-apc-overflow parser) nil
+          (ebb-parser-state parser) :sos-pm-apc))
    ;; Other ESC intermediate sequences, such as DECALN (ESC # 8).
    ((and (>= ch ?\s) (<= ch ?/))
     (setf (ebb-parser-string-state parser) nil)
@@ -626,10 +670,11 @@ only digits and semicolons."
       (error (ebb-parse--log "ESC dispatch error for %c: %S" ch err)))))
 
 (defun ebb-parse--complete-string (parser)
-  "Complete a pending OSC or DCS string."
+  "Complete a pending OSC, DCS, or APC string."
   (pcase (ebb-parser-string-state parser)
     (:osc (ebb-parse--dispatch-osc parser))
-    (:dcs (ebb-parse--dispatch-dcs parser))))
+    (:dcs (ebb-parse--dispatch-dcs parser))
+    (:apc (ebb-parse--dispatch-apc parser))))
 
 ;;;; ---- State: CSI Entry -----------------------------------------------
 
@@ -785,12 +830,112 @@ in process-char."
    ch)
   (setf (ebb-parser-state parser) :ground))
 
-;;;; ---- State: SOS/PM/APC (consume and ignore) ------------------------
+;;;; ---- State: SOS/PM/APC ----------------------------------------------
+
+(defun ebb-parse--apc-collect (parser chunk)
+  "Retain CHUNK of the pending APC string in PARSER, within the size bound."
+  ;; SOS and PM enter this state too, but only Kitty APC starts with G.  Retain
+  ;; a bounded prefix and let dispatch ignore all other control strings.
+  (when (and (ebb-parser-apc-active parser)
+             (not (ebb-parser-apc-overflow parser)))
+    (if (<= (+ (ebb-parser-apc-length parser) (length chunk))
+            ebb-kitty-graphics-apc-limit)
+        (progn
+          (push chunk (ebb-parser-apc-parts parser))
+          (cl-incf (ebb-parser-apc-length parser) (length chunk)))
+      ;; Retain the bounded prefix so an oversized Kitty command can receive
+      ;; an error carrying its image/placement identifiers.  The printable
+      ;; fast path can hand us the entire oversized body as one CHUNK.
+      (let ((remaining (- ebb-kitty-graphics-apc-limit
+                          (ebb-parser-apc-length parser))))
+        (when (> remaining 0)
+          (push (substring chunk 0 remaining)
+                (ebb-parser-apc-parts parser))
+          (cl-incf (ebb-parser-apc-length parser) remaining))
+        (setf (ebb-parser-apc-overflow parser) t)))))
 
 (defun ebb-parse--sos-pm-apc (parser ch)
-  "Consume SOS/PM/APC strings until ST.  ESC handled in process-char."
-  ;; Just ignore the character; ESC \ (ST) transitions via :escape state
-  (ignore parser ch))
+  "Consume SOS/PM/APC strings until ST.  Retain bounded Kitty APC data."
+  ;; VT500 ignores C0 controls in this state (CAN/SUB and ESC are handled by
+  ;; the outer dispatcher).
+  (when (>= ch ?\s)
+    (ebb-parse--apc-collect parser (string ch))))
+
+(defun ebb-parse--dispatch-apc (parser)
+  "Dispatch a completed APC control string."
+  (let ((active (ebb-parser-apc-active parser))
+        (overflow (ebb-parser-apc-overflow parser))
+        (payload (apply #'concat
+                        (nreverse (ebb-parser-apc-parts parser)))))
+    (setf (ebb-parser-apc-parts parser) nil
+          (ebb-parser-apc-length parser) 0
+          (ebb-parser-apc-overflow parser) nil
+          (ebb-parser-apc-active parser) nil)
+    (when active
+      (condition-case err
+          (let* ((screen (ebb-parser-screen parser))
+                 (graphics (ebb-screen-graphics screen))
+                 (generation (ebb-graphics-state-generation graphics))
+                 (old-placements
+                  (mapcar
+                   (lambda (placement)
+                     (list (ebb-graphics-placement-virtual placement)
+                           (ebb-graphics-placement-row placement)
+                           (ebb-graphics-placement-rows placement)))
+                   (ebb-graphics-state-placements graphics)))
+                 (row-base (if (ebb-screen-alt-screen screen)
+                               0
+                             (ebb-screen-history-row-count screen)))
+                 effect)
+            (setq effect
+                  (if overflow
+                (ebb-graphics-process-overflow
+                 graphics payload
+                 (lambda (response) (ebb-parse--respond parser response)))
+              (ebb-graphics-process-apc
+               graphics payload
+               (lambda (response) (ebb-parse--respond parser response))
+               (+ row-base (ebb-screen-cursor-y screen))
+               (ebb-screen-cursor-x screen)
+               (ebb-parse--emit parser 'pixel-size 'cell)
+               row-base (ebb-screen-height screen)
+               (ebb-parser-graphics-file-media-enabled parser)
+               (ebb-screen-width screen))))
+            ;; Like kitty, leave the cursor on the placement's last row, just
+            ;; past its right edge, clamped to the screen.
+            (when-let* ((placement (cdr-safe effect)))
+              (when (and (not (ebb-graphics-placement-virtual placement))
+                         (zerop (ebb-graphics-placement-cursor-policy placement)))
+                (ebb-screen-cursor-goto
+                 screen
+                 (+ (- (ebb-graphics-placement-row placement) row-base)
+                    (1- (ebb-graphics-placement-rows placement)))
+                 (+ (ebb-graphics-placement-column placement)
+                    (ebb-graphics-placement-columns placement)))))
+            (unless (= generation (ebb-graphics-state-generation graphics))
+              (let ((placements
+                     (append
+                      old-placements
+                      (mapcar
+                       (lambda (placement)
+                         (list (ebb-graphics-placement-virtual placement)
+                               (ebb-graphics-placement-row placement)
+                               (ebb-graphics-placement-rows placement)))
+                       (ebb-graphics-state-placements graphics)))))
+                (if (cl-some #'car placements)
+                    ;; Placeholder characters can be moved independently of
+                    ;; their virtual prototype, so conservatively revisit the
+                    ;; viewport when a virtual placement changes.
+                    (dotimes (row (ebb-screen-height screen))
+                      (ebb--mark-dirty screen row))
+                  (dolist (range placements)
+                    (let ((start (max 0 (- (nth 1 range) row-base)))
+                          (end (min (ebb-screen-height screen)
+                                    (- (+ (nth 1 range) (nth 2 range))
+                                       row-base))))
+                      (cl-loop for row from start below end
+                               do (ebb--mark-dirty screen row))))))))
+        (error (ebb-parse--log "APC dispatch error: %S" err))))))
 
 ;;;; ---- CSI Dispatch Table ---------------------------------------------
 
@@ -1356,6 +1501,32 @@ Pm=1: read, Pm=4: read maximum."
       ((and value (guard (>= value 24)))
        (puthash screen (ebb-parse--param params 0 24)
                 ebb-parse--page-lengths))
+      ;; Report text-area size in pixels.
+      (14
+       (let* ((reported-cell
+               (ebb-graphics-normalize-cell-size
+                (ebb-parse--emit parser 'pixel-size 'cell)))
+              (cell (or reported-cell
+                        (and ebb-report-fallback-pixel-size
+                             (ebb-graphics-normalize-cell-size
+                              ebb-graphics-fallback-cell-size))))
+              (size (or (ebb-parse--emit parser 'pixel-size 'text-area)
+                        (and cell
+                             (cons (* (ebb-screen-width screen) (car cell))
+                                   (* (ebb-screen-height screen) (cdr cell))))
+                        '(0 . 0))))
+         (ebb-parse--respond parser
+                            (format "\e[4;%d;%dt" (cdr size) (car size)))))
+      ;; Report terminal cell size in pixels.
+      (16
+       (let ((size (or (ebb-graphics-normalize-cell-size
+                        (ebb-parse--emit parser 'pixel-size 'cell))
+                       (and ebb-report-fallback-pixel-size
+                            (ebb-graphics-normalize-cell-size
+                             ebb-graphics-fallback-cell-size))
+                       '(0 . 0))))
+         (ebb-parse--respond parser
+                            (format "\e[6;%d;%dt" (cdr size) (car size)))))
       ;; Report terminal size in chars.
       (18 (ebb-parse--respond
            parser

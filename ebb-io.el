@@ -21,6 +21,7 @@
 (cl-defstruct (ebb-io (:copier nil))
   "Async I/O state for a ebb terminal."
   (process nil)           ; the PTY process
+  (remote nil)            ; non-nil when the process runs through TRAMP
   (parser nil)            ; ebb-parser
   (screen nil)            ; ebb-screen
   (render nil)            ; ebb-render-state
@@ -39,6 +40,8 @@
   (first-chunk-time nil)  ; float time of first unrendered chunk
   (render-timer nil)      ; pending render timer
   (sync-timer nil)        ; synchronized-output (DEC 2026) flush timer
+  (pixel-size-timer nil)  ; coalesced PTY pixel-size update
+  (pixel-size-error nil)  ; first helper failure; disables later attempts
   ;; Error reporting
   (last-processing-error nil)
   (processing-error-count 0))
@@ -79,6 +82,20 @@ Ensures responsiveness."
   "Maximum seconds to hold a frame held by synchronized output (DEC 2026).
 An application that enables synchronized output but never disables it
 only delays its redraw by this long."
+  :type 'number
+  :group 'ebb)
+
+(defcustom ebb-report-pixel-size t
+  "Report the terminal's pixel size through the PTY (TIOCGWINSZ).
+Emacs only sets rows and columns on the PTY.  When non-nil, Ebb runs a
+small python3 or perl helper after settled resizes to fill in the pixel fields
+that graphics clients such as `kitten icat' read.  Ignored for remote
+terminals and when neither interpreter is available."
+  :type 'boolean
+  :group 'ebb)
+
+(defcustom ebb-pixel-size-idle-delay 0.05
+  "Idle seconds used to coalesce repeated PTY pixel-size updates."
   :type 'number
   :group 'ebb)
 
@@ -432,6 +449,114 @@ so the connection is detected through the allocated terminal instead."
        (process-tty-name process)
        t))
 
+;;;; ---- PTY size ------------------------------------------------------
+
+(defconst ebb-io--pixel-size-python
+  "import fcntl, os, struct, sys, termios
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOCTTY)
+rows, cols, cw, ch = map(int, sys.argv[2:6])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, min(65535, cols * cw), min(65535, rows * ch)))"
+  "Python program filling in the PTY pixel size from a cell size.")
+
+(defconst ebb-io--pixel-size-perl
+  "use Fcntl;
+my ($tty, $rows, $cols, $cw, $ch) = @ARGV;
+my $set = eval { require 'sys/ioctl.ph'; &TIOCSWINSZ } || ($^O eq 'linux' ? 0x5414 : 0x80087467);
+sysopen(my $t, $tty, O_RDWR | O_NOCTTY) or exit 1;
+my $px = $cols * $cw > 65535 ? 65535 : $cols * $cw;
+my $py = $rows * $ch > 65535 ? 65535 : $rows * $ch;
+ioctl($t, $set, pack('S4', $rows, $cols, $px, $py)) or exit 1;"
+  "Perl program filling in the PTY pixel size from a cell size.")
+
+(defvar ebb-io--pixel-size-helper 'unknown
+  "Command prefix of the pixel-size helper, or nil when none is available.")
+
+(defun ebb-io--pixel-size-helper ()
+  "Return the command prefix of an available pixel-size helper, or nil."
+  (when (eq ebb-io--pixel-size-helper 'unknown)
+    ;; Cache a discovered helper, but retry later when none is currently on
+    ;; PATH (for example after entering a development environment).
+    (let ((helper
+           (cond
+            ((executable-find "python3")
+             (list "python3" "-c" ebb-io--pixel-size-python))
+            ((executable-find "perl")
+             (list "perl" "-e" ebb-io--pixel-size-perl)))))
+      (when helper (setq ebb-io--pixel-size-helper helper))))
+  (unless (eq ebb-io--pixel-size-helper 'unknown)
+    ebb-io--pixel-size-helper))
+
+(defun ebb-io--cancel-pixel-size-timer (io)
+  "Cancel IO's pending pixel-size helper launch."
+  (when (ebb-io-pixel-size-timer io)
+    (cancel-timer (ebb-io-pixel-size-timer io))
+    (setf (ebb-io-pixel-size-timer io) nil)))
+
+(defun ebb-io--disable-pixel-size (io error)
+  "Record ERROR on IO and disable further pixel-size attempts."
+  (unless (ebb-io-pixel-size-error io)
+    (setf (ebb-io-pixel-size-error io) error)
+    (message "[ebb] PTY pixel-size reporting disabled: %s" error)))
+
+(defun ebb-io--pixel-size-sentinel (io process _event)
+  "Record PROCESS failure on IO and disable further pixel-size attempts."
+  (when (memq (process-status process) '(exit signal))
+    (unless (zerop (process-exit-status process))
+      (ebb-io--disable-pixel-size
+       io (format "helper exited with status %d"
+                  (process-exit-status process))))))
+
+(defun ebb-io--report-pixel-size (io process tty helper height width cell)
+  "Launch IO's pixel-size HELPER for PROCESS on TTY using HEIGHT and WIDTH.
+CELL is the normalized cell size captured when the resize was scheduled,
+so the helper never combines settled rows and columns with a newer cell
+geometry."
+  (setf (ebb-io-pixel-size-timer io) nil)
+  (when (and (not (ebb-io-pixel-size-error io))
+             (eq process (ebb-io-process io))
+             (process-live-p process))
+    (let ((default-directory temporary-file-directory))
+      (condition-case error
+          (make-process
+           :name "ebb-pixel-size"
+           :command (append helper
+                            (list tty
+                                  (number-to-string height)
+                                  (number-to-string width)
+                                  (number-to-string (car cell))
+                                  (number-to-string (cdr cell))))
+           :buffer nil :connection-type 'pipe :noquery t
+           :sentinel (lambda (helper-process event)
+                       (ebb-io--pixel-size-sentinel io helper-process event)))
+        (error
+         (ebb-io--disable-pixel-size io (error-message-string error)))))))
+
+(defun ebb-io-set-window-size (io process height width)
+  "Resize the PTY of PROCESS to HEIGHT rows and WIDTH columns.
+Rows and columns are always applied synchronously so the child never
+observes a stale size.  When the pixel size is known and
+`ebb-report-pixel-size' allows it, additionally schedule a coalesced
+helper that records the pixel dimensions on the PTY."
+  (ebb-io--cancel-pixel-size-timer io)
+  ;; The base resize must happen even when pixel reporting is enabled:
+  ;; the helper only augments the size later, and any helper failure
+  ;; must not drop the pending row/column update.
+  (set-process-window-size process height width)
+  (when-let* ((ebb-report-pixel-size)
+              ((not (ebb-io-pixel-size-error io)))
+              ((not (ebb-io-remote io)))
+              ((display-graphic-p))
+              (render (ebb-io-render io))
+              (cell (ebb-graphics-normalize-cell-size
+                     (ebb-render-cell-pixel-size render)))
+              (tty (process-tty-name process))
+              (helper (ebb-io--pixel-size-helper)))
+    (setf (ebb-io-pixel-size-timer io)
+          (run-with-idle-timer
+           ebb-pixel-size-idle-delay nil
+           #'ebb-io--report-pixel-size
+           io process tty helper height width cell))))
+
 (defun ebb-io-start (io shell-command buffer &optional extra-env)
   "Start a terminal process running SHELL-COMMAND in BUFFER.
 EXTRA-ENV is an optional list of \"VAR=VALUE\" strings to add to
@@ -481,9 +606,12 @@ local paths), and TERM is chosen by an on-remote probe; see
                           (ebb-io--filter io proc output))
                 :sentinel (lambda (proc event)
                             (ebb-io--sentinel io proc event)))))
+    (setf (ebb-io-remote io) remote)
+    (setf (ebb-parser-graphics-file-media-enabled (ebb-io-parser io))
+          (not remote))
     ;; Set initial PTY size.
     (when (ebb-io--pty-process-p proc)
-      (set-process-window-size proc h w))
+      (ebb-io-set-window-size io proc h w))
     ;; Wire up response writing
     (setf (ebb-parser-write-fn (ebb-io-parser io))
           (lambda (s) (ebb-io-send io s)))
@@ -509,10 +637,16 @@ local paths), and TERM is chosen by an on-remote probe; see
   "Attach IO to existing PROCESS in BUFFER without replacing its handlers.
 Eshell owns PROCESS's filter, sentinel, and bookkeeping; its output hook feeds
 Ebb through `ebb-io--filter'."
-  (setf (ebb-io-process io) process
-        (ebb-io-buffer io) buffer
-        (ebb-parser-write-fn (ebb-io-parser io))
-        (lambda (string) (ebb-io-send io string)))
+  (let ((remote (and (buffer-live-p buffer)
+                     (with-current-buffer buffer
+                       (and (file-remote-p default-directory) t)))))
+    (setf (ebb-io-process io) process
+          (ebb-io-buffer io) buffer
+          (ebb-io-remote io) remote
+          (ebb-parser-graphics-file-media-enabled (ebb-io-parser io))
+          (not remote)
+          (ebb-parser-write-fn (ebb-io-parser io))
+          (lambda (string) (ebb-io-send io string))))
   process)
 
 (defun ebb-io--sentinel (io proc event)
@@ -529,6 +663,7 @@ Ebb through `ebb-io--filter'."
           (cancel-timer (ebb-io-render-timer io))
           (setf (ebb-io-render-timer io) nil))
         (ebb-io--cancel-sync-timer io)
+        (ebb-io--cancel-pixel-size-timer io)
         ;; Flush remaining output.
         (when (ebb-io--pending-p io)
           (ebb-io--process-pending io t))
@@ -588,7 +723,7 @@ queued output so the interrupted program's prompt is not stuck behind it."
       (when-let* ((proc (ebb-io-process io)))
         (when (and (process-live-p proc)
                    (ebb-io--pty-process-p proc))
-          (set-process-window-size proc new-height new-width)))
+          (ebb-io-set-window-size io proc new-height new-width)))
       ;; Step 3: A minibuffer only changes height.  Rebuild its viewport,
       ;; not thousands of unchanged scrollback rows.
       (when (ebb-io-render io)
@@ -604,6 +739,7 @@ queued output so the interrupted program's prompt is not stuck behind it."
     (cancel-timer (ebb-io-render-timer io))
     (setf (ebb-io-render-timer io) nil))
   (ebb-io--cancel-sync-timer io)
+  (ebb-io--cancel-pixel-size-timer io)
   (when-let* ((proc (ebb-io-process io)))
     (when (process-live-p proc)
       (delete-process proc))
