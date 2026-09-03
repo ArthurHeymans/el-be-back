@@ -1266,7 +1266,13 @@ hint at the live terminal position."
           (progn
             (overlay-put ov 'face nil)
             (overlay-put ov 'after-string nil)
-            (setq-local cursor-type nil))
+            (if emacs-mode
+                ;; Emacs mode uses the native cursor for navigation;
+                ;; a hidden terminal cursor (DECTCEM, e.g. fullscreen
+                ;; TUIs) must not hide it.  Only the overlay hint goes away.
+                (setq-local cursor-type
+                            (ebb-render--cursor-type-for-style style))
+              (setq-local cursor-type nil)))
         (let* ((region-end (marker-position
                             (ebb-render-state-region-end render)))
                pos after-string)
