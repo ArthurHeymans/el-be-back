@@ -2863,9 +2863,9 @@ LINE must already span WIDTH columns."
 
 ;;;; ---- Alternate Screen -----------------------------------------------
 
-(defun ebb--resize-alt-save (saved new-width new-height)
-  "Resize SAVED's main-screen model while the alternate screen is active.
-NEW-WIDTH and NEW-HEIGHT give the new dimensions."
+(defun ebb--resize-alt-save (saved new-width new-height &optional alternate)
+  "Resize SAVED's inactive screen model to NEW-WIDTH and NEW-HEIGHT.
+When ALTERNATE is non-nil, resize without main-screen reflow."
   (let ((main (ebb-screen--make
                :lines (ebb-alt-save-lines saved)
                :width (ebb-alt-save-width saved)
@@ -2883,7 +2883,14 @@ NEW-WIDTH and NEW-HEIGHT give the new dimensions."
                :history-next-id (ebb-alt-save-history-next-id saved)
                :history-generation (ebb-alt-save-history-generation saved)
                :auto-wrap (ebb-alt-save-auto-wrap saved))))
-    (ebb-screen-resize main new-width new-height)
+    (if alternate
+        (progn
+          (ebb--resize-alt-screen
+           main (ebb--ordered-lines-vector main) (ebb-screen-width main)
+           (ebb-screen-pending-wrap main) new-width new-height)
+          (setf (ebb-screen-scroll-top main) 0
+                (ebb-screen-scroll-bottom main) (1- new-height)))
+      (ebb-screen-resize main new-width new-height))
     (setf (ebb-alt-save-lines saved) (ebb-screen-lines main)
           (ebb-alt-save-width saved) (ebb-screen-width main)
           (ebb-alt-save-height saved) (ebb-screen-height main)
@@ -3170,10 +3177,12 @@ DECCOLM clears the display, restores full-screen margins, and homes the cursor."
      (if value
          (ebb-screen-enter-alt screen)
        (ebb-screen-leave-alt screen)))
-    (1047 ;; Alt screen only (no cursor save, no clear)
+    (1047 ;; Alt screen only; reset clears the alternate grid.
      (if value
          (ebb-screen-enter-alt screen)
-       (ebb-screen-leave-alt screen)))
+       (when (ebb-screen-alt-screen screen)
+         (ebb-screen-leave-alt screen)
+         (remhash screen ebb--alt-saved-grid))))
     (1048 ;; Cursor save only
      (if value
          (ebb-screen-save-cursor screen)
@@ -3335,6 +3344,8 @@ Reflow main-screen lines, preserve the logical cursor, and reset the region."
                  (/= new-height (ebb-screen-height screen))))
     (when-let* ((saved (ebb-screen-alt-screen screen)))
       (ebb--resize-alt-save saved new-width new-height))
+    (when-let* ((saved (gethash screen ebb--alt-saved-grid)))
+      (ebb--resize-alt-save saved new-width new-height t))
     (when (ebb-screen-scrollback screen)
       (setf (ebb-screen-scrollback-dirty screen) t)
       (ebb--history-changed screen))

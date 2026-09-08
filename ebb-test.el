@@ -6196,6 +6196,37 @@ cell is 9x18 unless overridden."
     (ebb-test-output parser "\e[?47h")
     (should (equal "alt" (ebb-test-display-line screen 0)))))
 
+(ert-deftest ebb-test-inactive-alt-screen-resize ()
+  "Resize retained alternate grids without reflow, including cursor and margins."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e[?47h\e[Habcdefghij\e[2;3r\e[3;10H\e[?47l")
+    (ebb-screen-resize screen 12 5)
+    (ebb-test-output parser "\e[?47h")
+    (should (= 5 (length (ebb-screen-lines screen))))
+    (should (equal "abcdefghij" (ebb-test-display-line screen 0)))
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 4 (ebb-screen-scroll-bottom screen)))
+    (ebb-test-output parser "\e[5;12HX\e[?47l")
+    (ebb-screen-resize screen 4 2)
+    (ebb-test-output parser "\e[?47h")
+    (should (= 2 (length (ebb-screen-lines screen))))
+    (should (equal "abcd" (ebb-test-display-line screen 0)))
+    (should (= 3 (ebb-screen-cursor-x screen)))
+    (should (= 1 (ebb-screen-cursor-y screen)))
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 1 (ebb-screen-scroll-bottom screen)))
+    (ebb-test-output parser "\e[2;4HY")
+    (should (equal "   Y" (ebb-test-display-line screen 1)))))
+
+(ert-deftest ebb-test-alt-screen-mode-1047-clears-on-reset ()
+  "DECRST 1047 clears alternate contents, unlike DECRST 47."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "main\e[?1047h\e[HSECRET\e[?1047l")
+    (should (equal "main" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[?47h")
+    (dotimes (row 3)
+      (should (equal "" (ebb-test-display-line screen row))))))
+
 (ert-deftest ebb-test-cwd-to-path-rejects-untrusted-tramp-dir ()
   "A local terminal cannot adopt a TRAMP-shaped OSC 7 path by default."
   (with-temp-buffer
