@@ -420,13 +420,16 @@ Return (PARAMS DATA ROW COLUMN CELL-SIZE), nil while pending, or an error."
      (t
       (if-let* ((upload (and continuation
                              (ebb-graphics-state-upload state))))
-          (let ((initial (ebb-graphics-upload-params upload))
-                (chunks (nreverse (cons decoded
-                                         (ebb-graphics-upload-chunks upload)))))
+          (progn
             (setf (ebb-graphics-state-upload state) nil)
-            ;; Kitty defines the final chunk's cursor and cell geometry as the
-            ;; placement anchor for a chunked transmit-and-display command.
-            (list initial (apply #'concat chunks) row column cell-size))
+            (if (> (+ (ebb-graphics-upload-byte-count upload) (length decoded))
+                   ebb-kitty-graphics-image-limit)
+                (ebb-graphics--error "EFBIG:image data too large")
+              (let ((initial (ebb-graphics-upload-params upload))
+                    (chunks (nreverse
+                             (cons decoded (ebb-graphics-upload-chunks upload)))))
+                ;; The final packet supplies the placement anchor and geometry.
+                (list initial (apply #'concat chunks) row column cell-size))))
         (setf (ebb-graphics-state-upload state) nil)
         (list params decoded row column cell-size))))))
 

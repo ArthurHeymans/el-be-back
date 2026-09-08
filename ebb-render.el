@@ -367,7 +367,8 @@ RGBA graphics.  PNG and RGB images are unaffected."
   (graphics-placement-order nil)
   (graphics-layout-cache nil)
   (placeholder-row-cache nil)
-  (placeholder-history-row-cache nil))
+  (placeholder-history-row-cache nil)
+  (placeholder-history-key nil))
 
 ;;;; ---- Constructor ----------------------------------------------------
 
@@ -459,15 +460,7 @@ state are reconciled independently so metadata-only updates are visible."
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
-            ;; Placeholder row prefixes depend on viewport text and are shared
-            ;; by every dirty row rendered in this refresh.
-            (clrhash (or (ebb-render-state-placeholder-row-cache render)
-                         (setf (ebb-render-state-placeholder-row-cache render)
-                               (make-hash-table :test #'eql))))
-            (clrhash
-             (or (ebb-render-state-placeholder-history-row-cache render)
-                 (setf (ebb-render-state-placeholder-history-row-cache render)
-                       (make-hash-table :test #'eql))))
+            (ebb-render--prepare-placeholder-caches render)
             ;; Reconcile scrollback independently of dirty display rows.
             (ebb-render--update-scrollback render)
             ;; Render dirty display lines.
@@ -1125,24 +1118,27 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
         rgb))))
 
 (defun ebb-render--graphics-raw-png-helper (image)
-  "Encode raw RGB or RGBA IMAGE as PNG using native zlib operations."
-  (when-let* ((python (executable-find "python3")))
+  "Encode raw RGB or RGBA IMAGE as PNG locally, or return nil on failure."
+  (when-let* ((default-directory temporary-file-directory)
+              (python (executable-find "python3")))
     (with-temp-buffer
       (set-buffer-multibyte nil)
       (insert (ebb-graphics-image-data image))
       (let ((status
-             (call-process-region
-              (point-min) (point-max) python t t nil "-c"
-              (concat
-               "import binascii,struct,sys,zlib\n"
-               "w,h,c=map(int,sys.argv[1:4]); src=sys.stdin.buffer.read(); stride=w*c\n"
-               "raw=b''.join(b'\\0'+src[y*stride:(y+1)*stride] for y in range(h))\n"
-               "def chunk(t,d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',binascii.crc32(t+d)&0xffffffff)\n"
-               "ihdr=struct.pack('>IIBBBBB',w,h,8,2 if c==3 else 6,0,0,0)\n"
-               "sys.stdout.buffer.write(b'\\x89PNG\\r\\n\\x1a\\n'+chunk(b'IHDR',ihdr)+chunk(b'IDAT',zlib.compress(raw,1))+chunk(b'IEND',b''))\n")
-              (number-to-string (ebb-graphics-image-width image))
-              (number-to-string (ebb-graphics-image-height image))
-              (number-to-string (/ (ebb-graphics-image-format image) 8)))))
+             (condition-case nil
+                 (call-process-region
+                  (point-min) (point-max) python t t nil "-c"
+                  (concat
+                   "import binascii,struct,sys,zlib\n"
+                   "w,h,c=map(int,sys.argv[1:4]); src=sys.stdin.buffer.read(); stride=w*c\n"
+                   "raw=b''.join(b'\\0'+src[y*stride:(y+1)*stride] for y in range(h))\n"
+                   "def chunk(t,d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',binascii.crc32(t+d)&0xffffffff)\n"
+                   "ihdr=struct.pack('>IIBBBBB',w,h,8,2 if c==3 else 6,0,0,0)\n"
+                   "sys.stdout.buffer.write(b'\\x89PNG\\r\\n\\x1a\\n'+chunk(b'IHDR',ihdr)+chunk(b'IDAT',zlib.compress(raw,1))+chunk(b'IEND',b''))\n")
+                  (number-to-string (ebb-graphics-image-width image))
+                  (number-to-string (ebb-graphics-image-height image))
+                  (number-to-string (/ (ebb-graphics-image-format image) 8)))
+               (error nil))))
         (and (eq status 0) (buffer-string))))))
 
 (defun ebb-render--graphics-ppm-data (image background)
@@ -1362,15 +1358,37 @@ ROW addresses history when ABSOLUTE is non-nil."
       (cl-incf column))
     found))
 
+(defun ebb-render--sync-placeholder-history-cache (render)
+  "Retain RENDER's history prefixes until their model or geometry changes."
+  (let* ((screen (ebb-render-state-screen render))
+         (graphics (ebb-screen-graphics screen))
+         (key (list screen (ebb-screen-history-generation screen)
+                    (ebb-screen-width screen) graphics
+                    (ebb-graphics-state-generation graphics)))
+         (cache (or (ebb-render-state-placeholder-history-row-cache render)
+                    (setf (ebb-render-state-placeholder-history-row-cache render)
+                          (make-hash-table :test #'eql)))))
+    (unless (equal key (ebb-render-state-placeholder-history-key render))
+      (clrhash cache)
+      (setf (ebb-render-state-placeholder-history-key render) key))
+    cache))
+
+(defun ebb-render--prepare-placeholder-caches (render)
+  "Prepare placeholder prefixes before any viewport rebuild of RENDER.
+Viewport text can change without graphics changes; history is generation-keyed
+so repeated refreshes and slab rebuilds do not rescan unchanged scrollback."
+  (clrhash (or (ebb-render-state-placeholder-row-cache render)
+               (setf (ebb-render-state-placeholder-row-cache render)
+                     (make-hash-table :test #'eql))))
+  (ebb-render--sync-placeholder-history-cache render))
+
 (defun ebb-render--placeholder-tile-row
     (render screen graphics row placement &optional absolute)
   "Return PLACEMENT's tile row before ROW, caching line prefixes.
 ROW addresses history when ABSOLUTE is non-nil."
   (let* ((cache
           (if absolute
-              (or (ebb-render-state-placeholder-history-row-cache render)
-                  (setf (ebb-render-state-placeholder-history-row-cache render)
-                        (make-hash-table :test #'eql)))
+              (ebb-render--sync-placeholder-history-cache render)
             (or (ebb-render-state-placeholder-row-cache render)
                 (setf (ebb-render-state-placeholder-row-cache render)
                       (make-hash-table :test #'eql)))))
@@ -2189,6 +2207,7 @@ Used after resize when the display area size has changed."
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
+            (ebb-render--prepare-placeholder-caches render)
             (goto-char (ebb-render-state-region-begin render))
             (delete-region (point)
                            (ebb-render-state-region-end render))
@@ -2315,6 +2334,7 @@ Used after resize when the display area size has changed."
                            when (>= (window-point window)
                                     (marker-position display-begin))
                            collect window))))
+          (ebb-render--prepare-placeholder-caches render)
           (ebb-render--update-scrollback render)
           (save-excursion
             (goto-char display-begin)

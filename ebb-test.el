@@ -1786,6 +1786,31 @@ Binds `screen' and `parser' in BODY."
   "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGP4zwAE/wEHAAH/4iOeWQAAAABJRU5ErkJggg=="
   "A 2x1 RGB PNG (red, blue) as base64.")
 
+(ert-deftest ebb-test-kitty-final-chunk-enforces-total-limit ()
+  "Individually valid chunks must also fit the aggregate per-image quota."
+  (dolist (excess '(0 1))
+    (ebb-test-with-screen (:width 20 :height 6)
+      (let* ((data (base64-decode-string ebb-test-kitty-png-base64))
+             (middle (/ (length data) 2))
+             (ebb-kitty-graphics-image-limit (- (length data) excess))
+             (graphics (ebb-screen-graphics screen))
+             responses)
+        (setf (ebb-parser-write-fn parser) (lambda (s) (push s responses)))
+        (ebb-test-output parser
+                         (format "\e_Ga=t,f=100,i=9,m=1;%s\e\\"
+                                 (base64-encode-string (substring data 0 middle) t)))
+        (should (ebb-graphics-state-upload graphics))
+        (ebb-test-output parser
+                         (format "\e_Gm=0;%s\e\\"
+                                 (base64-encode-string (substring data middle) t)))
+        (should-not (ebb-graphics-state-upload graphics))
+        (if (zerop excess)
+            (should (equal data (ebb-graphics-image-data
+                                 (gethash 9 (ebb-graphics-state-images graphics)))))
+          (should-not (gethash 9 (ebb-graphics-state-images graphics)))
+          (should (= 0 (ebb-graphics-state-byte-count graphics)))
+          (should (string-match-p "EFBIG" (car responses))))))))
+
 (ert-deftest ebb-test-parse-kitty-direct-png-transmit ()
   "A direct PNG transmission is retained with its IHDR dimensions."
   (ebb-test-with-screen (:width 20 :height 6)
@@ -1878,7 +1903,7 @@ Binds `screen' and `parser' in BODY."
 
 (ert-deftest ebb-test-parse-kitty-zlib-payload ()
   "An o=z payload is inflated before validation and storage."
-  (skip-unless (zlib-available-p))
+  (skip-unless (executable-find "python3"))
   (ebb-test-with-screen (:width 20 :height 6)
     (let ((compressed (unibyte-string 120 156 99 100 98 6 0 0 13 0 7))
           responses)
@@ -1955,6 +1980,7 @@ Binds `screen' and `parser' in BODY."
 
 (ert-deftest ebb-test-parse-kitty-file-mediums ()
   "File mediums read regular files, delete temporary ones, refuse sensitive paths."
+  (skip-unless (executable-find "python3"))
   (ebb-test-with-screen (:width 20 :height 6)
     (let* ((ebb-kitty-graphics-allow-files t)
            (temporary (make-temp-file "tty-graphics-protocol-ebb"))
@@ -2046,6 +2072,7 @@ Binds `screen' and `parser' in BODY."
 
 (ert-deftest ebb-test-parse-kitty-shared-memory-medium ()
   "The t=s medium reads and unlinks a local POSIX shared-memory object."
+  (skip-unless (executable-find "python3"))
   (skip-unless (file-writable-p "/dev/shm"))
   (let* ((name (format "ebb-kitty-%d" (emacs-pid)))
          (path (expand-file-name name "/dev/shm"))
@@ -2909,6 +2936,87 @@ The shared quota is conservative: a full main screen leaves an
             (should (string-match-p
                      (format "<image x='0' y='0' width='%d' height='%d'"
                              (cdr size) (cdr size)) svg))))))))
+
+(ert-deftest ebb-test-render-kitty-helper-errors-use-local-ppm-fallback ()
+  "A failed local PNG helper cannot interrupt rendering a remote terminal."
+  (dolist (failure '(signal exit))
+    (let* ((default-directory "/ssh:unreachable:/missing/")
+           (image (make-ebb-graphics-image
+                   :format 24 :width 1 :height 1 :data (unibyte-string 1 2 3)))
+           (placement (make-ebb-graphics-placement
+                       :columns 1 :rows 1 :pixel-width 1 :pixel-height 1))
+           (render (make-ebb-render-state :graphics-cache (make-hash-table :test #'equal)))
+           called)
+      (cl-letf (((symbol-function 'executable-find)
+                 (lambda (_)
+                   (should (equal default-directory temporary-file-directory))
+                   "/mock/python3"))
+                ((symbol-function 'call-process-region)
+                 (lambda (&rest _)
+                   (setq called t)
+                   (should (equal default-directory temporary-file-directory))
+                   (if (eq failure 'signal)
+                       (signal 'file-error '("Helper disappeared"))
+                     1)))
+                ((symbol-function 'ebb-render-cell-pixel-size) (lambda (_) '(8 . 16)))
+                ((symbol-function 'create-image)
+                 (lambda (data type &rest _)
+                   (should (eq type 'pbm))
+                   (should (string-prefix-p "P6\n1 1\n255\n" data))
+                   'mock-image)))
+        (should (eq 'mock-image (ebb-render--graphics-image-object render image placement)))
+        (should called)))))
+
+(ert-deftest ebb-test-render-kitty-rebuild-refreshes-placeholder-prefixes ()
+  "Full viewport rebuilds recompute prefixes after text-only changes."
+  (dolist (rebuild '(ebb-render-full-reset ebb-render-resize-height))
+    (ebb-test-with-screen (:width 6 :height 3)
+      (with-temp-buffer
+        (let ((render (ebb-render-create screen (current-buffer))))
+          (ebb-test-output parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=1,r=3,U=1,C=1;AQID\e\\")
+          (ebb-test-output parser (concat "\e[38;2;0;0;1m" (string #x10eeee)
+                                          "\r\n" (string #x10eeee)))
+          (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                    ((symbol-function 'ebb-render-cell-pixel-size) (lambda (_) '(8 . 16)))
+                    ((symbol-function 'ebb-render--graphics-image-object)
+                     (lambda (&rest _) 'mock-image)))
+            (ebb-render-refresh render)
+            (goto-char (ebb-render-state-display-begin render))
+            (forward-line 1)
+            (should (equal '((slice 0 16 8 16) mock-image)
+                           (get-text-property (point) 'display)))
+            (ebb-test-output parser "\e[1;1H\e[2K")
+            (funcall rebuild render)
+            (goto-char (ebb-render-state-display-begin render))
+            (forward-line 1)
+            (should (equal '((slice 0 0 8 16) mock-image)
+                           (get-text-property (point) 'display)))))))))
+
+(ert-deftest ebb-test-render-kitty-history-prefixes-survive-rebuilds ()
+  "Unchanged history is scanned once, with generation-based invalidation."
+  (ebb-test-with-screen (:width 6 :height 3)
+    (with-temp-buffer
+      (let* ((render (ebb-render-create screen (current-buffer)))
+             (graphics (ebb-screen-graphics screen))
+             ;; Placeholder text can precede the virtual placement's anchor.
+             (placement (make-ebb-graphics-placement :row 99 :virtual t))
+             (scans 0))
+        (cl-letf (((symbol-function 'ebb-render--line-has-placeholder-placement-p)
+                   (lambda (_screen _graphics row _target &optional _absolute)
+                     (cl-incf scans)
+                     (memq row '(10 98)))))
+          (should (= 2 (ebb-render--placeholder-tile-row render screen graphics 100 placement t)))
+          (should (= 100 scans))
+          (dolist (rebuild '(ebb-render-refresh ebb-render-full-reset ebb-render-resize-height))
+            (funcall rebuild render)
+            (should (= 2 (ebb-render--placeholder-tile-row render screen graphics 100 placement t)))
+            (should (= 100 scans)))
+          (cl-incf (ebb-screen-history-generation screen))
+          (should (= 2 (ebb-render--placeholder-tile-row render screen graphics 100 placement t)))
+          (should (= 200 scans))
+          (cl-incf (ebb-graphics-state-generation graphics))
+          (should (= 2 (ebb-render--placeholder-tile-row render screen graphics 100 placement t)))
+          (should (= 300 scans)))))))
 
 (ert-deftest ebb-test-render-kitty-placeholder-renders-in-scrollback ()
   "A diacritic-addressed Unicode placeholder keeps its image in history."
