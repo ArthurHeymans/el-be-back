@@ -767,10 +767,17 @@ selected window."
      (let ((event (car args)))
        (when (buffer-live-p (current-buffer))
          (with-current-buffer (current-buffer)
-           (let ((inhibit-read-only t))
+           (let ((inhibit-read-only t)
+                 (notice-start (point-max)))
              (goto-char (point-max))
              (insert (format "\n\n[Process %s]\n"
-                             (string-trim event))))
+                             (string-trim event)))
+             ;; Keep the notice outside the render region so a later
+             ;; resize/rebuild does not delete it.
+             (when ebb--render
+               (let ((end (ebb-render-state-region-end ebb--render)))
+                 (when (and end (>= (marker-position end) notice-start))
+                   (set-marker end notice-start)))))
            ;; Switch to emacs mode
            (ebb-emacs-mode)
            (when ebb-kill-buffer-on-exit
@@ -1237,6 +1244,7 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
      (t nil))))
   ;; With numeric prefix: switch to Nth ebb buffer
   (let ((existing (and (numberp current-prefix-arg)
+                       (> current-prefix-arg 0)
                        (not program)
                        (nth (1- current-prefix-arg) (ebb--buffers)))))
     (if existing

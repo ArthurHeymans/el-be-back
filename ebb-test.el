@@ -475,8 +475,8 @@ Binds `screen' and `parser' in BODY."
   (ebb-test-with-screen (:width 10 :height 3)
     (ebb-screen-cursor-goto screen 0 0)
     (mapc (lambda (c) (ebb-screen-write-char screen c)) (string-to-list "main"))
-    ;; Enter alt screen
-    (ebb-screen-enter-alt screen)
+    ;; Enter alt screen (1049-style: home the cursor)
+    (ebb-screen-enter-alt screen t)
     (should (equal "" (ebb-test-display-line screen 0)))
     (should (equal '(0 . 0) (ebb-test-cursor screen)))
     ;; Write on alt screen
@@ -485,6 +485,45 @@ Binds `screen' and `parser' in BODY."
     ;; Leave alt screen
     (ebb-screen-leave-alt screen)
     (should (equal "main" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-alt-screen-mode-47 ()
+  "DECSET/DECRST 47 switch to and from the alternate screen."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "main")
+    (ebb-test-output parser "\e[?47h")
+    (should (ebb-screen-alt-screen screen))
+    (ebb-test-output parser "alt")
+    (ebb-test-output parser "\e[?47l")
+    (should-not (ebb-screen-alt-screen screen))
+    (should (equal "main" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-alt-screen-resets-horizontal-margins ()
+  "A buffer switch clears DECLRMM horizontal margins in both directions."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e[?69h\e[3;10s")
+    (should (ebb-screen-horizontal-margins-enabled-p screen))
+    (ebb-test-output parser "\e[?1049h")
+    (should-not (ebb-screen-horizontal-margins-enabled-p screen))
+    (ebb-test-output parser "\e[?69h\e[3;10s")
+    (should (ebb-screen-horizontal-margins-enabled-p screen))
+    (ebb-test-output parser "\e[?1049l")
+    (should-not (ebb-screen-horizontal-margins-enabled-p screen))))
+
+(ert-deftest ebb-test-dsr-private-reports-question-mark ()
+  "DECXCPR (private DSR) prefixes the cursor report with '?'."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser) (lambda (s) (push s responses)))
+      (ebb-test-output parser "\e[2;3H\e[?6n")
+      (should (equal '("\e[?2;3R") responses)))))
+
+(ert-deftest ebb-test-charset-designate-executes-intervening-c0 ()
+  "A C0 control inside ESC ( is executed, then the designator applies."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e(\nB")
+    (should (equal '(0 . 1) (ebb-test-cursor screen)))
+    (should (equal "" (ebb-test-display-line screen 0)))
+    (should (eq 'us-ascii (ebb-screen-charset-g0 screen)))))
 
 (ert-deftest ebb-test-save-restore-cursor ()
   "DECSC/DECRC preserve position, attributes, modes, and character sets."

@@ -496,7 +496,8 @@ only digits and semicolons."
    ((and (< ch ?\s)
          (memq (ebb-parser-state parser)
                '(:ground :escape :escape-intermediate :escape-ignored
-                 :csi-entry :csi-param :csi-intermediate :csi-ignored)))
+                 :csi-entry :csi-param :csi-intermediate :csi-ignored
+                 :charset-designate)))
     (ebb-parse--dispatch-c0 parser ch))
 
    ;; DEL -- ignore
@@ -1483,7 +1484,8 @@ Pm=1: read, Pm=4: read maximum."
 
 (defun ebb-parse--csi-dsr (parser params)
   "Report device status for PARSER with PARAMS request (DSR)."
-  (let ((screen (ebb-parser-screen parser)))
+  (let ((screen (ebb-parser-screen parser))
+        (private (eq (ebb-parser-private parser) ??)))
     (pcase (ebb-parse--param params 0 0)
       (5 (ebb-parse--respond parser "\e[0n"))
       (6 (let ((row (ebb-screen-cursor-y screen))
@@ -1494,7 +1496,8 @@ Pm=1: read, Pm=4: read maximum."
                (setq column (- column (ebb-screen-left-margin screen)))))
            (ebb-parse--respond
             parser
-            (format "\e[%d;%dR" (1+ row) (1+ column))))))))
+            (format "\e[%s%d;%dR" (if private "?" "")
+                    (1+ row) (1+ column))))))))
 
 (defun ebb-parse--csi-winops (parser params)
   "Handle window manipulation for PARSER with PARAMS operation (CSI t)."
