@@ -1616,6 +1616,19 @@ suffix."
     (when (eq (aref suffix (1- (length suffix))) #x200d)
       (ebb--append-to-previous-cell screen char))))
 
+(defun ebb--wrap-to-next-line (screen)
+  "Move SCREEN's cursor to column 0 of the next line after an autowrap.
+Scrolls the active region at its bottom margin.  The cursor never moves
+past the last screen row, so a cursor below the scroll region stays put
+instead of moving off the screen."
+  (setf (ebb-screen-cursor-x screen) 0)
+  (let ((y (ebb-screen-cursor-y screen)))
+    (cond
+     ((= y (ebb-screen-scroll-bottom screen))
+      (ebb--scroll-region-up screen 1))
+     ((< y (1- (ebb-screen-height screen)))
+      (cl-incf (ebb-screen-cursor-y screen))))))
+
 (defun ebb--apply-pending-wrap (screen)
   "Apply SCREEN's pending automatic wrap before writing a character."
   (when (ebb-screen-pending-wrap screen)
@@ -1623,12 +1636,8 @@ suffix."
     (when (ebb-screen-auto-wrap screen)
       (setf (ebb-line-wrapped
              (ebb--line-at screen (ebb-screen-cursor-y screen)))
-            t
-            (ebb-screen-cursor-x screen) 0)
-      (if (= (ebb-screen-cursor-y screen)
-             (ebb-screen-scroll-bottom screen))
-          (ebb--scroll-region-up screen 1)
-        (cl-incf (ebb-screen-cursor-y screen)))
+            t)
+      (ebb--wrap-to-next-line screen)
       (remhash (ebb--line-at screen (ebb-screen-cursor-y screen))
                ebb--reverse-wrap-barriers))))
 
@@ -1674,15 +1683,19 @@ suffix."
     (ebb--mark-dirty screen row)
     (if (ebb-screen-auto-wrap screen)
         (progn
-          (setf (ebb-line-wrapped line) t
-                (ebb-screen-cursor-x screen) 0)
-          (if (= row (ebb-screen-scroll-bottom screen))
-              (ebb--scroll-region-up screen 1)
-            (cl-incf (ebb-screen-cursor-y screen)))
+          (setf (ebb-line-wrapped line) t)
+          (ebb--wrap-to-next-line screen)
+          (remhash (ebb--line-at screen (ebb-screen-cursor-y screen))
+                   ebb--reverse-wrap-barriers)
           (setq column 0
                 row (ebb-screen-cursor-y screen)
                 line (ebb--line-at screen row)
-                cells (ebb--line-ensure-cells line screen-width)))
+                cells (ebb--line-ensure-cells line screen-width))
+          ;; The wrapped-to row now holds cells; drop any stale text cache so
+          ;; the renderer does not keep showing its pre-wrap contents.
+          (setf (ebb-line-text line) nil
+                (ebb-line-attr-runs line) nil
+                (ebb-line-uniform-attr line) nil))
       (setq column (1- screen-width))))
   ;; Clean up continuation cells only when the destination overlaps one.
   (unless (= (ebb-cell-width (aref cells column)) 1)
@@ -1772,11 +1785,9 @@ for wide/non-ASCII/insert-mode cases."
           (when (ebb-screen-auto-wrap screen)
             (let ((line (ebb--line-at screen (ebb-screen-cursor-y screen))))
               (setf (ebb-line-wrapped line) t))
-            (setf (ebb-screen-cursor-x screen) 0)
-            (if (= (ebb-screen-cursor-y screen)
-                   (ebb-screen-scroll-bottom screen))
-                (ebb--scroll-region-up screen 1)
-              (cl-incf (ebb-screen-cursor-y screen)))))
+            (ebb--wrap-to-next-line screen)
+            (remhash (ebb--line-at screen (ebb-screen-cursor-y screen))
+                     ebb--reverse-wrap-barriers)))
         (let* ((cx (ebb-screen-cursor-x screen))
                (cy (ebb-screen-cursor-y screen))
                (width (ebb-screen-line-width screen cy))

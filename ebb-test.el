@@ -217,6 +217,44 @@ Binds `screen' and `parser' in BODY."
         (should (equal vs (ebb-cell-combining cell))))
       (should (equal '(2 . 0) (ebb-test-cursor screen))))))
 
+(ert-deftest ebb-test-wrap-below-scroll-region-keeps-cursor-on-screen ()
+  "Autowrap below the scroll region must not move the cursor off screen."
+  (ebb-test-with-screen (:width 8 :height 4)
+    (ebb-test-output parser "\e[1;2r\e[4;8H")
+    (ebb-test-output parser "a")
+    (should (ebb-screen-pending-wrap screen))
+    ;; The next byte wraps.  Before the fix this raised args-out-of-range and
+    ;; left the cursor at row 4, wedging every later write.
+    (ebb-test-output parser "b")
+    (should (= 3 (ebb-screen-cursor-y screen)))
+    (should (< (ebb-screen-cursor-y screen) (ebb-screen-height screen)))
+    (should (= 1 (ebb-screen-cursor-x screen)))))
+
+(ert-deftest ebb-test-wide-wrap-below-scroll-region-keeps-cursor-on-screen ()
+  "The wide-character pre-wrap path applies the same off-screen clamp."
+  (ebb-test-with-screen (:width 8 :height 4)
+    (ebb-test-output parser "\e[1;2r\e[4;8H")
+    (ebb-test-output parser "a")
+    (ebb-test-output parser "\u4e2d")
+    (should (< (ebb-screen-cursor-y screen) (ebb-screen-height screen)))
+    (should (string-prefix-p "\u4e2d" (ebb-test-display-line screen 3)))))
+
+(ert-deftest ebb-test-wide-char-wrap-renders-and-survives-overwrite ()
+  "A wide character that wraps must render and not be lost on later writes."
+  (ebb-test-with-screen (:width 8 :height 3)
+    (ebb-test-output parser "\e[1;8H")
+    (ebb-test-output parser "\u4e2d")
+    (should (equal "\u4e2d" (ebb-test-display-line screen 1)))
+    ;; The wrapped-to row must not keep a stale text cache that the renderer
+    ;; prefers over its cells.
+    (should (string-prefix-p
+             "\u4e2d"
+             (substring-no-properties
+              (ebb-render--line-to-string
+               (ebb-screen-get-line screen 1) 8))))
+    (ebb-test-output parser "AB")
+    (should (equal "\u4e2dAB" (ebb-test-display-line screen 1)))))
+
 (ert-deftest ebb-test-auto-wrap ()
   "Auto-wrap moves to next line at end of line."
   (ebb-test-with-screen (:width 5 :height 3)
