@@ -929,10 +929,7 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
                (slab-end (+ slab-start
                             (ebb-render-state-scrollback-count render))))
           (unless (and (>= row slab-start) (< row slab-end))
-            (let* ((start (min (max 0 (- row (/ capacity 3)))
-                               (max 0 (- history-rows capacity))))
-                   (count (min capacity (- history-rows start)))
-                   (inhibit-read-only t)
+            (let* ((inhibit-read-only t)
                    (inhibit-modification-hooks t)
                    (buffer-undo-list t)
                    (other-windows
@@ -944,7 +941,29 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
                                            (ebb-render-buffer-anchor
                                             render (window-start other))
                                            (ebb-render-buffer-anchor
-                                            render (window-point other))))))
+                                            render (window-point other)))))
+                   ;; Size the slab from every window anchor, or a window parked
+                   ;; in distant history falls outside the rebuilt slab and
+                   ;; cannot be restored.
+                   (other-rows
+                    (delq nil
+                          (cl-loop for (nil start-anchor window-point-anchor)
+                                   in other-windows
+                                   collect (ebb-render--anchor-history-row
+                                            render start-anchor history-rows)
+                                   collect (ebb-render--anchor-history-row
+                                            render window-point-anchor
+                                            history-rows))))
+                   (wanted-rows (cons row other-rows))
+                   (start (min (max 0 (- (apply #'min wanted-rows)
+                                          (/ capacity 3)))
+                               (max 0 (- history-rows capacity))))
+                   (count (min (- history-rows start)
+                               (max capacity
+                                    (- (min history-rows
+                                            (+ (apply #'max wanted-rows)
+                                               capacity))
+                                       start)))))
               (ebb-render--rebuild-scrollback
                render start count history-rows
                (ebb-screen-history-generation screen))
@@ -1349,11 +1368,12 @@ image dimensions rather than stretching them over the propertized text run."
                      (if (equal mime "image/png") 'png 'pbm)
                      t :width width :height height :scale 1 :ascent 'center)))
                 (error nil))))
-        (ebb-render--graphics-cache-put
-         render key (or object :failed)
-         (if object
-             (+ (length source) (length (or svg "")) (* width height 4))
-           0))
+        (when object
+          ;; Failed creations are not cached: zero-byte entries never trigger
+          ;; byte-budget eviction and would grow the LRU without bound.
+          (ebb-render--graphics-cache-put
+           render key object
+           (+ (length source) (length (or svg "")) (* width height 4))))
         object))))
 
 (defun ebb-render--graphics-color-id (color)

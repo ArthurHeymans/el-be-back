@@ -189,6 +189,11 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (make-hash-table :test #'eq :weakness 'key)
   "Alternate-screen DECSC position (X Y ATTR) keyed by terminal screen.")
 
+(defvar ebb--alt-saved-grid
+  (make-hash-table :test #'eq :weakness 'key)
+  "Alternate-screen buffer contents keyed by terminal screen.
+Preserved across a non-clearing buffer switch (DECSET 47/1047).")
+
 (defun ebb--swap-saved-renditions (screen)
   "Swap SCREEN's active and alternate DECSC rendition state."
   (let ((active (gethash screen ebb--saved-cursor-renditions))
@@ -2896,9 +2901,11 @@ NEW-WIDTH and NEW-HEIGHT give the new dimensions."
           (ebb-alt-save-history-generation saved)
           (ebb-screen-history-generation main))))
 
-(defun ebb-screen-enter-alt (screen &optional home)
+(defun ebb-screen-enter-alt (screen &optional home clear)
   "Enter SCREEN's alternate screen buffer.
-When HOME is non-nil, move the cursor to the home position (DECSET 1049)."
+When HOME is non-nil, move the cursor to the home position (DECSET 1049).
+When CLEAR is nil and a saved alternate grid exists, restore it instead of
+starting blank, as DECSET 47/1047 require."
   (unless (ebb-screen-alt-screen screen)
     ;; Each buffer keeps its own DECSC state; swap it in.
     (ebb--swap-saved-renditions screen)
@@ -2935,25 +2942,50 @@ When HOME is non-nil, move the cursor to the home position (DECSET 1049)."
             (ebb-screen-cursor-saved-p screen) (and alt-cursor t)))
     ;; xterm's resetMargins: a buffer switch clears horizontal margins.
     (remhash screen ebb--horizontal-margins)
-    ;; Create fresh alt screen
-    (let ((w (ebb-screen-width screen))
-          (h (ebb-screen-height screen)))
-      (let ((lines (make-vector h nil)))
-        (dotimes (i h)
-          (aset lines i (ebb--make-empty-line w)))
-        (setf (ebb-screen-lines screen) lines))
-      (setf (ebb-screen-line-start screen) 0)
-      (when home
-        (setf (ebb-screen-cursor-x screen) 0)
-        (setf (ebb-screen-cursor-y screen) 0))
-      (setf (ebb-screen-pending-wrap screen) nil)
-      (setf (ebb-screen-scroll-top screen) 0)
-      (setf (ebb-screen-scroll-bottom screen) (1- h))
+    ;; Restore the alternate grid for a non-clearing switch (47/1047); a
+    ;; clearing switch (1049) and a first entry start from a blank grid.
+    (let* ((w (ebb-screen-width screen))
+           (h (ebb-screen-height screen))
+           (saved (and (not clear) (gethash screen ebb--alt-saved-grid))))
+      (if saved
+          (setf (ebb-screen-lines screen) (ebb-alt-save-lines saved)
+                (ebb-screen-line-start screen) (ebb-alt-save-line-start saved)
+                (ebb-screen-cursor-x screen) (ebb-alt-save-cursor-x saved)
+                (ebb-screen-cursor-y screen) (ebb-alt-save-cursor-y saved)
+                (ebb-screen-pending-wrap screen)
+                (ebb-alt-save-pending-wrap saved)
+                (ebb-screen-current-attr screen)
+                (ebb-attr-copy (ebb-alt-save-current-attr saved))
+                (ebb-screen-scroll-top screen) (ebb-alt-save-scroll-top saved)
+                (ebb-screen-scroll-bottom screen)
+                (ebb-alt-save-scroll-bottom saved)
+                (ebb-screen-history-next-id screen)
+                (ebb-alt-save-history-next-id saved)
+                (ebb-screen-history-generation screen)
+                (ebb-alt-save-history-generation saved)
+                (ebb-screen-auto-wrap screen) (ebb-alt-save-auto-wrap saved)
+                (ebb-screen-origin-mode screen)
+                (ebb-alt-save-origin-mode saved)
+                (ebb-screen-insert-mode screen)
+                (ebb-alt-save-insert-mode saved))
+        (let ((lines (make-vector h nil)))
+          (dotimes (i h)
+            (aset lines i (ebb--make-empty-line w)))
+          (setf (ebb-screen-lines screen) lines))
+        (setf (ebb-screen-line-start screen) 0)
+        (when home
+          (setf (ebb-screen-cursor-x screen) 0)
+          (setf (ebb-screen-cursor-y screen) 0))
+        (setf (ebb-screen-pending-wrap screen) nil)
+        (setf (ebb-screen-scroll-top screen) 0)
+        (setf (ebb-screen-scroll-bottom screen) (1- h)))
+      (remhash screen ebb--alt-saved-grid)
       (setf (ebb-screen-graphics screen)
             (ebb-graphics-create
              (ebb-graphics-state-budget
               (ebb-alt-save-graphics (ebb-screen-alt-screen screen)))))
       (ebb--history-clear screen)
+      (setf (ebb-screen-history-row-ends screen) nil)
       (setf (ebb-screen-dirty-lines screen)
             (number-sequence 0 (1- h)))
       (setf (ebb-screen-dirty-map screen) (make-vector h t))
@@ -2962,6 +2994,25 @@ When HOME is non-nil, move the cursor to the home position (DECSET 1049)."
 (defun ebb-screen-leave-alt (screen)
   "Leave SCREEN's alternate screen buffer, restoring main screen."
   (when-let* ((saved (ebb-screen-alt-screen screen)))
+    ;; Preserve the alternate grid for a later non-clearing switch.
+    (puthash screen
+             (make-ebb-alt-save
+              :lines (ebb-screen-lines screen)
+              :width (ebb-screen-width screen)
+              :height (ebb-screen-height screen)
+              :line-start (ebb-screen-line-start screen)
+              :cursor-x (ebb-screen-cursor-x screen)
+              :cursor-y (ebb-screen-cursor-y screen)
+              :pending-wrap (ebb-screen-pending-wrap screen)
+              :current-attr (ebb-attr-copy (ebb-screen-current-attr screen))
+              :scroll-top (ebb-screen-scroll-top screen)
+              :scroll-bottom (ebb-screen-scroll-bottom screen)
+              :history-next-id (ebb-screen-history-next-id screen)
+              :history-generation (ebb-screen-history-generation screen)
+              :auto-wrap (ebb-screen-auto-wrap screen)
+              :origin-mode (ebb-screen-origin-mode screen)
+              :insert-mode (ebb-screen-insert-mode screen))
+             ebb--alt-saved-grid)
     ;; Alternate-screen image data is discarded, but its bytes participate in
     ;; the same terminal-wide quota while the alternate screen is active.
     (ebb-graphics-reset (ebb-screen-graphics screen))
@@ -3119,7 +3170,7 @@ DECCOLM clears the display, restores full-screen margins, and homes the cursor."
      (if value
          (ebb-screen-enter-alt screen)
        (ebb-screen-leave-alt screen)))
-    (1047 ;; Alt screen only (no cursor save)
+    (1047 ;; Alt screen only (no cursor save, no clear)
      (if value
          (ebb-screen-enter-alt screen)
        (ebb-screen-leave-alt screen)))
@@ -3127,11 +3178,11 @@ DECCOLM clears the display, restores full-screen margins, and homes the cursor."
      (if value
          (ebb-screen-save-cursor screen)
        (ebb-screen-restore-cursor screen)))
-    (1049 ;; Alt screen + cursor save
+    (1049 ;; Alt screen + cursor save + clear
      (if value
          (progn
            (ebb-screen-save-cursor screen)
-           (ebb-screen-enter-alt screen t))
+           (ebb-screen-enter-alt screen t t))
        (ebb-screen-leave-alt screen)
        (ebb-screen-restore-cursor screen)))
     (2004 (setf (ebb-screen-bracketed-paste screen) value))
@@ -3585,6 +3636,7 @@ Does not clear the display (DECSTR)."
         (ebb-screen-cursor-saved-x screen) 0
         (ebb-screen-cursor-saved-y screen) 0
         (ebb-screen-cursor-saved-attr screen) nil
+        (ebb-screen-cursor-saved-p screen) nil
         (ebb-screen-current-attr screen) (make-ebb-attr)
         (ebb-screen-scroll-top screen) 0
         (ebb-screen-scroll-bottom screen) (1- (ebb-screen-height screen))
@@ -3601,6 +3653,8 @@ Does not clear the display (DECSTR)."
         (ebb-screen-charset-active screen) 'g0)
   (remhash screen ebb--saved-cursor-renditions)
   (remhash screen ebb--alt-saved-cursor-renditions)
+  (remhash screen ebb--alt-saved-cursors)
+  (remhash screen ebb--alt-saved-grid)
   (remhash screen ebb--horizontal-margins)
   (remhash screen ebb--reverse-wrap-modes)
   (remhash screen ebb--dec-protection-mode-screens)
@@ -3632,8 +3686,11 @@ Does not clear the display (DECSTR)."
     (setf (ebb-screen-cursor-saved-x screen) 0)
     (setf (ebb-screen-cursor-saved-y screen) 0)
     (setf (ebb-screen-cursor-saved-attr screen) nil)
+    (setf (ebb-screen-cursor-saved-p screen) nil)
     (remhash screen ebb--saved-cursor-renditions)
     (remhash screen ebb--alt-saved-cursor-renditions)
+    (remhash screen ebb--alt-saved-cursors)
+    (remhash screen ebb--alt-saved-grid)
     (setf (ebb-screen-cursor-style screen) :block)
     (setf (ebb-screen-cursor-visible screen) t)
     (setf (ebb-screen-pending-wrap screen) nil)

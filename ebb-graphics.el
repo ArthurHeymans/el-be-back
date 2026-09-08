@@ -653,12 +653,13 @@ Return the image ID, or nil when the storage quota cannot admit it."
            (projected (+ (- (ebb-graphics-state-byte-count state) old-bytes)
                          new-bytes))
            (required (- projected ebb-kitty-graphics-storage-limit))
-           (count-limit (max 1 ebb-kitty-graphics-image-count-limit))
+           (count-limit ebb-kitty-graphics-image-count-limit)
            (required-count
-            (if old 0
-              (max 0 (- (hash-table-count (ebb-graphics-state-images state))
-                        (1- count-limit)))))
-           (victims (and (<= new-bytes ebb-kitty-graphics-storage-limit)
+            (max 0
+                 (- (hash-table-count (ebb-graphics-state-images state))
+                    (if old count-limit (1- count-limit)))))
+           (victims (and (> count-limit 0)
+                         (<= new-bytes ebb-kitty-graphics-storage-limit)
                          (ebb-graphics--eviction-plan
                           state required image-id required-count))))
       ;; Do not mutate the old image, its placements, or accounting until a

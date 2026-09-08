@@ -142,34 +142,41 @@ OUTPUT from the process is queued on IO for parsing."
 (defun ebb-io--enqueue-output (io output)
   "Append OUTPUT to IO's pending chunk queue without copying old data.
 Output beyond `ebb-io-max-pending-bytes' is dropped to bound memory: queued
-backlog is discarded oldest-first, then the incoming chunk itself."
+backlog is discarded oldest-first, then the incoming chunk itself.  Sizes are
+measured in bytes, since decoded multibyte output can be several bytes per
+character."
   (unless (zerop (length output))
-    (let ((limit ebb-io-max-pending-bytes))
-      (when (> (+ (ebb-io-pending-bytes io) (length output)) limit)
+    (let ((limit ebb-io-max-pending-bytes)
+          (size (string-bytes output)))
+      (when (> (+ (ebb-io-pending-bytes io) size) limit)
         (let ((backlog (cdr (ebb-io-pending-chunks io))))
           (when backlog
-            (let ((dropped (cl-loop for chunk in backlog sum (length chunk))))
+            (let ((dropped (cl-loop for chunk in backlog
+                                    sum (string-bytes chunk))))
               (cl-decf (ebb-io-pending-bytes io) dropped)
               (cl-incf (ebb-io-dropped-bytes io) dropped)
               (setcdr (ebb-io-pending-chunks io) nil)
               (setf (ebb-io-pending-tail io) (ebb-io-pending-chunks io))))))
-      (if (> (+ (ebb-io-pending-bytes io) (length output)) limit)
+      (if (> (+ (ebb-io-pending-bytes io) size) limit)
           ;; A single chunk larger than the cap: drop it rather than buffer it.
-          (cl-incf (ebb-io-dropped-bytes io) (length output))
+          (cl-incf (ebb-io-dropped-bytes io) size)
         (let ((cell (list output)))
           (if (ebb-io-pending-tail io)
               (setcdr (ebb-io-pending-tail io) cell)
             (setf (ebb-io-pending-chunks io) cell))
           (setf (ebb-io-pending-tail io) cell)
-          (cl-incf (ebb-io-pending-bytes io) (length output)))))))
+          (cl-incf (ebb-io-pending-bytes io) size))))))
 
 (defun ebb-io--normalize-pending (io)
-  "Drop fully consumed head chunks from IO's pending queue."
+  "Drop fully consumed head chunks from IO's pending queue.
+`ebb-io-pending-offset' is character-based (it counts what
+`ebb-parse-bytes' consumed), so the completion test uses `length'; the byte
+total uses `string-bytes'."
   (while (and (ebb-io-pending-chunks io)
               (>= (ebb-io-pending-offset io)
                   (length (car (ebb-io-pending-chunks io)))))
     (cl-decf (ebb-io-pending-bytes io)
-             (length (car (ebb-io-pending-chunks io))))
+             (string-bytes (car (ebb-io-pending-chunks io))))
     (setf (ebb-io-pending-chunks io)
           (cdr (ebb-io-pending-chunks io)))
     (setf (ebb-io-pending-offset io) 0))

@@ -1048,10 +1048,16 @@ selected window."
   "Adopt the shell-reported working directory PATH.
 Remote host reports are only adopted when `ebb-trust-osc7-remote-hosts' is
 non-nil (see `ebb--cwd-to-path').  A local path must exist (a synchronous
-TRAMP `file-directory-p' would open a connection on every cd).
+TRAMP `file-directory-p' would open a connection on every cd), and a remote
+path must either be trusted or reuse the buffer's existing remote prefix.
 Also updates `list-buffers-directory' and renames the buffer when
 `ebb-buffer-name-function' is set."
-  (when (and path (if (file-remote-p path) t (file-directory-p path)))
+  (when (and path
+             (if (file-remote-p path)
+                 (or ebb-trust-osc7-remote-hosts
+                     (equal (file-remote-p path)
+                            (file-remote-p default-directory)))
+               (file-directory-p path)))
     (setq default-directory (file-name-as-directory path)
           list-buffers-directory default-directory)
     (when ebb-buffer-name-function
@@ -1133,7 +1139,15 @@ user, multi-hop).  A HOST naming this machine, in a remote buffer, is the
 local shell back in charge after the user left ssh: a plain local path
 again.  A local-looking HOST (or none) in a remote buffer is the remote
 shell reporting on itself."
-  (when (and dir (not (string-empty-p dir)))
+  (when (and dir (not (string-empty-p dir))
+             ;; A TRAMP-shaped path sent by the child is only honored when
+             ;; remote hosts are trusted, or when it reuses the buffer's
+             ;; existing remote prefix; otherwise a local shell could point
+             ;; `default-directory' at an arbitrary host.
+             (or ebb-trust-osc7-remote-hosts
+                 (not (file-remote-p dir))
+                 (equal (file-remote-p dir)
+                        (file-remote-p default-directory))))
     (let ((prefix (file-remote-p default-directory)))
       (cond
        ;; Preserve an existing remote session even when its target happens

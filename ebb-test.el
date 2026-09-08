@@ -6132,5 +6132,128 @@ cell is 9x18 unless overridden."
       (should (equal 2 (get-text-property 1 'ebb-cell-width s)))
       (should-not (get-text-property 0 'ebb-cell-width s)))))
 
+(ert-deftest ebb-test-kitty-image-count-limit-zero-rejects ()
+  "A zero image-count limit retains no images."
+  (let ((ebb-kitty-graphics-image-count-limit 0)
+        (ebb-kitty-graphics-storage-limit (* 1024 1024))
+        (state (ebb-graphics-create)))
+    (should-not (ebb-graphics--store-image
+                 state (make-hash-table) 24 1 1 "abc"))
+    (should (zerop (hash-table-count (ebb-graphics-state-images state))))))
+
+(ert-deftest ebb-test-kitty-image-count-limit-replacement-evicts ()
+  "Replacing an image after the count limit drops still evicts."
+  (let ((ebb-kitty-graphics-image-count-limit 3)
+        (ebb-kitty-graphics-storage-limit (* 1024 1024))
+        (state (ebb-graphics-create)))
+    (dotimes (_ 3)
+      (should (ebb-graphics--store-image
+               state (make-hash-table) 24 1 1 "abc")))
+    (let ((ebb-kitty-graphics-image-count-limit 2)
+          (params (make-hash-table)))
+      (puthash ?i "1" params)
+      (should (ebb-graphics--store-image state params 24 1 1 "def")))
+    (should (<= (hash-table-count (ebb-graphics-state-images state)) 2))))
+
+(ert-deftest ebb-test-io-pending-byte-cap-counts-bytes ()
+  "The pending-byte cap measures decoded multibyte output in bytes."
+  (let ((ebb-io-max-pending-bytes 4)
+        (io (make-ebb-io)))
+    ;; Three two-byte characters are six bytes, over the four-byte cap.
+    (ebb-io--enqueue-output io "\u00e9\u00e9\u00e9")
+    (should (zerop (ebb-io-pending-bytes io)))
+    (should (= 6 (ebb-io-dropped-bytes io)))
+    (ebb-io--enqueue-output io "\u00e9")
+    (should (= 2 (ebb-io-pending-bytes io)))))
+
+(ert-deftest ebb-test-io-normalize-pending-decrements-bytes ()
+  "Dropping a consumed multibyte chunk decrements the byte total."
+  (let ((io (make-ebb-io)))
+    (ebb-io--enqueue-output io "\u00e9\u00e9")
+    (should (= 4 (ebb-io-pending-bytes io)))
+    ;; The offset is character-based, the byte total is not.
+    (setf (ebb-io-pending-offset io) 2)
+    (ebb-io--normalize-pending io)
+    (should (zerop (ebb-io-pending-bytes io)))
+    (should-not (ebb-io-pending-chunks io))))
+
+(ert-deftest ebb-test-reset-clears-alt-saved-cursor ()
+  "A reset discards alternate-screen DECSC state."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-parse-bytes parser "\e[2;3H\e7\e[?1049h\e[?1049l")
+    (should (gethash screen ebb--alt-saved-cursors))
+    (ebb-parse-bytes parser "\ec")
+    (should-not (gethash screen ebb--alt-saved-cursors))
+    (should-not (ebb-screen-cursor-saved-p screen))))
+
+(ert-deftest ebb-test-alt-screen-mode-47-retains-grid ()
+  "DECSET 47 preserves the alternate grid across switches."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "main")
+    (ebb-test-output parser "\e[?47h\e[Halt")
+    (ebb-test-output parser "\e[?47l")
+    (should (equal "main" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[?47h")
+    (should (equal "alt" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-cwd-to-path-rejects-untrusted-tramp-dir ()
+  "A local terminal cannot adopt a TRAMP-shaped OSC 7 path by default."
+  (with-temp-buffer
+    (setq-local default-directory "/tmp/")
+    (should-not (ebb--cwd-to-path "/ssh:attacker:/tmp" ""))
+    (should-not (ebb--cwd-to-path "/ssh:attacker:/tmp" (system-name)))
+    (ebb--set-shell-cwd "/ssh:attacker:/tmp")
+    (should (equal "/tmp/" default-directory))
+    ;; With remote hosts trusted, the report is honored.
+    (let ((ebb-trust-osc7-remote-hosts t))
+      (should (equal "/ssh:attacker:/tmp"
+                     (ebb--cwd-to-path "/ssh:attacker:/tmp" ""))))))
+
+(ert-deftest ebb-test-render-goto-location-keeps-distant-window ()
+  "Jumping to history preserves another window's distant position."
+  (let* ((screen (ebb-screen-create 20 6))
+         (parser (ebb-parse-create screen))
+         (buffer (generate-new-buffer " *ebb-test-goto-distant*")))
+    (cl-flet ((line-at (position)
+                (with-current-buffer buffer
+                  (save-excursion
+                    (goto-char position)
+                    (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))))
+      (unwind-protect
+          (save-window-excursion
+            (delete-other-windows)
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'emacs)
+            (let* ((render (ebb-render-create screen buffer))
+                   (distant (selected-window))
+                   (target (split-window)))
+              (setq-local ebb--render render)
+              (set-window-buffer distant buffer)
+              (set-window-buffer target buffer)
+              (dotimes (i 400)
+                (ebb-test-output parser (format "line-%04d\r\n" i)))
+              (ebb-render-refresh render)
+              (let ((total (ebb-screen-history-row-count screen)))
+                (ebb-render--rebuild-scrollback
+                 render 0 total total
+                 (ebb-screen-history-generation screen))
+                (let ((region-begin (ebb-render-state-region-begin render)))
+                  (set-window-start
+                   distant
+                   (with-current-buffer buffer
+                     (save-excursion
+                       (goto-char region-begin)
+                       (forward-line 330)
+                       (point)))
+                   t))
+                (let ((line (line-at (window-start distant))))
+                  ;; Jump the selected window to early history; the other
+                  ;; window's row must stay inside the rebuilt slab.
+                  (select-window target)
+                  (ebb-render-goto-location render 5 0 t)
+                  (should (equal line (line-at (window-start distant))))))))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
+
 (provide 'ebb-test)
 ;;; ebb-test.el ends here
