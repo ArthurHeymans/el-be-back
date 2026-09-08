@@ -34,6 +34,9 @@
   (pending-chunks nil)    ; unprocessed output chunks, oldest first
   (pending-tail nil)      ; tail cons of pending-chunks for O(1) append
   (pending-offset 0)      ; parse position in the head chunk
+  (pending-bytes 0)       ; bytes currently queued (upper bound)
+  (dropped-bytes 0)       ; bytes discarded by the queue cap
+  (drop-reported nil)     ; non-nil after the drop warning was emitted
   ;; Processing state
   (processing nil)        ; non-nil when parse loop is active
   (chunk-size 4096)       ; bytes per parse chunk
@@ -67,6 +70,15 @@ Each function receives IO, the error value, and its consecutive count.")
 (defcustom ebb-chunk-size 4096
   "Number of bytes to parse per chunk before yielding to the event loop."
   :type 'integer
+  :group 'ebb)
+
+(defcustom ebb-io-max-pending-bytes (* 16 1024 1024)
+  "Maximum bytes of unparsed terminal output to buffer.
+A child that writes faster than Ebb parses would otherwise grow the queue
+without bound.  When the cap is reached, queued backlog is discarded (oldest
+first, keeping the chunk currently being parsed) and a one-time warning is
+logged.  The bytes are dropped, so the display can have gaps."
+  :type 'natnum
   :group 'ebb)
 
 (defcustom ebb-minimum-latency 0.008
@@ -128,19 +140,43 @@ OUTPUT from the process is queued on IO for parsing."
   (ebb-io-receive io output))
 
 (defun ebb-io--enqueue-output (io output)
-  "Append OUTPUT to IO's pending chunk queue without copying old data."
+  "Append OUTPUT to IO's pending chunk queue without copying old data.
+Output beyond `ebb-io-max-pending-bytes' is dropped to bound memory: queued
+backlog is discarded oldest-first, then the incoming chunk itself.  Sizes are
+measured in bytes, since decoded multibyte output can be several bytes per
+character."
   (unless (zerop (length output))
-    (let ((cell (list output)))
-      (if (ebb-io-pending-tail io)
-          (setcdr (ebb-io-pending-tail io) cell)
-        (setf (ebb-io-pending-chunks io) cell))
-      (setf (ebb-io-pending-tail io) cell))))
+    (let ((limit ebb-io-max-pending-bytes)
+          (size (string-bytes output)))
+      (when (> (+ (ebb-io-pending-bytes io) size) limit)
+        (let ((backlog (cdr (ebb-io-pending-chunks io))))
+          (when backlog
+            (let ((dropped (cl-loop for chunk in backlog
+                                    sum (string-bytes chunk))))
+              (cl-decf (ebb-io-pending-bytes io) dropped)
+              (cl-incf (ebb-io-dropped-bytes io) dropped)
+              (setcdr (ebb-io-pending-chunks io) nil)
+              (setf (ebb-io-pending-tail io) (ebb-io-pending-chunks io))))))
+      (if (> (+ (ebb-io-pending-bytes io) size) limit)
+          ;; A single chunk larger than the cap: drop it rather than buffer it.
+          (cl-incf (ebb-io-dropped-bytes io) size)
+        (let ((cell (list output)))
+          (if (ebb-io-pending-tail io)
+              (setcdr (ebb-io-pending-tail io) cell)
+            (setf (ebb-io-pending-chunks io) cell))
+          (setf (ebb-io-pending-tail io) cell)
+          (cl-incf (ebb-io-pending-bytes io) size))))))
 
 (defun ebb-io--normalize-pending (io)
-  "Drop fully consumed head chunks from IO's pending queue."
+  "Drop fully consumed head chunks from IO's pending queue.
+`ebb-io-pending-offset' is character-based (it counts what
+`ebb-parse-bytes' consumed), so the completion test uses `length'; the byte
+total uses `string-bytes'."
   (while (and (ebb-io-pending-chunks io)
               (>= (ebb-io-pending-offset io)
                   (length (car (ebb-io-pending-chunks io)))))
+    (cl-decf (ebb-io-pending-bytes io)
+             (string-bytes (car (ebb-io-pending-chunks io))))
     (setf (ebb-io-pending-chunks io)
           (cdr (ebb-io-pending-chunks io)))
     (setf (ebb-io-pending-offset io) 0))
@@ -197,7 +233,10 @@ When DRAIN-ALL is non-nil, ignore chunk budgets."
           (let ((budget (ebb-io-chunk-size io))
                 (total-parsed 0)
                 (max-parsed (if drain-all most-positive-fixnum
-                              (* (ebb-io-chunk-size io) 4))))
+                              (* (ebb-io-chunk-size io) 4)))
+                ;; Bound helper subprocesses spawned by untrusted graphics.
+                (ebb-graphics--subprocess-budget
+                 ebb-kitty-graphics-subprocess-budget))
             ;; Parse in chunks up to budget
             (while (and (< total-parsed max-parsed)
                         (ebb-io--pending-p io))
@@ -225,16 +264,22 @@ When DRAIN-ALL is non-nil, ignore chunk budgets."
               (run-hook-with-args 'ebb-io-after-render-functions
                                   (ebb-io-render io)))))
 
-        ;; Reset latency tracking
-        (setf (ebb-io-first-chunk-time io) nil
-              (ebb-io-last-processing-error io) nil
-              (ebb-io-processing-error-count io) 0)
-
-        ;; Check for more pending data
+        ;; While a backlog remains, keep the original arrival time so the
+        ;; max-latency budget drives back-to-back drains instead of
+        ;; restarting the latency window after every chunk.
         (setf (ebb-io-processing io) nil)
-        (when (ebb-io--pending-p io)
-          (setf (ebb-io-first-chunk-time io) (float-time))
-          (ebb-io--schedule-processing io)))
+        (if (ebb-io--pending-p io)
+            (ebb-io--schedule-processing io)
+          (when (and (> (ebb-io-dropped-bytes io) 0)
+                     (not (ebb-io-drop-reported io)))
+            (setf (ebb-io-drop-reported io) t)
+            (message "[ebb] dropped %d bytes of terminal output (queue limit %d)"
+                     (ebb-io-dropped-bytes io) ebb-io-max-pending-bytes))
+          (setf (ebb-io-first-chunk-time io) nil
+                (ebb-io-last-processing-error io) nil
+                (ebb-io-processing-error-count io) 0
+                (ebb-io-dropped-bytes io) 0
+                (ebb-io-drop-reported io) nil)))
     (error
      (setf (ebb-io-processing io) nil)
      (if (equal err (ebb-io-last-processing-error io))
@@ -242,7 +287,16 @@ When DRAIN-ALL is non-nil, ignore chunk budgets."
        (setf (ebb-io-last-processing-error io) err
              (ebb-io-processing-error-count io) 1))
      (run-hook-with-args 'ebb-io-processing-error-functions
-                         io err (ebb-io-processing-error-count io)))))
+                         io err (ebb-io-processing-error-count io))
+     ;; A parser error must not wedge the terminal: discard the offending
+     ;; chunk, return the parser to ground, and keep draining.
+     (when (ebb-io-pending-chunks io)
+       (setf (ebb-io-pending-offset io)
+             (length (car (ebb-io-pending-chunks io))))
+       (ebb-io--normalize-pending io)
+       (ebb-parse-cancel-sequence (ebb-io-parser io)))
+     (when (ebb-io--pending-p io)
+       (ebb-io--schedule-processing io)))))
 
 (defun ebb-io--report-processing-error (_io error-data count)
   "Report asynchronous ERROR-DATA after COUNT consecutive failures.
@@ -657,7 +711,7 @@ Ebb through `ebb-io--filter'."
 (defun ebb-io--sentinel (io proc event)
   "Handle process state changes for PROC on IO.
 EVENT describes the transition."
-  (when (string-match-p "\\(finished\\|exited\\|killed\\|deleted\\)" event)
+  (when (string-match-p "\\(finished\\|exited\\|killed\\|deleted\\|failed\\|connection broken\\)" event)
     ;; Delete the temporary bash integration rcfile, if any.  Read it
     ;; from PROC, not from IO, whose process slot may already be nil.
     (when-let* ((rcfile (and (processp proc)
@@ -687,6 +741,7 @@ EVENT describes the transition."
         (ebb-io-pending-chunks io) nil
         (ebb-io-pending-tail io) nil
         (ebb-io-pending-offset io) 0
+        (ebb-io-pending-bytes io) 0
         (ebb-io-first-chunk-time io) nil)
   (ebb-io--cancel-sync-timer io)
   (when (ebb-io-parser io)

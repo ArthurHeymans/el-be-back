@@ -424,15 +424,29 @@ Eshell retain everything outside an inline terminal."
           (window-body-height window t))))
 
 (defun ebb-render-cell-pixel-size (render)
-  "Return RENDER's terminal cell size as (WIDTH . HEIGHT) pixels."
+  "Return RENDER's terminal cell size as (WIDTH . HEIGHT) pixels.
+Measured on the frame showing the terminal, not necessarily the selected
+frame, so multi-frame sessions size glyphs and images correctly."
   (when-let* ((buffer (ebb-render-state-buffer render))
               ((buffer-live-p buffer)))
     (with-current-buffer buffer
-      (if (ebb-render--glyph-cache-valid-p)
-          (cons ebb-render--cell-pixel-width ebb-render--cell-pixel-height)
-        (cons (frame-char-width) (frame-char-height))))))
+      (let ((frame (or (window-frame
+                        (car (get-buffer-window-list buffer nil t)))
+                       (selected-frame))))
+        (if (and (ebb-render--glyph-cache-valid-p)
+                 (eq frame (selected-frame)))
+            (cons ebb-render--cell-pixel-width ebb-render--cell-pixel-height)
+          (cons (frame-char-width frame) (frame-char-height frame)))))))
 
 ;;;; ---- Main Refresh ---------------------------------------------------
+
+(defun ebb-render--run-after-refresh-hook (render)
+  "Run RENDER's after-refresh hook, isolating hook errors.
+Callers must run this after any full buffer rebuild so link/shell
+post-processing is re-applied."
+  (condition-case hook-error
+      (run-hook-with-args 'ebb-render-after-refresh-hook render)
+    (error (message "[ebb] after-refresh hook error: %S" hook-error))))
 
 (defun ebb-render-refresh (render)
   "Refresh RENDER's buffer from the screen model.
@@ -447,8 +461,16 @@ state are reconciled independently so metadata-only updates are visible."
                 (eq (bound-and-true-p ebb--input-mode) 'emacs))
                (saved-point (and preserve-view
                                  (ebb-render-buffer-anchor render (point))))
-               (saved-mark (and preserve-view (mark t)
-                                (ebb-render-buffer-anchor render (mark t))))
+               (saved-mark-position (and preserve-view (mark t)))
+               (saved-mark (and saved-mark-position
+                                (ebb-render-buffer-anchor
+                                 render saved-mark-position)))
+               (saved-mark-in-region
+                (and saved-mark-position
+                     (>= saved-mark-position
+                         (marker-position (ebb-render-state-region-begin render)))
+                     (<= saved-mark-position
+                         (marker-position (ebb-render-state-region-end render)))))
                (saved-mark-active (and preserve-view mark-active))
                (saved-window
                 (and preserve-view
@@ -476,8 +498,12 @@ state are reconciled independently so metadata-only updates are visible."
                   (save-excursion
                     (ebb-render-goto-anchor render saved-mark t)
                     (set-marker (mark-marker) (point)))
-                  (setq mark-active saved-mark-active))
-              (set-marker (mark-marker) nil))
+                  (setq mark-active saved-mark-active)
+                  (setf (ebb-render-state-virtual-mark render) nil))
+              ;; Only drop a mark that lived inside the rebuilt region; a mark
+              ;; in the surrounding buffer (inline Eshell) must survive.
+              (when saved-mark-in-region
+                (set-marker (mark-marker) nil)))
             (when (window-live-p saved-window)
               (let ((window-anchor
                      ;; Point decides whether this window follows the live
@@ -506,10 +532,7 @@ state are reconciled independently so metadata-only updates are visible."
           (ebb-render--apply-viewport-reset render)
           ;; Hook errors must not leave the dirty state set, or every
           ;; subsequent refresh would re-render the same rows forever.
-          (condition-case hook-error
-              (run-hook-with-args 'ebb-render-after-refresh-hook render)
-            (error (message "[ebb] after-refresh hook error: %S"
-                            hook-error)))))
+          (ebb-render--run-after-refresh-hook render)))
       (ebb-screen-clear-dirty screen))))
 
 ;;;; ---- Scrollback Rendering -------------------------------------------
@@ -906,22 +929,66 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
                (slab-end (+ slab-start
                             (ebb-render-state-scrollback-count render))))
           (unless (and (>= row slab-start) (< row slab-end))
-            (let* ((start (min (max 0 (- row (/ capacity 3)))
-                               (max 0 (- history-rows capacity))))
-                   (count (min capacity (- history-rows start)))
-                   (inhibit-read-only t)
+            (let* ((inhibit-read-only t)
                    (inhibit-modification-hooks t)
-                   (buffer-undo-list t))
+                   (buffer-undo-list t)
+                   (other-windows
+                    (cl-loop for other in (get-buffer-window-list
+                                           (ebb-render-state-buffer render)
+                                           nil t)
+                             unless (eq other (selected-window))
+                             collect (list other
+                                           (ebb-render-buffer-anchor
+                                            render (window-start other))
+                                           (ebb-render-buffer-anchor
+                                            render (window-point other)))))
+                   ;; Size the slab from every window anchor, or a window parked
+                   ;; in distant history falls outside the rebuilt slab and
+                   ;; cannot be restored.
+                   (other-rows
+                    (delq nil
+                          (cl-loop for (nil start-anchor window-point-anchor)
+                                   in other-windows
+                                   collect (ebb-render--anchor-history-row
+                                            render start-anchor history-rows)
+                                   collect (ebb-render--anchor-history-row
+                                            render window-point-anchor
+                                            history-rows))))
+                   (wanted-rows (cons row other-rows))
+                   (start (min (max 0 (- (apply #'min wanted-rows)
+                                          (/ capacity 3)))
+                               (max 0 (- history-rows capacity))))
+                   (count (min (- history-rows start)
+                               (max capacity
+                                    (- (min history-rows
+                                            (+ (apply #'max wanted-rows)
+                                               capacity))
+                                       start)))))
               (ebb-render--rebuild-scrollback
                render start count history-rows
-               (ebb-screen-history-generation screen))))
+               (ebb-screen-history-generation screen))
+              ;; The rebuild deletes/reinserts the slab, which collapses other
+              ;; windows' markers; restore their model anchors.
+              (pcase-dolist (`(,other ,start-anchor ,window-point-anchor)
+                             other-windows)
+                (when (window-live-p other)
+                  (when-let* ((position
+                               (ebb-render--anchor-buffer-position
+                                render start-anchor)))
+                    (set-window-start other position t))
+                  (ebb-render--restore-window-point
+                   render other window-point-anchor)))))
           (goto-char (ebb-render-state-region-begin render))
           (forward-line (- row
                            (ebb-render-state-history-start-row render))))
       (goto-char (ebb-render-state-display-begin render))
       (forward-line (- row history-rows)))
     (move-to-column column)
-    (unless no-recenter (recenter))
+    (unless no-recenter
+      ;; `recenter' errors when the buffer is not shown in the selected window.
+      (when (eq (window-buffer (selected-window))
+                (ebb-render-state-buffer render))
+        (recenter)))
     (point)))
 
 (defun ebb-render--line-to-string-scrollback (line width)
@@ -1246,9 +1313,11 @@ image dimensions rather than stretching them over the propertized text run."
                      :failed
                    (gethash key cache missing))))
     (if (not (eq cached missing))
-        (progn
+        (unless (eq cached :failed)
+          ;; `:failed' surfaces are never stored, so they must not enter the
+          ;; LRU order (they would never be evicted by the byte budget).
           (ebb-render--graphics-cache-touch render key)
-          (unless (eq cached :failed) cached))
+          cached)
       (let* ((source-key
               (list (ebb-graphics-image-format image)
                     (and (= (ebb-graphics-image-format image) 32) background)))
@@ -1299,11 +1368,12 @@ image dimensions rather than stretching them over the propertized text run."
                      (if (equal mime "image/png") 'png 'pbm)
                      t :width width :height height :scale 1 :ascent 'center)))
                 (error nil))))
-        (ebb-render--graphics-cache-put
-         render key (or object :failed)
-         (if object
-             (+ (length source) (length (or svg "")) (* width height 4))
-           0))
+        (when object
+          ;; Failed creations are not cached: zero-byte entries never trigger
+          ;; byte-budget eviction and would grow the LRU without bound.
+          (ebb-render--graphics-cache-put
+           render key object
+           (+ (length source) (length (or svg "")) (* width height 4))))
         object))))
 
 (defun ebb-render--graphics-color-id (color)
@@ -2198,8 +2268,16 @@ Used after resize when the display area size has changed."
                 (eq (bound-and-true-p ebb--input-mode) 'emacs))
                (saved-point (and preserve-view
                                  (ebb-render-buffer-anchor render (point))))
-               (saved-mark (and preserve-view (mark t)
-                                (ebb-render-buffer-anchor render (mark t))))
+               (saved-mark-position (and preserve-view (mark t)))
+               (saved-mark (and saved-mark-position
+                                (ebb-render-buffer-anchor
+                                 render saved-mark-position)))
+               (saved-mark-in-region
+                (and saved-mark-position
+                     (>= saved-mark-position
+                         (marker-position (ebb-render-state-region-begin render)))
+                     (<= saved-mark-position
+                         (marker-position (ebb-render-state-region-end render)))))
                (saved-mark-active (and preserve-view mark-active))
                (saved-windows
                 (cl-loop for window in (get-buffer-window-list buffer nil t)
@@ -2287,8 +2365,10 @@ Used after resize when the display area size has changed."
                   (save-excursion
                     (ebb-render-goto-anchor render saved-mark t)
                     (set-marker (mark-marker) (point)))
-                  (setq mark-active saved-mark-active))
-              (set-marker (mark-marker) nil)))
+                  (setq mark-active saved-mark-active)
+                  (setf (ebb-render-state-virtual-mark render) nil))
+              (when saved-mark-in-region
+                (set-marker (mark-marker) nil))))
           (pcase-dolist (`(,window ,start-anchor ,window-point-anchor)
                          saved-windows)
             (when (window-live-p window)
@@ -2303,7 +2383,9 @@ Used after resize when the display area size has changed."
           ;; Update the cursor after window restoration so the live input
           ;; modes can move window-point to the terminal cursor.
           (ebb-render--update-cursor render)
-          (ebb-render--apply-viewport-reset render))))))
+          (ebb-render--apply-viewport-reset render)
+          ;; A full rebuild drops link/shell properties; re-apply them.
+          (ebb-render--run-after-refresh-hook render))))))
 
 (defun ebb-render-resize-height (render)
   "Rebuild only RENDER's viewport after a height-only terminal resize."
@@ -2375,7 +2457,9 @@ Used after resize when the display area size has changed."
           (ebb-render--update-cursor render)
           (ebb-render--apply-viewport-reset render)
           (ebb-screen-clear-dirty screen)
-          (ebb-screen-clear-scrollback-dirty screen))))))
+          (ebb-screen-clear-scrollback-dirty screen)
+          ;; A full rebuild drops link/shell properties; re-apply them.
+          (ebb-render--run-after-refresh-hook render))))))
 
 ;;;; ---- Cleanup --------------------------------------------------------
 

@@ -217,6 +217,44 @@ Binds `screen' and `parser' in BODY."
         (should (equal vs (ebb-cell-combining cell))))
       (should (equal '(2 . 0) (ebb-test-cursor screen))))))
 
+(ert-deftest ebb-test-wrap-below-scroll-region-keeps-cursor-on-screen ()
+  "Autowrap below the scroll region must not move the cursor off screen."
+  (ebb-test-with-screen (:width 8 :height 4)
+    (ebb-test-output parser "\e[1;2r\e[4;8H")
+    (ebb-test-output parser "a")
+    (should (ebb-screen-pending-wrap screen))
+    ;; The next byte wraps.  Before the fix this raised args-out-of-range and
+    ;; left the cursor at row 4, wedging every later write.
+    (ebb-test-output parser "b")
+    (should (= 3 (ebb-screen-cursor-y screen)))
+    (should (< (ebb-screen-cursor-y screen) (ebb-screen-height screen)))
+    (should (= 1 (ebb-screen-cursor-x screen)))))
+
+(ert-deftest ebb-test-wide-wrap-below-scroll-region-keeps-cursor-on-screen ()
+  "The wide-character pre-wrap path applies the same off-screen clamp."
+  (ebb-test-with-screen (:width 8 :height 4)
+    (ebb-test-output parser "\e[1;2r\e[4;8H")
+    (ebb-test-output parser "a")
+    (ebb-test-output parser "\u4e2d")
+    (should (< (ebb-screen-cursor-y screen) (ebb-screen-height screen)))
+    (should (string-prefix-p "\u4e2d" (ebb-test-display-line screen 3)))))
+
+(ert-deftest ebb-test-wide-char-wrap-renders-and-survives-overwrite ()
+  "A wide character that wraps must render and not be lost on later writes."
+  (ebb-test-with-screen (:width 8 :height 3)
+    (ebb-test-output parser "\e[1;8H")
+    (ebb-test-output parser "\u4e2d")
+    (should (equal "\u4e2d" (ebb-test-display-line screen 1)))
+    ;; The wrapped-to row must not keep a stale text cache that the renderer
+    ;; prefers over its cells.
+    (should (string-prefix-p
+             "\u4e2d"
+             (substring-no-properties
+              (ebb-render--line-to-string
+               (ebb-screen-get-line screen 1) 8))))
+    (ebb-test-output parser "AB")
+    (should (equal "\u4e2dAB" (ebb-test-display-line screen 1)))))
+
 (ert-deftest ebb-test-auto-wrap ()
   "Auto-wrap moves to next line at end of line."
   (ebb-test-with-screen (:width 5 :height 3)
@@ -437,8 +475,8 @@ Binds `screen' and `parser' in BODY."
   (ebb-test-with-screen (:width 10 :height 3)
     (ebb-screen-cursor-goto screen 0 0)
     (mapc (lambda (c) (ebb-screen-write-char screen c)) (string-to-list "main"))
-    ;; Enter alt screen
-    (ebb-screen-enter-alt screen)
+    ;; Enter alt screen (1049-style: home the cursor)
+    (ebb-screen-enter-alt screen t)
     (should (equal "" (ebb-test-display-line screen 0)))
     (should (equal '(0 . 0) (ebb-test-cursor screen)))
     ;; Write on alt screen
@@ -447,6 +485,45 @@ Binds `screen' and `parser' in BODY."
     ;; Leave alt screen
     (ebb-screen-leave-alt screen)
     (should (equal "main" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-alt-screen-mode-47 ()
+  "DECSET/DECRST 47 switch to and from the alternate screen."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "main")
+    (ebb-test-output parser "\e[?47h")
+    (should (ebb-screen-alt-screen screen))
+    (ebb-test-output parser "alt")
+    (ebb-test-output parser "\e[?47l")
+    (should-not (ebb-screen-alt-screen screen))
+    (should (equal "main" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-alt-screen-resets-horizontal-margins ()
+  "A buffer switch clears DECLRMM horizontal margins in both directions."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e[?69h\e[3;10s")
+    (should (ebb-screen-horizontal-margins-enabled-p screen))
+    (ebb-test-output parser "\e[?1049h")
+    (should-not (ebb-screen-horizontal-margins-enabled-p screen))
+    (ebb-test-output parser "\e[?69h\e[3;10s")
+    (should (ebb-screen-horizontal-margins-enabled-p screen))
+    (ebb-test-output parser "\e[?1049l")
+    (should-not (ebb-screen-horizontal-margins-enabled-p screen))))
+
+(ert-deftest ebb-test-dsr-private-reports-question-mark ()
+  "DECXCPR (private DSR) prefixes the cursor report with '?'."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser) (lambda (s) (push s responses)))
+      (ebb-test-output parser "\e[2;3H\e[?6n")
+      (should (equal '("\e[?2;3R") responses)))))
+
+(ert-deftest ebb-test-charset-designate-executes-intervening-c0 ()
+  "A C0 control inside ESC ( is executed, then the designator applies."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e(\nB")
+    (should (equal '(0 . 1) (ebb-test-cursor screen)))
+    (should (equal "" (ebb-test-display-line screen 0)))
+    (should (eq 'us-ascii (ebb-screen-charset-g0 screen)))))
 
 (ert-deftest ebb-test-save-restore-cursor ()
   "DECSC/DECRC preserve position, attributes, modes, and character sets."
@@ -2074,7 +2151,7 @@ Binds `screen' and `parser' in BODY."
   "The t=s medium reads and unlinks a local POSIX shared-memory object."
   (skip-unless (executable-find "python3"))
   (skip-unless (file-writable-p "/dev/shm"))
-  (let* ((name (format "ebb-kitty-%d" (emacs-pid)))
+  (let* ((name (format "ebb-kitty-tty-graphics-protocol-%d" (emacs-pid)))
          (path (expand-file-name name "/dev/shm"))
          (data (unibyte-string 1 2 3)))
     (unwind-protect
@@ -2092,6 +2169,18 @@ Binds `screen' and `parser' in BODY."
               (should (equal '("\e_Gi=7;OK\e\\") responses))
               (should-not (file-exists-p path)))))
       (ignore-errors (delete-file path)))))
+
+(ert-deftest ebb-test-kitty-shm-name-must-be-kitty-temporary ()
+  "A t=s name outside the kitty temporary namespace is refused."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output
+       parser (format "\e_Ga=q,f=24,s=1,v=1,i=7,t=s;%s\e\\"
+                      (base64-encode-string "some-other-shm" t)))
+      (should (equal '("\e_Gi=7;EBADF:unsupported shared memory name\e\\")
+                     responses)))))
 
 (ert-deftest ebb-test-parse-kitty-rejects-id-with-number ()
   "Specifying both i and I is an error, and query validates its payload."
@@ -2332,6 +2421,17 @@ Binds `screen' and `parser' in BODY."
             (ebb-graphics-state-placements state))
       (should-not (ebb-graphics--store-image state second 24 1 1 "def"))
       (should (gethash 1 (ebb-graphics-state-images state))))))
+
+(ert-deftest ebb-test-kitty-image-count-limit ()
+  "Unreferenced images are evicted to honor the image count cap."
+  (let ((ebb-kitty-graphics-image-count-limit 2)
+        (ebb-kitty-graphics-storage-limit (* 1024 1024))
+        (state (ebb-graphics-create)))
+    (dotimes (_ 3)
+      (should (ebb-graphics--store-image
+               state (make-hash-table) 24 1 1 "abc")))
+    (should (<= (hash-table-count (ebb-graphics-state-images state)) 2))
+    (should (<= (length (ebb-graphics-state-image-order state)) 2))))
 
 (ert-deftest ebb-test-kitty-placement-resources-are-bounded ()
   "Surface dimensions and retained placement count have independent limits."
@@ -5029,6 +5129,9 @@ the pixel helper is coalesced."
         (cl-letf (((symbol-function 'ebb-parse-bytes)
                    (lambda (&rest _) (error "test failure"))))
           (ebb-io--process-pending io t)
+          ;; A parse error now discards the offending chunk, so feed another
+          ;; one to exercise the consecutive-error counter.
+          (ebb-io--enqueue-output io "bad")
           (ebb-io--process-pending io t))
         (should (equal '(2 1) counts))))))
 
@@ -5792,8 +5895,11 @@ the pixel helper is coalesced."
     ;; Local host: plain path.
     (should (equal "/home/u" (ebb--cwd-to-path "/home/u" (system-name))))
     (should (equal "/home/u" (ebb--cwd-to-path "/home/u" "")))
-    ;; Remote host, no existing prefix: build via default method.
-    (let ((ebb-tramp-default-method "ssh"))
+    ;; Remote host, no existing prefix: untrusted by default, so the path
+    ;; stays local; with trust enabled, build via the default method.
+    (should (equal "/home/u" (ebb--cwd-to-path "/home/u" "box")))
+    (let ((ebb-tramp-default-method "ssh")
+          (ebb-trust-osc7-remote-hosts t))
       (should (equal "/ssh:box:/home/u"
                      (ebb--cwd-to-path "/home/u" "box"))))
     ;; Empty or nil dir: nil.
@@ -5813,8 +5919,12 @@ the pixel helper is coalesced."
       ;; (containers often report 127.0.0.1).
       (should (equal "/ssh:user@box:/home/u"
                      (ebb--cwd-to-path "/home/u" "127.0.0.1")))
-      ;; A different host means the user ssh'd onward: fresh TRAMP path.
-      (let ((ebb-tramp-default-method "ssh"))
+      ;; A different host is ignored unless remote hosts are trusted; the
+      ;; existing prefix is kept, so a hostile report cannot redirect it.
+      (should (equal "/ssh:user@box:/home/u"
+                     (ebb--cwd-to-path "/home/u" "other")))
+      (let ((ebb-tramp-default-method "ssh")
+            (ebb-trust-osc7-remote-hosts t))
         (should (equal "/ssh:other:/home/u"
                        (ebb--cwd-to-path "/home/u" "other"))))
       ;; The report names this machine again: the user left ssh and the
@@ -5834,7 +5944,11 @@ the pixel helper is coalesced."
       (should (equal "/ssh:user@box.example.org:/home/u"
                      (ebb--cwd-to-path "/home/u" "box")))
       ;; Equal first labels do not make distinct FQDNs the same host.
-      (let ((ebb-tramp-default-method "ssh"))
+      ;; Untrusted, the existing prefix is kept; trusting builds a fresh path.
+      (should (equal "/ssh:user@box.example.org:/home/u"
+                     (ebb--cwd-to-path "/home/u" "box.example.net")))
+      (let ((ebb-tramp-default-method "ssh")
+            (ebb-trust-osc7-remote-hosts t))
         (should (equal "/ssh:box.example.net:/home/u"
                        (ebb--cwd-to-path "/home/u"
                                          "box.example.net")))))))
@@ -6017,6 +6131,160 @@ cell is 9x18 unless overridden."
       (should (equal "a中b" (substring-no-properties s 0 3)))
       (should (equal 2 (get-text-property 1 'ebb-cell-width s)))
       (should-not (get-text-property 0 'ebb-cell-width s)))))
+
+(ert-deftest ebb-test-kitty-image-count-limit-zero-rejects ()
+  "A zero image-count limit retains no images."
+  (let ((ebb-kitty-graphics-image-count-limit 0)
+        (ebb-kitty-graphics-storage-limit (* 1024 1024))
+        (state (ebb-graphics-create)))
+    (should-not (ebb-graphics--store-image
+                 state (make-hash-table) 24 1 1 "abc"))
+    (should (zerop (hash-table-count (ebb-graphics-state-images state))))))
+
+(ert-deftest ebb-test-kitty-image-count-limit-replacement-evicts ()
+  "Replacing an image after the count limit drops still evicts."
+  (let ((ebb-kitty-graphics-image-count-limit 3)
+        (ebb-kitty-graphics-storage-limit (* 1024 1024))
+        (state (ebb-graphics-create)))
+    (dotimes (_ 3)
+      (should (ebb-graphics--store-image
+               state (make-hash-table) 24 1 1 "abc")))
+    (let ((ebb-kitty-graphics-image-count-limit 2)
+          (params (make-hash-table)))
+      (puthash ?i "1" params)
+      (should (ebb-graphics--store-image state params 24 1 1 "def")))
+    (should (<= (hash-table-count (ebb-graphics-state-images state)) 2))))
+
+(ert-deftest ebb-test-io-pending-byte-cap-counts-bytes ()
+  "The pending-byte cap measures decoded multibyte output in bytes."
+  (let ((ebb-io-max-pending-bytes 4)
+        (io (make-ebb-io)))
+    ;; Three two-byte characters are six bytes, over the four-byte cap.
+    (ebb-io--enqueue-output io "\u00e9\u00e9\u00e9")
+    (should (zerop (ebb-io-pending-bytes io)))
+    (should (= 6 (ebb-io-dropped-bytes io)))
+    (ebb-io--enqueue-output io "\u00e9")
+    (should (= 2 (ebb-io-pending-bytes io)))))
+
+(ert-deftest ebb-test-io-normalize-pending-decrements-bytes ()
+  "Dropping a consumed multibyte chunk decrements the byte total."
+  (let ((io (make-ebb-io)))
+    (ebb-io--enqueue-output io "\u00e9\u00e9")
+    (should (= 4 (ebb-io-pending-bytes io)))
+    ;; The offset is character-based, the byte total is not.
+    (setf (ebb-io-pending-offset io) 2)
+    (ebb-io--normalize-pending io)
+    (should (zerop (ebb-io-pending-bytes io)))
+    (should-not (ebb-io-pending-chunks io))))
+
+(ert-deftest ebb-test-reset-clears-alt-saved-cursor ()
+  "A reset discards alternate-screen DECSC state."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-parse-bytes parser "\e[2;3H\e7\e[?1049h\e[?1049l")
+    (should (gethash screen ebb--alt-saved-cursors))
+    (ebb-parse-bytes parser "\ec")
+    (should-not (gethash screen ebb--alt-saved-cursors))
+    (should-not (ebb-screen-cursor-saved-p screen))))
+
+(ert-deftest ebb-test-alt-screen-mode-47-retains-grid ()
+  "DECSET 47 preserves the alternate grid across switches."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "main")
+    (ebb-test-output parser "\e[?47h\e[Halt")
+    (ebb-test-output parser "\e[?47l")
+    (should (equal "main" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[?47h")
+    (should (equal "alt" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-inactive-alt-screen-resize ()
+  "Resize retained alternate grids without reflow, including cursor and margins."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e[?47h\e[Habcdefghij\e[2;3r\e[3;10H\e[?47l")
+    (ebb-screen-resize screen 12 5)
+    (ebb-test-output parser "\e[?47h")
+    (should (= 5 (length (ebb-screen-lines screen))))
+    (should (equal "abcdefghij" (ebb-test-display-line screen 0)))
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 4 (ebb-screen-scroll-bottom screen)))
+    (ebb-test-output parser "\e[5;12HX\e[?47l")
+    (ebb-screen-resize screen 4 2)
+    (ebb-test-output parser "\e[?47h")
+    (should (= 2 (length (ebb-screen-lines screen))))
+    (should (equal "abcd" (ebb-test-display-line screen 0)))
+    (should (= 3 (ebb-screen-cursor-x screen)))
+    (should (= 1 (ebb-screen-cursor-y screen)))
+    (should (= 0 (ebb-screen-scroll-top screen)))
+    (should (= 1 (ebb-screen-scroll-bottom screen)))
+    (ebb-test-output parser "\e[2;4HY")
+    (should (equal "   Y" (ebb-test-display-line screen 1)))))
+
+(ert-deftest ebb-test-alt-screen-mode-1047-clears-on-reset ()
+  "DECRST 1047 clears alternate contents, unlike DECRST 47."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "main\e[?1047h\e[HSECRET\e[?1047l")
+    (should (equal "main" (ebb-test-display-line screen 0)))
+    (ebb-test-output parser "\e[?47h")
+    (dotimes (row 3)
+      (should (equal "" (ebb-test-display-line screen row))))))
+
+(ert-deftest ebb-test-cwd-to-path-rejects-untrusted-tramp-dir ()
+  "A local terminal cannot adopt a TRAMP-shaped OSC 7 path by default."
+  (with-temp-buffer
+    (setq-local default-directory "/tmp/")
+    (should-not (ebb--cwd-to-path "/ssh:attacker:/tmp" ""))
+    (should-not (ebb--cwd-to-path "/ssh:attacker:/tmp" (system-name)))
+    (ebb--set-shell-cwd "/ssh:attacker:/tmp")
+    (should (equal "/tmp/" default-directory))
+    ;; With remote hosts trusted, the report is honored.
+    (let ((ebb-trust-osc7-remote-hosts t))
+      (should (equal "/ssh:attacker:/tmp"
+                     (ebb--cwd-to-path "/ssh:attacker:/tmp" ""))))))
+
+(ert-deftest ebb-test-render-goto-location-keeps-distant-window ()
+  "Jumping to history preserves another window's distant position."
+  (let* ((screen (ebb-screen-create 20 6))
+         (parser (ebb-parse-create screen))
+         (buffer (generate-new-buffer " *ebb-test-goto-distant*")))
+    (cl-flet ((line-at (position)
+                (with-current-buffer buffer
+                  (save-excursion
+                    (goto-char position)
+                    (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))))
+      (unwind-protect
+          (save-window-excursion
+            (delete-other-windows)
+            (switch-to-buffer buffer)
+            (setq-local ebb--input-mode 'emacs)
+            (let* ((render (ebb-render-create screen buffer))
+                   (distant (selected-window))
+                   (target (split-window)))
+              (setq-local ebb--render render)
+              (set-window-buffer distant buffer)
+              (set-window-buffer target buffer)
+              (dotimes (i 400)
+                (ebb-test-output parser (format "line-%04d\r\n" i)))
+              (ebb-render-refresh render)
+              (let ((total (ebb-screen-history-row-count screen)))
+                (ebb-render--rebuild-scrollback
+                 render 0 total total
+                 (ebb-screen-history-generation screen))
+                (let ((region-begin (ebb-render-state-region-begin render)))
+                  (set-window-start
+                   distant
+                   (with-current-buffer buffer
+                     (save-excursion
+                       (goto-char region-begin)
+                       (forward-line 330)
+                       (point)))
+                   t))
+                (let ((line (line-at (window-start distant))))
+                  ;; Jump the selected window to early history; the other
+                  ;; window's row must stay inside the rebuilt slab.
+                  (select-window target)
+                  (ebb-render-goto-location render 5 0 t)
+                  (should (equal line (line-at (window-start distant))))))))
+        (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
 (provide 'ebb-test)
 ;;; ebb-test.el ends here

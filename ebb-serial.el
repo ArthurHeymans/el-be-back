@@ -300,7 +300,11 @@ Emacs does not currently expose a portable serial-break primitive."
   (format "%s=%d" name (if enabled 1 0)))
 
 (defun ebb-serial--socat-open-address (port)
-  "Return a socat OPEN address for serial PORT using current settings."
+  "Return a socat OPEN address for serial PORT using current settings.
+PORT must not contain a comma or control character: socat's OPEN address
+uses commas to separate options, so an unescaped one would inject them."
+  (when (string-match-p "[\0-\x1f,\x7f]" port)
+    (user-error "Invalid serial port name %S" port))
   (let ((options (list "echo=0" "raw")))
     (when ebb-serial--speed
       (push (format "b%s" ebb-serial--speed) options))
