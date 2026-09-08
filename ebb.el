@@ -1,10 +1,11 @@
-;;; ebb.el --- Terminal emulator for Emacs -*- lexical-binding: t; -*-
+;;; ebb.el --- Terminal emulator -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2026
 ;; Author: Arthur
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: terminals, processes
+;; URL: https://github.com/ArthurHeymans/el-be-back
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
 ;;; Commentary:
@@ -253,7 +254,7 @@ Options: `char', `semi-char', `emacs'."
 
 (defun ebb--require-running-terminal ()
   "Return the current terminal I/O state or signal `user-error'."
-  (unless (or (eq major-mode 'ebb-mode)
+  (unless (or (derived-mode-p 'ebb-mode)
               (bound-and-true-p ebb-eshell--io))
     (user-error "Not in a Ebb buffer"))
   (let ((process (and ebb--io (ebb-io-process ebb--io))))
@@ -616,7 +617,7 @@ selected window."
 (defun ebb-copy-all ()
   "Copy all terminal scrollback and viewport text to the kill ring."
   (interactive)
-  (unless (and (eq major-mode 'ebb-mode) ebb--screen)
+  (unless (and (derived-mode-p 'ebb-mode) ebb--screen)
     (user-error "Not in a Ebb buffer"))
   (let ((text (ebb-screen-plain-text ebb--screen)))
     (kill-new text)
@@ -721,7 +722,7 @@ selected window."
     (ebb-render-full-reset (ebb-io-render ebb--io))))
 
 (defun ebb--handle-event (type &rest args)
-  "Handle events emitted by the parser."
+  "Handle TYPE events emitted by the parser, with ARGS."
   (pcase type
     ('bell (ding t))
     ('title
@@ -1215,7 +1216,7 @@ prompt for the program to run.  PROGRAM defaults to `ebb-default-shell'
 or `$SHELL'.
 
 When `default-directory' is remote, spawns the remote shell via TRAMP
-(see `ebb-tramp-shells').  Shell integration is not deployed to the
+\(see `ebb-tramp-shells').  Shell integration is not deployed to the
 remote host: cwd tracking there requires the remote rc files to emit
 OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
 `integration/' directory)."
@@ -1244,7 +1245,7 @@ OSC 7/51 themselves (e.g. by sourcing the scripts in ebb's
 
 ;;;###autoload
 (defun ebb-other-window (&optional program)
-  "Start a terminal in another window."
+  "Start a terminal running PROGRAM in another window."
   (interactive)
   (ebb--start program #'switch-to-buffer-other-window))
 
@@ -1419,7 +1420,9 @@ Local paths omit the hostname; remote TRAMP paths keep the host."
                ebb--progress))
    " "))
 
-(add-hook 'ebb-io-after-render-functions #'ebb--detect-password-prompt)
+;; Internal after-render handlers are registered by
+;; `ebb-io-create-terminal', which also covers Eshell and serial
+;; terminals that never enable `ebb-mode'.
 
 (require 'ebb-eshell)
 

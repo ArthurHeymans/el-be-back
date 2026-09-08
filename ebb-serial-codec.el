@@ -6,7 +6,6 @@
 ;; Maintainer: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.1.1
 ;; Keywords: terminals, serial, processes
-;; Package-Requires: ((emacs "29.1"))
 ;; URL: https://github.com/ArthurHeymans/el-be-back
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 

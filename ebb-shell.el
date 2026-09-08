@@ -105,8 +105,9 @@ Either `left-margin' or `right-margin'."
 Each entry is (TYPE . DATA) where TYPE is a symbol.")
 
 (defvar-local ebb-shell--prompt-start-line nil
-  "Absolute line number (scrollback + display row) where the current
-prompt started.  Set during parsing, consumed after render.")
+  "Absolute line number where the current prompt started.
+The number combines scrollback and display rows.  Set during parsing,
+consumed after render.")
 
 ;; Buffer state (set after render)
 (defvar-local ebb-shell--prompt-mark nil
@@ -293,7 +294,8 @@ after `ebb-render-refresh'."
     (when ebb-enable-shell-prompt-annotation
       (ebb-shell--schedule-overlay-correction))))
 
-(add-hook 'ebb-io-after-render-functions #'ebb-shell-post-render)
+;; `ebb-shell-post-render' is registered on
+;; `ebb-io-after-render-functions' by `ebb-io-create-terminal'.
 
 (defun ebb-shell--line-to-buffer-pos (render abs-line &optional column)
   "Convert ABS-LINE and COLUMN to a buffer position in RENDER."
@@ -533,19 +535,19 @@ Should be called when the buffer is killed."
 (defvar ebb-shell-integration-directory
   (expand-file-name "integration" ebb-shell--install-path)
   "Directory containing shell integration scripts.
-This is passed to shells via the `EBB_SHELL_INTEGRATION_DIR'
-and `EAT_SHELL_INTEGRATION_DIR' environment variables.")
+This is passed to shells via the \"EBB_SHELL_INTEGRATION_DIR\"
+and \"EAT_SHELL_INTEGRATION_DIR\" environment variables.")
 
 (defcustom ebb-terminfo-directory
   (expand-file-name "terminfo" ebb-shell--install-path)
   "Directory containing terminfo databases.
-Set `TERMINFO' env var so terminal programs find the ebb-truecolor
+Set the \"TERMINFO\" env var so terminal programs find the ebb-truecolor
 terminfo entry."
   :type 'directory
   :group 'ebb-shell)
 
 (defcustom ebb-term-name "ebb-truecolor"
-  "Value of `TERM' environment variable for ebb terminals.
+  "Value of the \"TERM\" environment variable for ebb terminals.
 Should match an available terminfo entry."
   :type 'string
   :group 'ebb-shell)

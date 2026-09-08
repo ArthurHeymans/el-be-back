@@ -112,17 +112,17 @@ configurable bound improves compatibility with clients that send larger APCs."
     (gethash mode states)))
 
 (defun ebb-parse--log (fmt &rest args)
-  "Log a parser message when debug is enabled."
+  "Log a parser message formatted by FMT with ARGS when debug is enabled."
   (when ebb-parse-debug
     (apply #'message (concat "[ebb-parse] " fmt) args)))
 
 (defun ebb-parse--respond (parser response)
-  "Send RESPONSE string back to the PTY."
+  "Send RESPONSE string back to the PTY for PARSER."
   (when-let* ((fn (ebb-parser-write-fn parser)))
     (funcall fn response)))
 
 (defun ebb-parse--color-to-xterm (color-str)
-  "Convert an Emacs color string to xterm rgb:RRRR/GGGG/BBBB format."
+  "Convert Emacs color string COLOR-STR to xterm rgb:RRRR/GGGG/BBBB format."
   (cond
    ((not color-str)
     "rgb:ffff/ffff/ffff")
@@ -165,14 +165,15 @@ configurable bound improves compatibility with clients that send larger APCs."
   (ebb-parse--color-to-xterm (ebb-parse--256color-hex n)))
 
 (defun ebb-parse--emit (parser type &rest args)
-  "Emit an event TYPE with ARGS via the parser callback."
+  "Emit an event TYPE with ARGS via PARSER's callback."
   (when-let* ((fn (ebb-parser-emit-fn parser)))
     (apply fn type args)))
 
 ;;;; ---- Parameter Parsing ----------------------------------------------
 
 (defun ebb-parse--parse-params (param-str)
-  "Parse CSI parameter string into a vector of integers or sub-param lists.
+  "Parse CSI parameter string PARAM-STR into a vector.
+Elements are integers or sub-param lists.
 Splits on semicolons.  Within each parameter, colons delimit sub-parameters.
 A parameter with colons becomes a list of integers; without, a plain integer.
 Empty segments become 0.  Values clamped to 16384."
@@ -353,8 +354,9 @@ non-parameter byte."
     (and ok (cons row col))))
 
 (defun ebb-parse--fast-csi-at (parser string start end)
-  "Handle a common CSI beginning at START, returning the next index.
-START is the first byte after ESC [.  Return nil when the sequence is not one
+  "Handle a common CSI in STRING beginning at START, returning the next index.
+STRING carries PARSER's pending bytes and END bounds the scan.  START is the
+first byte after ESC [.  Return nil when the sequence is not one
 of the simple forms handled here."
   (catch 'done
     (let ((j start)
@@ -398,7 +400,8 @@ of the simple forms handled here."
            (t (throw 'done nil))))))))
 
 (defun ebb-parse--fast-sgr-at (parser string start end)
-  "Apply simple SGR params from STRING[START, END); return non-nil if handled.
+  "Apply simple SGR params from STRING[START, END) for PARSER;
+return non-nil if handled.
 This avoids the allocation-heavy generic `split-string' parameter parser for
 common color-heavy output.  The caller has already verified that the bytes are
 only digits and semicolons."
@@ -436,7 +439,7 @@ only digits and semicolons."
             t)))))))
 
 (defun ebb-parse--fast-simple-sgr-at (screen string start end)
-  "Handle the shortest and most frequent SGR forms in STRING[START, END)."
+  "Handle the shortest and most frequent SGR forms on SCREEN in STRING[START, END)."
   (let ((len (- end start)))
     (cond
      ((and (= len 1) (= (aref string start) ?0))
@@ -458,7 +461,7 @@ only digits and semicolons."
 ;;;; ---- Main Dispatch --------------------------------------------------
 
 (defun ebb-parse--process-char (parser ch)
-  "Process a single character CH through the parser state machine."
+  "Process a single character CH through PARSER's state machine."
   (cond
    ;; ESC always starts a new escape sequence
    ((= ch ?\e)
@@ -522,7 +525,7 @@ only digits and semicolons."
 ;;;; ---- C0 Control Dispatch --------------------------------------------
 
 (defun ebb-parse--dispatch-c0 (parser ch)
-  "Handle C0 control character CH."
+  "Handle C0 control character CH for PARSER."
   (let ((screen (ebb-parser-screen parser)))
     (cond
      ((= ch ?\a) (ebb-parse--emit parser 'bell))          ; BEL
@@ -539,14 +542,14 @@ only digits and semicolons."
 ;;;; ---- State: Ground --------------------------------------------------
 
 (defun ebb-parse--ground (parser ch)
-  "Handle printable character in ground state."
+  "Handle printable character CH in PARSER's ground state."
   (when (>= ch ?\s)
     (ebb-screen-write-char (ebb-parser-screen parser) ch)))
 
 ;;;; ---- State: Escape --------------------------------------------------
 
 (defun ebb-parse--escape (parser ch)
-  "Handle character after ESC."
+  "Handle character CH after ESC for PARSER."
   ;; Preserve DCS intermediates only for the ESC \\ string terminator.
   (unless (and (= ch ?\\) (ebb-parser-string-state parser))
     (setf (ebb-parser-intermediates parser) ""))
@@ -602,7 +605,8 @@ only digits and semicolons."
     (setf (ebb-parser-state parser) :ground))))
 
 (defun ebb-parse--escape-intermediate (parser ch)
-  "Collect and dispatch an ESC sequence with intermediate bytes."
+  "Collect and dispatch an ESC sequence with intermediate bytes.
+CH is the latest byte; PARSER holds the sequence state."
   (cond
    ((and (>= ch ?\s) (<= ch ?/))
     (if (ebb-parse--collect-control-header-byte-p parser)
@@ -616,13 +620,13 @@ only digits and semicolons."
     (setf (ebb-parser-state parser) :ground))))
 
 (defun ebb-parse--escape-ignored (parser ch)
-  "Ignore an overlong ESC sequence through its final byte."
+  "Ignore an overlong ESC sequence for PARSER, examining byte CH."
   (when (or (and (>= ch ?0) (<= ch ?~))
             (not (and (>= ch ?\s) (<= ch ?/))))
     (setf (ebb-parser-state parser) :ground)))
 
 (defun ebb-parse--dispatch-esc-intermediate (parser ch)
-  "Dispatch an ESC sequence ending in CH after intermediate bytes."
+  "Dispatch an ESC sequence for PARSER ending in CH after intermediate bytes."
   (let ((intermediates (ebb-parser-intermediates parser))
         (screen (ebb-parser-screen parser)))
     (condition-case err
@@ -646,7 +650,7 @@ only digits and semicolons."
                        intermediates ch err)))))
 
 (defun ebb-parse--dispatch-esc (parser ch)
-  "Dispatch a simple ESC sequence."
+  "Dispatch a simple ESC sequence for PARSER, ending in CH."
   (let ((screen (ebb-parser-screen parser)))
     (condition-case err
         (pcase ch
@@ -670,7 +674,7 @@ only digits and semicolons."
       (error (ebb-parse--log "ESC dispatch error for %c: %S" ch err)))))
 
 (defun ebb-parse--complete-string (parser)
-  "Complete a pending OSC, DCS, or APC string."
+  "Complete PARSER's pending OSC, DCS, or APC string."
   (pcase (ebb-parser-string-state parser)
     (:osc (ebb-parse--dispatch-osc parser))
     (:dcs (ebb-parse--dispatch-dcs parser))
@@ -679,7 +683,7 @@ only digits and semicolons."
 ;;;; ---- State: CSI Entry -----------------------------------------------
 
 (defun ebb-parse--csi-entry (parser ch)
-  "Handle first char after CSI (ESC [)."
+  "Handle first char CH after CSI (ESC [) for PARSER."
   (cond
    ;; Private marker
    ((memq ch '(?? ?> ?=))
@@ -708,7 +712,7 @@ only digits and semicolons."
 ;;;; ---- State: CSI Param -----------------------------------------------
 
 (defun ebb-parse--csi-param (parser ch)
-  "Collect CSI parameters."
+  "Collect CSI parameter byte CH into PARSER."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;) (= ch ?:))
     (if (ebb-parse--collect-control-header-byte-p parser)
@@ -728,7 +732,7 @@ only digits and semicolons."
 ;;;; ---- State: CSI Intermediate ----------------------------------------
 
 (defun ebb-parse--csi-intermediate (parser ch)
-  "Collect CSI intermediate bytes."
+  "Collect CSI intermediate byte CH into PARSER."
   (cond
    ((and (>= ch ?\s) (<= ch ?/))
     (if (ebb-parse--collect-control-header-byte-p parser)
@@ -744,8 +748,8 @@ only digits and semicolons."
    (t (setf (ebb-parser-state parser) :ground))))
 
 (defun ebb-parse--csi-ignored (parser ch)
-  "Consume the remainder of a malformed CSI sequence.
-The sequence ends at the first final byte; C0 controls and ESC are handled
+  "Consume the remainder of a malformed CSI sequence in PARSER.
+The sequence ends at the first final byte CH; C0 controls and ESC are handled
 in process-char."
   (when (and (>= ch ?@) (<= ch ?~))
     (setf (ebb-parser-state parser) :ground)))
@@ -753,7 +757,7 @@ in process-char."
 ;;;; ---- State: OSC String ----------------------------------------------
 
 (defun ebb-parse--osc-string (parser ch)
-  "Collect OSC string payload."
+  "Collect OSC string payload byte CH into PARSER."
   (cond
    ;; BEL terminates
    ((= ch ?\a)
@@ -770,7 +774,7 @@ in process-char."
 ;;;; ---- State: DCS Entry/Param/Passthrough -----------------------------
 
 (defun ebb-parse--dcs-entry (parser ch)
-  "Handle first char after DCS (ESC P)."
+  "Handle first char CH after DCS (ESC P) for PARSER."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;))
     (if (ebb-parse--collect-control-header-byte-p parser)
@@ -791,7 +795,7 @@ in process-char."
    (t (setf (ebb-parser-state parser) :ground))))
 
 (defun ebb-parse--dcs-param (parser ch)
-  "Collect DCS parameters."
+  "Collect DCS parameter byte CH into PARSER."
   (cond
    ((or (and (>= ch ?0) (<= ch ?9)) (= ch ?\;))
     (if (ebb-parse--collect-control-header-byte-p parser)
@@ -811,7 +815,7 @@ in process-char."
    (t (setf (ebb-parser-state parser) :ground))))
 
 (defun ebb-parse--dcs-passthrough (parser ch)
-  "Accumulate DCS body.  ESC handled in process-char for ST."
+  "Accumulate DCS body byte CH into PARSER.  ESC handled in process-char for ST."
   ;; Just accumulate (limit for safety)
   (when (< (ebb-parser-dcs-length parser) 1048576)
     (push (string ch) (ebb-parser-dcs-parts parser))
@@ -823,7 +827,7 @@ in process-char."
 ;;;; ---- State: Charset Designate ---------------------------------------
 
 (defun ebb-parse--charset-designate (parser ch)
-  "Handle charset designation: ESC SLOT CH."
+  "Handle charset designation for PARSER: ESC SLOT CH."
   (ebb-screen-designate-charset
    (ebb-parser-screen parser)
    (ebb-parser-charset-slot parser)
@@ -855,14 +859,15 @@ in process-char."
         (setf (ebb-parser-apc-overflow parser) t)))))
 
 (defun ebb-parse--sos-pm-apc (parser ch)
-  "Consume SOS/PM/APC strings until ST.  Retain bounded Kitty APC data."
+  "Consume SOS/PM/APC string byte CH for PARSER until ST.
+Retain bounded Kitty APC data."
   ;; VT500 ignores C0 controls in this state (CAN/SUB and ESC are handled by
   ;; the outer dispatcher).
   (when (>= ch ?\s)
     (ebb-parse--apc-collect parser (string ch))))
 
 (defun ebb-parse--dispatch-apc (parser)
-  "Dispatch a completed APC control string."
+  "Dispatch PARSER's completed APC control string."
   (let ((active (ebb-parser-apc-active parser))
         (overflow (ebb-parser-apc-overflow parser))
         (payload (apply #'concat
@@ -947,7 +952,7 @@ in process-char."
 ;;;; ---- CSI Dispatch Table ---------------------------------------------
 
 (defun ebb-parse--csi-unknown (parser params)
-  "Handler for unrecognized CSI sequences."
+  "Handle unrecognized CSI sequence PARAMS for PARSER."
   (ebb-parse--log "Unknown CSI %s %s %c"
                     (or (ebb-parser-private parser) "")
                     (ebb-parser-param-string parser)
@@ -997,7 +1002,8 @@ in process-char."
   "CSI final-byte dispatch table.  Indexed by character code.")
 
 (defun ebb-parse--fast-csi (parser final-byte param)
-  "Fast-path common CSI sequences; return non-nil when handled."
+  "Fast-path common CSI sequences for PARSER; return non-nil when handled.
+FINAL-BYTE selects the handler and PARAM carries the parameter string."
   (and (null (ebb-parser-private parser))
        (string-empty-p (ebb-parser-intermediates parser))
        (let ((screen (ebb-parser-screen parser)))
@@ -1067,8 +1073,9 @@ relative to the top and left margins."
             (ebb--clamp right 0 (1- width))))))
 
 (defun ebb-parse--dispatch-csi-intermediate (parser final-byte params)
-  "Handle CSI FINAL-BYTE sequences distinguished by intermediate bytes.
-Return non-nil when the sequence was handled."
+  "Handle CSI FINAL-BYTE sequences for PARSER, distinguished by intermediate bytes.
+Return non-nil when the sequence was handled.
+PARAMS carries the parsed parameters."
   (let ((intermediates (ebb-parser-intermediates parser))
         (screen (ebb-parser-screen parser)))
     (cond
@@ -1185,7 +1192,7 @@ Return non-nil when the sequence was handled."
      (t nil))))
 
 (defun ebb-parse--dispatch-csi (parser final-byte)
-  "Parse parameters and dispatch CSI sequence."
+  "Parse parameters and dispatch CSI sequence FINAL-BYTE for PARSER."
   (condition-case err
       (let ((param (ebb-parser-param-string parser)))
         (unless (ebb-parse--fast-csi parser final-byte param)
@@ -1210,43 +1217,43 @@ Return non-nil when the sequence was handled."
 
 ;;;; ---- CSI Handlers ---------------------------------------------------
 
-;; ICH - Insert Character
 (defun ebb-parse--csi-ich (parser params)
+  "Insert PARAMS blank characters at the cursor for PARSER (ICH)."
   (ebb-screen-insert-chars (ebb-parser-screen parser)
                              (ebb-parse--param params 0 1)))
 
-;; CUU - Cursor Up
 (defun ebb-parse--csi-cuu (parser params)
+  "Move the cursor up for PARSER by PARAMS lines (CUU)."
   (ebb-screen-cursor-move (ebb-parser-screen parser)
                             'up (ebb-parse--param params 0 1)))
 
-;; CUD - Cursor Down
 (defun ebb-parse--csi-cud (parser params)
+  "Move the cursor down for PARSER by PARAMS lines (CUD)."
   (ebb-screen-cursor-move (ebb-parser-screen parser)
                             'down (ebb-parse--param params 0 1)))
 
-;; CUF - Cursor Forward
 (defun ebb-parse--csi-cuf (parser params)
+  "Move the cursor forward for PARSER by PARAMS columns (CUF)."
   (ebb-screen-cursor-move (ebb-parser-screen parser)
                             'right (ebb-parse--param params 0 1)))
 
-;; CUB - Cursor Back
 (defun ebb-parse--csi-cub (parser params)
+  "Move the cursor back for PARSER by PARAMS columns (CUB)."
   (ebb-screen-cursor-move (ebb-parser-screen parser)
                             'left (ebb-parse--param params 0 1)))
 
-;; CNL - Cursor Next Line
 (defun ebb-parse--csi-cnl (parser params)
+  "Move the cursor down PARAMS lines to the left edge for PARSER (CNL)."
   (ebb-screen-cursor-next-line (ebb-parser-screen parser)
                                  (ebb-parse--param params 0 1)))
 
-;; CPL - Cursor Previous Line
 (defun ebb-parse--csi-cpl (parser params)
+  "Move the cursor up PARAMS lines to the left edge for PARSER (CPL)."
   (ebb-screen-cursor-prev-line (ebb-parser-screen parser)
                                   (ebb-parse--param params 0 1)))
 
-;; CHA - Cursor Horizontal Absolute
 (defun ebb-parse--csi-cha (parser params)
+  "Move the cursor to absolute column PARAMS for PARSER (CHA)."
   (let* ((screen (ebb-parser-screen parser))
          (origin (and (ebb-screen-origin-mode screen)
                       (ebb-screen-horizontal-margins-enabled-p screen)))
@@ -1259,50 +1266,50 @@ Return non-nil when the sequence was handled."
     (setf (ebb-screen-cursor-x screen)
           (ebb--clamp col min-x max-x))))
 
-;; CUP - Cursor Position
 (defun ebb-parse--csi-cup (parser params)
+  "Move the cursor to the PARAMS row and column for PARSER (CUP)."
   (ebb-screen-cursor-goto (ebb-parser-screen parser)
                             (1- (ebb-parse--param params 0 1))
                             (1- (ebb-parse--param params 1 1))))
 
-;; CHT - Cursor Horizontal Tab
 (defun ebb-parse--csi-cht (parser params)
+  "Move the cursor forward PARAMS tab stops for PARSER (CHT)."
   (ebb-screen-tab-forward (ebb-parser-screen parser)
                             (ebb-parse--param params 0 1)))
 
-;; ED - Erase in Display
 (defun ebb-parse--csi-ed (parser params)
+  "Erase in display for PARSER with PARAMS mode (ED)."
   (funcall (if (eql (ebb-parser-private parser) ??)
                #'ebb-screen-dec-erase-in-display
              #'ebb-screen-erase-in-display)
            (ebb-parser-screen parser)
            (ebb-parse--param params 0 0)))
 
-;; EL - Erase in Line
 (defun ebb-parse--csi-el (parser params)
+  "Erase in line for PARSER with PARAMS mode (EL)."
   (funcall (if (eql (ebb-parser-private parser) ??)
                #'ebb-screen-dec-erase-in-line
              #'ebb-screen-erase-in-line)
            (ebb-parser-screen parser)
            (ebb-parse--param params 0 0)))
 
-;; IL - Insert Line
 (defun ebb-parse--csi-il (parser params)
+  "Insert PARAMS blank lines at the cursor for PARSER (IL)."
   (ebb-screen-insert-lines (ebb-parser-screen parser)
                              (ebb-parse--param params 0 1)))
 
-;; DL - Delete Line
 (defun ebb-parse--csi-dl (parser params)
+  "Delete PARAMS lines at the cursor for PARSER (DL)."
   (ebb-screen-delete-lines (ebb-parser-screen parser)
                              (ebb-parse--param params 0 1)))
 
-;; DCH - Delete Character
 (defun ebb-parse--csi-dch (parser params)
+  "Delete PARAMS characters at the cursor for PARSER (DCH)."
   (ebb-screen-delete-chars (ebb-parser-screen parser)
                              (ebb-parse--param params 0 1)))
 
-;; SU - Scroll Up
 (defun ebb-parse--csi-su (parser params)
+  "Scroll up for PARSER by PARAMS lines, or handle XTSMGRAPHICS (SU)."
   (if (eql (ebb-parser-private parser) ??)
       ;; XTSMGRAPHICS: CSI ? Ps ; Pm S
       (ebb-parse--csi-xtsmgraphics parser params)
@@ -1311,7 +1318,7 @@ Return non-nil when the sequence was handled."
 
 ;; XTSMGRAPHICS - Send/query graphics attributes
 (defun ebb-parse--csi-xtsmgraphics (parser params)
-  "Handle XTSMGRAPHICS (CSI ? Ps ; Pm S).
+  "Handle XTSMGRAPHICS (CSI ? Ps ; Pm S) for PARSER with PARAMS.
 Ps=1: color register count, Ps=2: graphics geometry.
 Pm=1: read, Pm=4: read maximum."
   (let ((attr (ebb-parse--param params 0 0))
@@ -1332,37 +1339,37 @@ Pm=1: read, Pm=4: read maximum."
        parser
        (format "\e[?%d;%dS" attr (if (<= 1 attr 2) (if (<= 2 op 3) 3 2) 1))))))
 
-;; SD - Scroll Down
 (defun ebb-parse--csi-sd (parser params)
+  "Scroll down for PARSER by PARAMS lines (SD)."
   (ebb-screen-scroll (ebb-parser-screen parser)
                        'down (ebb-parse--param params 0 1)))
 
-;; ECH - Erase Character
 (defun ebb-parse--csi-ech (parser params)
+  "Erase PARAMS characters at the cursor for PARSER (ECH)."
   (ebb-screen-erase-chars (ebb-parser-screen parser)
                             (ebb-parse--param params 0 1)))
 
-;; CBT - Cursor Backward Tab
 (defun ebb-parse--csi-cbt (parser params)
+  "Move the cursor back PARAMS tab stops for PARSER (CBT)."
   (ebb-screen-tab-backward (ebb-parser-screen parser)
                              (ebb-parse--param params 0 1)))
 
-;; HPA - Horizontal Position Absolute
 (defun ebb-parse--csi-hpa (parser params)
+  "Move the cursor to absolute column PARAMS for PARSER (HPA)."
   (ebb-parse--csi-cha parser params))
 
-;; HPR - Horizontal Position Relative
 (defun ebb-parse--csi-hpr (parser params)
+  "Move the cursor forward PARAMS columns for PARSER (HPR)."
   (ebb-screen-cursor-move (ebb-parser-screen parser)
                             'right (ebb-parse--param params 0 1)))
 
-;; REP - Repeat last character
 (defun ebb-parse--csi-rep (parser params)
+  "Repeat the last character PARAMS times for PARSER (REP)."
   (ebb-screen-repeat-char (ebb-parser-screen parser)
                             (ebb-parse--param params 0 1)))
 
-;; DA - Device Attributes
 (defun ebb-parse--csi-da (parser _params)
+  "Report device attributes for PARSER (DA)."
   (cond
    ((not (ebb-parser-private parser))
     ;; Primary DA: report as VT220 with ANSI color
@@ -1371,8 +1378,8 @@ Pm=1: read, Pm=4: read maximum."
     ;; Secondary DA
     (ebb-parse--respond parser "\e[>1;1;0c"))))
 
-;; VPA - Vertical Position Absolute
 (defun ebb-parse--csi-vpa (parser params)
+  "Move the cursor to absolute row PARAMS for PARSER (VPA)."
   (let* ((screen (ebb-parser-screen parser))
          (row (1- (ebb-parse--param params 0 1)))
          (min-y (if (ebb-screen-origin-mode screen)
@@ -1384,22 +1391,22 @@ Pm=1: read, Pm=4: read maximum."
     (setf (ebb-screen-cursor-y screen)
           (ebb--clamp (+ min-y row) min-y max-y))))
 
-;; VPR - Vertical Position Relative
 (defun ebb-parse--csi-vpr (parser params)
+  "Move the cursor down PARAMS rows for PARSER (VPR)."
   (ebb-screen-cursor-move (ebb-parser-screen parser)
                             'down (ebb-parse--param params 0 1)))
 
-;; HVP - Horizontal Vertical Position (same as CUP)
 (defun ebb-parse--csi-hvp (parser params)
+  "Move the cursor to the PARAMS row and column for PARSER (HVP, like CUP)."
   (ebb-parse--csi-cup parser params))
 
-;; TBC - Tab Clear
 (defun ebb-parse--csi-tbc (parser params)
+  "Clear tab stops for PARSER with PARAMS mode (TBC)."
   (ebb-screen-clear-tab-stop (ebb-parser-screen parser)
                                (ebb-parse--param params 0 0)))
 
-;; SM - Set Mode
 (defun ebb-parse--csi-sm (parser params)
+  "Set the modes listed in PARAMS for PARSER (SM)."
   (let ((screen (ebb-parser-screen parser)))
     (if (ebb-parser-private parser)
         ;; DECSET
@@ -1417,8 +1424,8 @@ Pm=1: read, Pm=4: read maximum."
           (pcase mode
             (4 (setf (ebb-screen-insert-mode screen) t))))))))
 
-;; RM - Reset Mode
 (defun ebb-parse--csi-rm (parser params)
+  "Reset the modes listed in PARAMS for PARSER (RM)."
   (let ((screen (ebb-parser-screen parser)))
     (if (ebb-parser-private parser)
         ;; DECRST
@@ -1436,8 +1443,8 @@ Pm=1: read, Pm=4: read maximum."
           (pcase mode
             (4 (setf (ebb-screen-insert-mode screen) nil))))))))
 
-;; DECSTBM - Set Scrolling Region
 (defun ebb-parse--csi-decstbm (parser params)
+  "Set the scrolling region for PARSER from PARAMS (DECSTBM)."
   ;; DECSTBM is CSI Pt;Pb r without a private marker; CSI ? Ps r is the
   ;; xterm-specific XTRESTORE extension, which Ebb does not implement.
   (when (null (ebb-parser-private parser))
@@ -1447,8 +1454,8 @@ Pm=1: read, Pm=4: read maximum."
            (bot (1- (ebb-parse--param params 1 h))))
       (ebb-screen-set-scroll-region screen top bot))))
 
-;; SCP / DECSLRM - Save Cursor Position or set left/right margins.
 (defun ebb-parse--csi-scp (parser params)
+  "Save the cursor or set margins for PARSER from PARAMS (SCP, DECSLRM)."
   (when (and (null (ebb-parser-private parser))
              (string-empty-p (ebb-parser-intermediates parser)))
     (let ((screen (ebb-parser-screen parser)))
@@ -1460,22 +1467,22 @@ Pm=1: read, Pm=4: read maximum."
         (when (zerop (length params))
           (ebb-screen-save-cursor screen))))))
 
-;; RCP - Restore Cursor Position
 (defun ebb-parse--csi-rcp (parser params)
+  "Restore the cursor position for PARSER; PARAMS must be empty (RCP)."
   (when (and (null (ebb-parser-private parser))
              (string-empty-p (ebb-parser-intermediates parser))
              (zerop (length params)))
     (ebb-screen-restore-cursor (ebb-parser-screen parser))))
 
-;; DECSCUSR - Set Cursor Style (with SP intermediate)
 (defun ebb-parse--csi-decscusr (parser params)
+  "Set the cursor style for PARSER from PARAMS (DECSCUSR)."
   (when (string= (ebb-parser-intermediates parser) " ")
     (let ((style (ebb-parse--param params 0 0)))
       (ebb-screen-set-cursor-style (ebb-parser-screen parser) style)
       (ebb-parse--emit parser 'cursor-style style))))
 
-;; DSR - Device Status Report
 (defun ebb-parse--csi-dsr (parser params)
+  "Report device status for PARSER with PARAMS request (DSR)."
   (let ((screen (ebb-parser-screen parser)))
     (pcase (ebb-parse--param params 0 0)
       (5 (ebb-parse--respond parser "\e[0n"))
@@ -1489,8 +1496,8 @@ Pm=1: read, Pm=4: read maximum."
             parser
             (format "\e[%d;%dR" (1+ row) (1+ column))))))))
 
-;; Window manipulation (CSI t) -- character-cell resize and size reporting.
 (defun ebb-parse--csi-winops (parser params)
+  "Handle window manipulation for PARSER with PARAMS operation (CSI t)."
   (let ((screen (ebb-parser-screen parser)))
     (pcase (ebb-parse--param params 0 0)
       ;; Resize text area in character cells.  A zero/omitted dimension keeps
@@ -1674,7 +1681,7 @@ Private CSI sequences ending in `m' are not SGR and are ignored."
 ;;;; ---- OSC Helpers ----------------------------------------------------
 
 (defun ebb-parse--handle-osc-4 (parser payload)
-  "Handle OSC 4 color palette queries in PAYLOAD.
+  "Handle OSC 4 color palette queries in PAYLOAD for PARSER.
 Supports xterm-style query pairs such as 4;2;? and 4;0;?;1;?.
 Palette-setting requests are ignored."
   (let ((parts (vconcat (split-string payload ";"))))
@@ -1694,7 +1701,7 @@ Palette-setting requests are ignored."
                              (ebb-parse--palette-color-to-xterm index))))))))
 
 (defun ebb-parse--handle-progress (parser payload)
-  "Emit a normalized progress event parsed from OSC 9;4 PAYLOAD."
+  "Emit a normalized progress event parsed from OSC 9;4 PAYLOAD for PARSER."
   (when (string-match "\\`\\([0-4]\\);\\(-?[0-9]+\\)\\'" payload)
     (let ((state (aref [remove set error indeterminate pause]
                        (string-to-number (match-string 1 payload))))
@@ -1703,13 +1710,13 @@ Palette-setting requests are ignored."
       (ebb-parse--emit parser 'progress state progress))))
 
 (defun ebb-parse--handle-osc-777 (parser payload)
-  "Emit a notification described by OSC 777 PAYLOAD."
+  "Emit a notification described by OSC 777 PAYLOAD for PARSER."
   (when (string-match "\\`notify;\\([^;]+\\);\\(.+\\)\\'" payload)
     (ebb-parse--emit parser 'notification
                        (match-string 1 payload) (match-string 2 payload))))
 
 (defun ebb-parse--handle-osc-52 (parser payload)
-  "Handle OSC 52 clipboard manipulation.
+  "Handle OSC 52 clipboard manipulation for PARSER.
 PAYLOAD format: TARGET;BASE64-DATA
 TARGET is one or more of: c (clipboard), p (primary), s (secondary), etc.
 If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
@@ -1743,7 +1750,7 @@ If BASE64-DATA is `?' this is a query; otherwise it's a set operation."
 ;;;; ---- OSC Dispatch ---------------------------------------------------
 
 (defun ebb-parse--dispatch-osc (parser)
-  "Dispatch a completed OSC sequence."
+  "Dispatch PARSER's completed OSC sequence."
   (condition-case err
       (let* ((str (apply #'concat
                          (nreverse
@@ -1925,7 +1932,7 @@ CODE is supplied, in which case CODE is used for extended colors."
     (_ nil)))
 
 (defun ebb-parse--dispatch-dcs (parser)
-  "Dispatch a completed DCS sequence."
+  "Dispatch PARSER's completed DCS sequence."
   (condition-case err
       (let ((final (ebb-parser-dcs-final parser))
             (body (apply #'concat

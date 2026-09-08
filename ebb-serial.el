@@ -6,7 +6,6 @@
 ;; Maintainer: Arthur Heymans <arthur@aheymans.xyz>
 ;; Version: 0.1.1
 ;; Keywords: terminals, serial, processes
-;; Package-Requires: ((emacs "29.1"))
 ;; URL: https://github.com/ArthurHeymans/el-be-back
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -261,7 +260,7 @@ Emacs does not currently expose a portable serial-break primitive."
 
 (defun ebb-serial--setup-buffer (port speed)
   "Set up the current buffer for serial PORT at SPEED."
-  (unless (eq major-mode 'ebb-mode)
+  (unless (derived-mode-p 'ebb-mode)
     (ebb-mode))
   (ebb-serial-mode 1)
   (ebb-serial--install-mode-line)
@@ -275,7 +274,7 @@ Emacs does not currently expose a portable serial-break primitive."
         ebb-serial-default-coding-system))
 
 (defun ebb-serial--set-configuration (speed bytesize parity stopbits flowcontrol)
-  "Store serial configuration values in the current buffer."
+  "Store SPEED, BYTESIZE, PARITY, STOPBITS and FLOWCONTROL in the current buffer."
   (setq ebb-serial--speed speed)
   (setq ebb-serial--bytesize bytesize)
   (setq ebb-serial--parity parity)
@@ -343,7 +342,8 @@ Emacs does not currently expose a portable serial-break primitive."
 
 (defun ebb-serial--configure-process
     (process speed bytesize parity stopbits flowcontrol)
-  "Apply serial configuration values to PROCESS and store them."
+  "Apply SPEED, BYTESIZE, PARITY, STOPBITS and FLOWCONTROL to PROCESS.
+The values are stored on PROCESS."
   (if (process-get process 'ebb-serial-remote)
       (progn
         (ebb-serial--set-configuration speed bytesize parity stopbits

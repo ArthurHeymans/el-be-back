@@ -6,7 +6,7 @@
 ;;; Commentary:
 
 ;; Translates Emacs key events to terminal escape sequences.
-;; Provides three keybinding modes: char, semi-char, and emacs.
+;; Provides three keybinding modes: char, semi-char, and Emacs.
 
 ;;; Code:
 
@@ -219,7 +219,7 @@ A string KEY is committed input text from an input method."
 ;;;; ---- Mouse Encoding -------------------------------------------------
 
 (defun ebb-input-encode-mouse (event screen pos-offset)
-  "Encode mouse EVENT as terminal escape sequence.
+  "Encode mouse EVENT on SCREEN as terminal escape sequence.
 POS-OFFSET is the buffer position of display line 0, col 0.
 Returns a string or nil."
   (when-let* ((mouse-mode (ebb-screen-mouse-mode screen)))
@@ -252,7 +252,8 @@ Returns a string or nil."
       (event-start event)))
 
 (defun ebb-input--mouse-coordinates (event screen pos-offset)
-  "Return zero-based terminal coordinates for mouse EVENT on SCREEN."
+  "Return zero-based terminal coordinates for mouse EVENT on SCREEN.
+POS-OFFSET is the buffer position of display line 0, col 0."
   (let* ((posn (ebb-input--mouse-posn event))
          (pt (posn-point posn))
          coords)
@@ -280,7 +281,7 @@ Returns a string or nil."
       coords)))
 
 (defun ebb-input--mouse-event-allowed-p (event mode screen)
-  "Return non-nil if EVENT should be reported in DEC mouse MODE."
+  "Return non-nil if EVENT should be reported in DEC mouse MODE on SCREEN."
   (let ((mods (event-modifiers event))
         (basic (event-basic-type event)))
     (pcase mode
@@ -510,8 +511,9 @@ CATEGORIES is a list of keywords: `:ascii', `:arrow', `:navigation',
                                                  &optional self-interrupt)
   "Build a semi-char mode keymap for CATEGORIES.
 CATEGORIES passes to `ebb-input-make-keymap'.  EMACS-MODE-COMMAND is
-bound to C-c C-e to leave terminal input.  With SELF-INTERRUPT,
-C-c C-c sends a literal C-c to the terminal.  C-q quotes, and C-y/M-y
+bound to control-C control-E to leave terminal input.  With
+SELF-INTERRUPT, control-C control-C sends a literal control-C to the
+terminal.  Control-Q quotes, and control-Y and meta-Y
 paste from the kill ring."
   (let ((map (ebb-input-make-keymap
               #'ebb-self-input categories
@@ -598,7 +600,7 @@ paste from the kill ring."
     (define-key map (kbd "RET") #'ebb-open-link-at-point)
     (define-key map (kbd "<return>") #'ebb-open-link-at-point)
     map)
-  "Keymap for emacs mode.")
+  "Keymap for Emacs mode.")
 
 (provide 'ebb-input)
 ;;; ebb-input.el ends here
