@@ -2151,7 +2151,7 @@ Binds `screen' and `parser' in BODY."
   "The t=s medium reads and unlinks a local POSIX shared-memory object."
   (skip-unless (executable-find "python3"))
   (skip-unless (file-writable-p "/dev/shm"))
-  (let* ((name (format "ebb-kitty-%d" (emacs-pid)))
+  (let* ((name (format "ebb-kitty-tty-graphics-protocol-%d" (emacs-pid)))
          (path (expand-file-name name "/dev/shm"))
          (data (unibyte-string 1 2 3)))
     (unwind-protect
@@ -2169,6 +2169,18 @@ Binds `screen' and `parser' in BODY."
               (should (equal '("\e_Gi=7;OK\e\\") responses))
               (should-not (file-exists-p path)))))
       (ignore-errors (delete-file path)))))
+
+(ert-deftest ebb-test-kitty-shm-name-must-be-kitty-temporary ()
+  "A t=s name outside the kitty temporary namespace is refused."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let (responses)
+      (setf (ebb-parser-write-fn parser)
+            (lambda (response) (push response responses)))
+      (ebb-test-output
+       parser (format "\e_Ga=q,f=24,s=1,v=1,i=7,t=s;%s\e\\"
+                      (base64-encode-string "some-other-shm" t)))
+      (should (equal '("\e_Gi=7;EBADF:unsupported shared memory name\e\\")
+                     responses)))))
 
 (ert-deftest ebb-test-parse-kitty-rejects-id-with-number ()
   "Specifying both i and I is an error, and query validates its payload."
@@ -5883,8 +5895,11 @@ the pixel helper is coalesced."
     ;; Local host: plain path.
     (should (equal "/home/u" (ebb--cwd-to-path "/home/u" (system-name))))
     (should (equal "/home/u" (ebb--cwd-to-path "/home/u" "")))
-    ;; Remote host, no existing prefix: build via default method.
-    (let ((ebb-tramp-default-method "ssh"))
+    ;; Remote host, no existing prefix: untrusted by default, so the path
+    ;; stays local; with trust enabled, build via the default method.
+    (should (equal "/home/u" (ebb--cwd-to-path "/home/u" "box")))
+    (let ((ebb-tramp-default-method "ssh")
+          (ebb-trust-osc7-remote-hosts t))
       (should (equal "/ssh:box:/home/u"
                      (ebb--cwd-to-path "/home/u" "box"))))
     ;; Empty or nil dir: nil.
@@ -5904,8 +5919,12 @@ the pixel helper is coalesced."
       ;; (containers often report 127.0.0.1).
       (should (equal "/ssh:user@box:/home/u"
                      (ebb--cwd-to-path "/home/u" "127.0.0.1")))
-      ;; A different host means the user ssh'd onward: fresh TRAMP path.
-      (let ((ebb-tramp-default-method "ssh"))
+      ;; A different host is ignored unless remote hosts are trusted; the
+      ;; existing prefix is kept, so a hostile report cannot redirect it.
+      (should (equal "/ssh:user@box:/home/u"
+                     (ebb--cwd-to-path "/home/u" "other")))
+      (let ((ebb-tramp-default-method "ssh")
+            (ebb-trust-osc7-remote-hosts t))
         (should (equal "/ssh:other:/home/u"
                        (ebb--cwd-to-path "/home/u" "other"))))
       ;; The report names this machine again: the user left ssh and the
@@ -5925,7 +5944,11 @@ the pixel helper is coalesced."
       (should (equal "/ssh:user@box.example.org:/home/u"
                      (ebb--cwd-to-path "/home/u" "box")))
       ;; Equal first labels do not make distinct FQDNs the same host.
-      (let ((ebb-tramp-default-method "ssh"))
+      ;; Untrusted, the existing prefix is kept; trusting builds a fresh path.
+      (should (equal "/ssh:user@box.example.org:/home/u"
+                     (ebb--cwd-to-path "/home/u" "box.example.net")))
+      (let ((ebb-tramp-default-method "ssh")
+            (ebb-trust-osc7-remote-hosts t))
         (should (equal "/ssh:box.example.net:/home/u"
                        (ebb--cwd-to-path "/home/u"
                                          "box.example.net")))))))

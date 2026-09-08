@@ -75,6 +75,16 @@ Used when the shell reports a non-local hostname and the buffer's
   :type '(choice (const :tag "Use tramp-default-method" nil) string)
   :group 'ebb)
 
+(defcustom ebb-trust-osc7-remote-hosts nil
+  "If non-nil, adopt a remote host reported by the child through OSC 7.
+A hostile program can otherwise point `default-directory' at an arbitrary
+TRAMP host, so a later `find-file' or `compile' would connect to it.  When
+nil, a non-local host report keeps the buffer's existing remote prefix (or
+stays local for a local terminal); local and this-machine reports are
+always honored."
+  :type 'boolean
+  :group 'ebb)
+
 (defvar tramp-default-method)
 
 (defcustom ebb-kill-buffer-on-exit t
@@ -1036,7 +1046,8 @@ selected window."
 
 (defun ebb--set-shell-cwd (path)
   "Adopt the shell-reported working directory PATH.
-Remote reports are trusted; a local path must exist (a synchronous
+Remote host reports are only adopted when `ebb-trust-osc7-remote-hosts' is
+non-nil (see `ebb--cwd-to-path').  A local path must exist (a synchronous
 TRAMP `file-directory-p' would open a connection on every cd).
 Also updates `list-buffers-directory' and renames the buffer when
 `ebb-buffer-name-function' is set."
@@ -1113,14 +1124,15 @@ Also updates `list-buffers-directory' and renames the buffer when
 
 (defun ebb--cwd-to-path (dir host)
   "Return OSC 7 report DIR as a usable path, given the reporting HOST.
-Reports from a non-local HOST become TRAMP paths.  The buffer's remote
+Reports from a non-local HOST become TRAMP paths only when
+`ebb-trust-osc7-remote-hosts' is non-nil; otherwise the buffer's existing
+remote prefix is kept (or the path stays local), so a hostile child cannot
+redirect `default-directory' to an arbitrary host.  The buffer's remote
 prefix is reused when it targets the reported host (preserves method,
-user, multi-hop); a different host means the user ssh'd onward from
-this buffer's host, so a fresh path is built via
-`ebb-tramp-default-method'.  A HOST naming this machine, in a
-remote buffer, is the local shell back in charge after the user
-left ssh: a plain local path again.  A local-looking HOST (or
-none) in a remote buffer is the remote shell reporting on itself."
+user, multi-hop).  A HOST naming this machine, in a remote buffer, is the
+local shell back in charge after the user left ssh: a plain local path
+again.  A local-looking HOST (or none) in a remote buffer is the remote
+shell reporting on itself."
   (when (and dir (not (string-empty-p dir)))
     (let ((prefix (file-remote-p default-directory)))
       (cond
@@ -1131,10 +1143,15 @@ none) in a remote buffer is the remote shell reporting on itself."
               host (file-remote-p default-directory 'host)))
         (concat prefix dir))
        ((not (ebb--local-host-p host))
-        (require 'tramp)
-        (format "/%s:%s:%s"
-                (or ebb-tramp-default-method tramp-default-method)
-                host dir))
+        (if ebb-trust-osc7-remote-hosts
+            (progn
+              (require 'tramp)
+              (format "/%s:%s:%s"
+                      (or ebb-tramp-default-method tramp-default-method)
+                      host dir))
+          ;; Untrusted host report: keep the existing remote prefix, or stay
+          ;; local for a local terminal.
+          (if prefix (concat prefix dir) dir)))
        ;; ssh exited and the local shell talks again, so take the
        ;; report at face value and drop the stale remote prefix.
        ((and prefix (ebb--this-host-p host)) dir)

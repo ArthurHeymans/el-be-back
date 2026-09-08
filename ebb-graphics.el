@@ -373,8 +373,11 @@ still names the opened inode.  Return bytes or an error marker."
 
 (defun ebb-graphics--shm-path (name)
   "Return the filesystem path of POSIX shared memory NAME, or nil.
-The leading slash the protocol requires is optional: `kitten icat' omits it."
+The leading slash the protocol requires is optional: `kitten icat' omits it.
+Only kitty-graphics temporary names are accepted, matching the `t=t'
+restriction, so arbitrary `/dev/shm' files cannot be read or unlinked."
   (and (string-match "\\`/?\\([^/]+\\)\\'" name)
+       (string-search "tty-graphics-protocol" (match-string 1 name))
        (file-directory-p "/dev/shm")
        (concat "/dev/shm/" (match-string 1 name))))
 
