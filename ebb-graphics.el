@@ -183,6 +183,7 @@ Return nil when the value is present but not a single character."
 
 (defun ebb-graphics--param-integer (params key &optional default signed)
   "Return integer PARAMS value for KEY, or DEFAULT when absent.
+When SIGNED is non-nil, allow a leading minus.
 Return the symbol `invalid' when the value is malformed."
   (if-let* ((raw (gethash key params)))
       (or (ebb-graphics--parse-integer raw signed) 'invalid)
@@ -211,7 +212,8 @@ and q=2 suppresses all responses."
     (concat "\e_G" (mapconcat #'identity (nreverse fields) ",") ";")))
 
 (defun ebb-graphics--respond (respond-fn params kind message &optional actual-id)
-  "Call RESPOND-FN with a Kitty response unless PARAMS suppress KIND."
+  "Call RESPOND-FN with a Kitty response unless PARAMS suppress KIND.
+MESSAGE is the response body; ACTUAL-ID overrides the reported image number."
   (unless (ebb-graphics--quiet-p params kind)
     (funcall respond-fn
              (concat (ebb-graphics--response-prefix params actual-id)
@@ -268,7 +270,8 @@ an unbounded output buffer."
 
 (defconst ebb-graphics--temporary-directories
   '("/tmp" "/dev/shm" "/var/tmp")
-  "Directories besides `temporary-file-directory' holding deletable files.")
+  "Directories besides the variable `temporary-file-directory'.
+These hold deletable files.")
 
 (defun ebb-graphics--temporary-file-p (path)
   "Return non-nil when PATH may be deleted after a `t=t' transmission."
@@ -349,7 +352,8 @@ The leading slash the protocol requires is optional: `kitten icat' omits it."
 
 (defun ebb-graphics--load-file-medium
     (params medium payload file-media-enabled)
-  "Load image bytes for file MEDIUM (f, t, or s) named by base64 PAYLOAD."
+  "Load image bytes for PARAMS file MEDIUM (f, t, or s) named by base64 PAYLOAD.
+FILE-MEDIA-ENABLED gates t and s path access."
   (let* ((name (and (<= (length payload) 4096)
                     (ebb-graphics--decode payload)))
          (decoded-path (and name (not (string-search "\0" name))
@@ -485,8 +489,10 @@ Return (FORMAT WIDTH HEIGHT DATA) or an error marker."
 
 (defun ebb-graphics--load-image
     (state params medium payload file-media-enabled row column cell-size)
-  "Load an image for PARAMS over MEDIUM from PAYLOAD.
-Return (PARAMS FORMAT WIDTH HEIGHT DATA), nil while a direct upload is still
+  "Load an image for PARAMS over MEDIUM from PAYLOAD into STATE.
+ROW, COLUMN and CELL-SIZE locate the upload; FILE-MEDIA-ENABLED gates file
+medium access.  Return (PARAMS FORMAT WIDTH HEIGHT DATA), nil while a direct
+upload is still
 pending, or an error marker."
   (pcase medium
     (?d
@@ -517,7 +523,9 @@ pending, or an error marker."
 ;;;; ---- Image storage --------------------------------------------------
 
 (defun ebb-graphics--image-storage-size (format width height data)
-  "Return the retained-memory charge for image DATA and decoded dimensions.
+  "Return the retained-memory charge for image DATA with FORMAT.
+WIDTH and HEIGHT give the decoded pixel dimensions.
+WIDTH and HEIGHT are the decoded pixel dimensions.
 PNG storage is charged at no less than its estimated four-byte decoded
 surface so compressed images cannot bypass the terminal storage quota."
   (max (length data)
@@ -549,7 +557,7 @@ surface so compressed images cannot bypass the terminal storage quota."
     candidate))
 
 (defun ebb-graphics--prospective-image-id (state params)
-  "Return the image ID a successful store for PARAMS would use."
+  "Return the image ID a successful store for PARAMS in STATE would use."
   (let ((requested (ebb-graphics--param-integer params ?i nil)))
     (if (and (integerp requested) (> requested 0))
         requested
@@ -571,7 +579,7 @@ surface so compressed images cannot bypass the terminal storage quota."
     t))
 
 (defun ebb-graphics--eviction-plan (state required-bytes excluded-id)
-  "Return oldest unreferenced image IDs freeing REQUIRED-BYTES, or nil.
+  "Return oldest unreferenced image IDs in STATE freeing REQUIRED-BYTES, or nil.
 EXCLUDED-ID is a replacement target and is never considered a victim."
   (if (<= required-bytes 0)
       'fit
@@ -670,7 +678,8 @@ match Emacs glyph geometry."
 
 (defun ebb-graphics--placement-candidate
     (state params image row column cell-size &optional replacing-image)
-  "Build a validated placement without mutating STATE.
+  "Build a validated placement for IMAGE at ROW and COLUMN without mutating STATE.
+PARAMS carries the control data and CELL-SIZE gives the display cell size.
 When REPLACING-IMAGE is non-nil, existing placements for IMAGE are assumed to
 be removed by an atomic retransmission before this candidate is committed."
   (let ((placement-id (ebb-graphics--param-integer params ?p nil))
@@ -733,7 +742,8 @@ be removed by an atomic retransmission before this candidate is committed."
   placement)
 
 (defun ebb-graphics--add-placement (state params image row column cell-size)
-  "Validate and add a placement of IMAGE to STATE."
+  "Validate and add a placement of IMAGE at ROW and COLUMN to STATE.
+PARAMS carries the control data and CELL-SIZE gives the display cell size."
   (when-let* ((placement (ebb-graphics--placement-candidate
                           state params image row column cell-size)))
     (ebb-graphics--commit-placement state placement)))
@@ -749,7 +759,7 @@ When ALL is non-nil, remove virtual placeholder prototypes too."
       (cl-incf (ebb-graphics-state-generation state)))))
 
 (defun ebb-graphics-clear-row-range (state top bottom)
-  "Remove non-virtual placements intersecting absolute rows TOP..BOTTOM."
+  "Remove non-virtual placements of STATE intersecting absolute rows TOP..BOTTOM."
   (ebb-graphics--remove-placements
    state
    (lambda (placement)
@@ -761,7 +771,8 @@ When ALL is non-nil, remove virtual placeholder prototypes too."
    nil))
 
 (defun ebb-graphics--scroll-placement-up (placement top bottom count)
-  "Return PLACEMENT moved up within TOP..BOTTOM, or nil if clipped away."
+  "Return PLACEMENT moved up within TOP..BOTTOM, or nil if clipped away.
+COUNT is the scroll distance in rows."
   (if (ebb-graphics-placement-virtual placement)
       placement
     (let* ((row (ebb-graphics-placement-row placement))
@@ -788,7 +799,8 @@ When ALL is non-nil, remove virtual placeholder prototypes too."
             placement))))))))
 
 (defun ebb-graphics--scroll-placement-down (placement top bottom count)
-  "Return PLACEMENT moved down within TOP..BOTTOM, or nil if clipped away."
+  "Return PLACEMENT moved down within TOP..BOTTOM, or nil if clipped away.
+COUNT is the scroll distance in rows."
   (if (ebb-graphics-placement-virtual placement)
       placement
     (let* ((row (ebb-graphics-placement-row placement))
@@ -813,7 +825,8 @@ When ALL is non-nil, remove virtual placeholder prototypes too."
 
 (defun ebb-graphics-scroll (state direction top bottom count)
   "Move placements in STATE for a terminal scroll operation.
-DIRECTION is `up' or `down'; TOP and BOTTOM are inclusive row bounds."
+DIRECTION is `up' or `down'; TOP and BOTTOM are inclusive row bounds.
+COUNT is the scroll distance in rows."
   (when (> count 0)
     (let* ((old (ebb-graphics-state-placements state))
            (changed nil)
@@ -845,7 +858,8 @@ DIRECTION is `up' or `down'; TOP and BOTTOM are inclusive row bounds."
         (cl-incf (ebb-graphics-state-generation state))))))
 
 (defun ebb-graphics-history-grew (state old-base bottom count)
-  "Adjust placements after COUNT rows were inserted into history.
+  "Adjust placements in STATE after COUNT rows were inserted into history.
+OLD-BASE and BOTTOM locate the top-anchored region.
 Placements wholly below the top-anchored region move with unchanged viewport
 content.  A placement crossing the region's bottom cannot follow both sides
 without splitting, so it is removed."
@@ -870,7 +884,7 @@ without splitting, so it is removed."
       (cl-incf (ebb-graphics-state-generation state)))))
 
 (defun ebb-graphics-trim-history (state count)
-  "Remove COUNT oldest physical history rows from placement coordinates."
+  "Remove COUNT oldest physical history rows from STATE placement coordinates."
   (when (> count 0)
     (let ((old (ebb-graphics-state-placements state))
           new changed)
@@ -951,7 +965,9 @@ When FREE-DATA is non-nil, delete newly unreferenced backing images."
 
 (defun ebb-graphics--handle-delete
     (state params row column row-base viewport-height viewport-width)
-  "Apply a Kitty delete command to STATE using PARAMS at ROW and COLUMN."
+  "Apply a Kitty delete command to STATE using PARAMS at ROW and COLUMN.
+ROW-BASE anchors viewport rows; VIEWPORT-HEIGHT and VIEWPORT-WIDTH bound
+relative geometry."
   (setf (ebb-graphics-state-upload state) nil)
   (let* ((selector (ebb-graphics--param-char params ?d ?a))
          (kind (and selector (downcase selector)))
@@ -1083,7 +1099,7 @@ When FREE-DATA is non-nil, delete newly unreferenced backing images."
 ;;;; ---- Command dispatch -----------------------------------------------
 
 (defun ebb-graphics--invalid-parameter-p (params)
-  "Return non-nil when known control data is malformed or out of range."
+  "Return non-nil when known control data in PARAMS is malformed or out of range."
   (cl-labels ((integer (key &optional signed)
                 (ebb-graphics--param-integer params key nil signed))
               (present-invalid (key &optional signed)
@@ -1127,7 +1143,11 @@ When FREE-DATA is non-nil, delete newly unreferenced backing images."
 (defun ebb-graphics--handle-transmit
     (state params medium payload respond-fn row column cell-size
            file-media-enabled)
-  "Handle an a=t or a=T command and return its new placement, if any."
+  "Handle an a=t or a=T command for PARAMS over MEDIUM.
+Return the new placement, if any.
+PAYLOAD carries the image data for STATE; RESPOND-FN reports errors.
+ROW, COLUMN and CELL-SIZE locate the upload; FILE-MEDIA-ENABLED gates file
+medium access."
   (pcase (ebb-graphics--load-image
           state params medium payload file-media-enabled row column cell-size)
     ('nil nil)
@@ -1178,7 +1198,10 @@ When FREE-DATA is non-nil, delete newly unreferenced backing images."
 
 (defun ebb-graphics--handle-query
     (state params medium payload respond-fn file-media-enabled)
-  "Handle an a=q command: load the image described by PARAMS, but never store it."
+  "Handle an a=q command for PARAMS without storing the image.
+MEDIUM and PAYLOAD describe the upload; it loads into STATE but is never
+stored.  RESPOND-FN reports the result; FILE-MEDIA-ENABLED gates file
+medium access."
   (let ((loaded (ebb-graphics--load-image
                  state params medium payload file-media-enabled
                  0 0 ebb-graphics-fallback-cell-size)))
@@ -1265,7 +1288,8 @@ selectors.  FILE-MEDIA-ENABLED must be non-nil for local file media."
       (cons 'kitty placement))))
 
 (defun ebb-graphics-process-overflow (state payload respond-fn)
-  "Reply to an oversized Kitty APC represented by retained PAYLOAD prefix."
+  "Reply to an oversized Kitty APC represented by retained PAYLOAD prefix.
+RESPOND-FN sends the reply; STATE tracks the aborted upload."
   (setf (ebb-graphics-state-upload state) nil)
   (when (and (> (length payload) 0) (= (aref payload 0) ?G))
     (let* ((body (substring payload 1))

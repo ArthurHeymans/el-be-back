@@ -59,11 +59,13 @@
     map))
 
 (defun ebb-eshell--semi-char-map ()
+  "Return the keymap for inline Eshell semi-char input."
   (ebb-input-make-semi-char-map '(:ascii :arrow :navigation)
                                   #'ebb-eshell-emacs-mode))
 
 (defvar ebb-eshell-semi-char-mode-map
-  (ignore-errors (ebb-eshell--semi-char-map)))
+  (ignore-errors (ebb-eshell--semi-char-map))
+  "Keymap used by `ebb-eshell--semi-char-mode'.")
 
 (defvar ebb-eshell-char-mode-map
   (let ((map (ebb-input-make-keymap
@@ -101,7 +103,7 @@
 
 (defun ebb-eshell--switch-input-mode (mode &optional read-only)
   "Enable the inline terminal minor modes for MODE.
-READ-ONLY also toggles the buffer's read-only state (emacs mode is
+READ-ONLY also toggles the buffer's read-only state (Emacs mode is
 read-only; the terminal modes are writable)."
   (ebb-eshell--semi-char-mode (if (eq mode 'semi-char) 1 -1))
   (ebb-eshell--char-mode (if (eq mode 'char) 1 -1))
@@ -136,7 +138,7 @@ read-only; the terminal modes are writable)."
   ebb-term-name)
 
 (defun ebb-eshell--event (type &rest args)
-  "Handle terminal TYPE emitted from an inline Eshell terminal."
+  "Handle terminal event TYPE emitted from an inline Eshell terminal, with ARGS."
   (pcase type
     ('bell (ding t))
     ('osc-51 (ebb-shell-handle-osc51 (car args) ebb--screen))
@@ -211,7 +213,7 @@ read-only; the terminal modes are writable)."
       (ebb-io-stop ebb-eshell--io)
       (let ((inhibit-read-only t))
         (goto-char end)
-        (unless (or (= (point) (point-min)) (eq (char-before) ?\n))
+        (unless (or (bobp) (eq (char-before) ?\n))
           (insert "\n"))
         (set-marker eshell-last-output-start (point))
         (set-marker eshell-last-output-end (point))
@@ -244,7 +246,8 @@ read-only; the terminal modes are writable)."
   (funcall original process event))
 
 (defun ebb-eshell--around-gather (original command args)
-  "Run interactive Eshell COMMAND ARGS in a PTY-backed Ebb region."
+  "Run interactive Eshell COMMAND with ARGS in a PTY-backed Ebb region.
+Fall back to ORIGINAL when unavailable."
   (if (or eshell-current-subjob-p (not (eshell-interactive-output-p)))
       (funcall original command args)
     (let ((expected (cons (file-local-name (expand-file-name command)) args))
@@ -312,7 +315,7 @@ read-only; the terminal modes are writable)."
       (progn
         (dolist (buffer (buffer-list))
           (with-current-buffer buffer
-            (when (eq major-mode 'eshell-mode)
+            (when (derived-mode-p 'eshell-mode)
               (when ebb-eshell--io
                 (user-error "Can't enable Ebb Eshell mode while a process is running"))
               (ebb-eshell--local-mode 1))))
@@ -321,13 +324,13 @@ read-only; the terminal modes are writable)."
                     #'ebb-eshell--around-gather))
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
-        (when (and (eq major-mode 'eshell-mode) ebb-eshell--io)
+        (when (and (derived-mode-p 'eshell-mode) ebb-eshell--io)
           (user-error "Can't disable Ebb Eshell mode while a process is running"))))
     (remove-hook 'eshell-mode-hook #'ebb-eshell--local-mode)
     (advice-remove #'eshell-gather-process-output #'ebb-eshell--around-gather)
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
-        (when (and (eq major-mode 'eshell-mode) ebb-eshell--local-mode)
+        (when (and (derived-mode-p 'eshell-mode) ebb-eshell--local-mode)
           (ebb-eshell--local-mode -1))))))
 
 ;;;; Visual commands

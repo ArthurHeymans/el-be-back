@@ -16,6 +16,9 @@
 (require 'ebb-parse)
 (require 'ebb-render)
 
+(declare-function ebb--detect-password-prompt "ebb" (&optional _render))
+(declare-function ebb-shell-post-render "ebb-shell" (render))
+
 ;;;; ---- Data Structure -------------------------------------------------
 
 (cl-defstruct (ebb-io (:copier nil))
@@ -50,7 +53,7 @@
   "Functions called after terminal output has been rendered.
 Each function receives the current `ebb-render-state'.")
 
-(defvar ebb-io-processing-error-functions nil
+(defvar ebb-io-processing-error-functions '(ebb-io--report-processing-error)
   "Functions called when asynchronous terminal processing fails.
 Each function receives IO, the error value, and its consecutive count.")
 
@@ -109,7 +112,7 @@ integration script for the detected shell."
 ;;;; ---- Process Filter (never blocks) ----------------------------------
 
 (defun ebb-io-receive (io output)
-  "Queue terminal OUTPUT for asynchronous parsing and rendering.
+  "Queue terminal OUTPUT for asynchronous parsing and rendering by IO.
 This is the supported entry point for non-PTY transports."
   (ebb-io--enqueue-output io output)
   ;; Record time of first unprocessed chunk
@@ -120,7 +123,8 @@ This is the supported entry point for non-PTY transports."
     (ebb-io--schedule-processing io)))
 
 (defun ebb-io--filter (io _process output)
-  "Process filter for Ebb-owned processes."
+  "Process filter for Ebb-owned processes.
+OUTPUT from the process is queued on IO for parsing."
   (ebb-io-receive io output))
 
 (defun ebb-io--enqueue-output (io output)
@@ -151,7 +155,7 @@ This is the supported entry point for non-PTY transports."
 ;;;; ---- Chunked Processing ---------------------------------------------
 
 (defun ebb-io--schedule-processing (io)
-  "Schedule the next parse+render cycle."
+  "Schedule IO's next parse+render cycle."
   (let* ((now (float-time))
          (first (ebb-io-first-chunk-time io))
          (elapsed (if first (- now first) 0))
@@ -172,7 +176,7 @@ This is the supported entry point for non-PTY transports."
     (setf (ebb-io-sync-timer io) nil)))
 
 (defun ebb-io--sync-timeout (io)
-  "Refresh a frame held too long by synchronized output (DEC 2026)."
+  "Refresh a frame of IO held too long by synchronized output (DEC 2026)."
   (setf (ebb-io-sync-timer io) nil)
   (when (buffer-live-p (ebb-io-buffer io))
     (with-current-buffer (ebb-io-buffer io)
@@ -181,7 +185,8 @@ This is the supported entry point for non-PTY transports."
                           (ebb-io-render io)))))
 
 (defun ebb-io--process-pending (io &optional drain-all)
-  "Process pending output: parse chunks, then render."
+  "Process IO's pending output: parse chunks, then render.
+When DRAIN-ALL is non-nil, ignore chunk budgets."
   (setf (ebb-io-processing io) t)
   (when (ebb-io-render-timer io)
     (cancel-timer (ebb-io-render-timer io)))
@@ -247,16 +252,22 @@ Repeated identical failures are rate-limited to avoid flooding *Messages*."
              (if (> count 1) (format " (repeated %d times)" count) "")
              error-data)))
 
-(add-hook 'ebb-io-processing-error-functions #'ebb-io--report-processing-error)
-
 ;;;; ---- Stack Construction ---------------------------------------------
 
 (defun ebb-io-create-terminal (buffer event-handler &optional begin end)
   "Create a screen, renderer, parser, and I/O instance for BUFFER.
 EVENT-HANDLER receives parser events.  When BEGIN and END are
 non-nil, the render region is restricted to that buffer region
-(used by the inline Eshell terminal).  The screen is sized from a
+\(used by the inline Eshell terminal).  The screen is sized from a
 window currently displaying BUFFER, else the selected window."
+  ;; Wire the internal pipeline handlers.  `add-hook' skips duplicates,
+  ;; so creating several terminals is harmless.  Guard with `fboundp'
+  ;; so partial loads (for example, Eshell integration without the
+  ;; interactive terminal) only register the handlers they define.
+  (when (fboundp 'ebb-shell-post-render)
+    (add-hook 'ebb-io-after-render-functions #'ebb-shell-post-render))
+  (when (fboundp 'ebb--detect-password-prompt)
+    (add-hook 'ebb-io-after-render-functions #'ebb--detect-password-prompt))
   (let* ((window (or (get-buffer-window buffer) (selected-window)))
          (width (max (window-max-chars-per-line window) 10))
          (height (max (window-body-height window) 3))
@@ -367,7 +378,8 @@ EXTRA-ENV is the env var list (used to find integration dir)."
 
 (defun ebb-io--remote-command (shell-command rows columns)
   "Wrap SHELL-COMMAND for a remote (TRAMP) spawn.
-The wrapper runs on the remote host: TERM is chosen there because
+The wrapper runs on the remote host with ROWS rows and COLUMNS columns.
+TERM is chosen there because
 TRAMP's `tramp-local-environment-variable-p' filter strips `TERM='
 entries pushed via the environment, leaving the remote shell with
 TERM=dumb.  It probes `infocmp' for the ebb terminfo entry and
@@ -386,6 +398,7 @@ local stty wrapper and execs SHELL-COMMAND."
 
 (defun ebb-io--wrap-command-with-stty (command rows columns)
   "Wrap COMMAND to initialize PTY termios before exec.
+ROWS and COLUMNS size the new PTY.
 Eat does this with `stty ... sane' before starting the client program; in
 particular it makes the erase character match TERM's kbs=^?, which keeps
 Backspace working in shells and line editors."
@@ -524,7 +537,7 @@ TIOCSWINSZ could otherwise restore stale rows and columns after a newer resize."
          (ebb-io--disable-pixel-size io (error-message-string error)))))))
 
 (defun ebb-io-set-window-size (io process height width)
-  "Resize the PTY of PROCESS to HEIGHT rows and WIDTH columns.
+  "Resize IO's PTY of PROCESS to HEIGHT rows and WIDTH columns.
 Rows and columns are always applied synchronously so the child never
 observes a stale size.  When the pixel size is known and
 `ebb-report-pixel-size' allows it, additionally schedule a coalesced
@@ -550,7 +563,7 @@ helper that records the pixel dimensions on the PTY."
            io process tty helper height width cell))))
 
 (defun ebb-io-start (io shell-command buffer &optional extra-env)
-  "Start a terminal process running SHELL-COMMAND in BUFFER.
+  "Start IO's terminal process running SHELL-COMMAND in BUFFER.
 EXTRA-ENV is an optional list of \"VAR=VALUE\" strings to add to
 the process environment.
 
@@ -642,7 +655,8 @@ Ebb through `ebb-io--filter'."
   process)
 
 (defun ebb-io--sentinel (io proc event)
-  "Handle process state changes."
+  "Handle process state changes for PROC on IO.
+EVENT describes the transition."
   (when (string-match-p "\\(finished\\|exited\\|killed\\|deleted\\)" event)
     ;; Delete the temporary bash integration rcfile, if any.  Read it
     ;; from PROC, not from IO, whose process slot may already be nil.
@@ -679,7 +693,7 @@ Ebb through `ebb-io--filter'."
     (ebb-parse-cancel-sequence (ebb-io-parser io))))
 
 (defun ebb-io-send (io string)
-  "Send STRING to the terminal process.
+  "Send STRING to IO's terminal process.
 Multibyte text is encoded with `ebb-io-input-coding-system'.
 Unibyte strings are always sent unchanged.  Sending an interrupt discards
 queued output so the interrupted program's prompt is not stuck behind it."
@@ -699,7 +713,7 @@ queued output so the interrupted program's prompt is not stuck behind it."
 ;;;; ---- Resize ---------------------------------------------------------
 
 (defun ebb-io-handle-resize (io new-width new-height)
-  "Handle terminal resize to NEW-WIDTH x NEW-HEIGHT."
+  "Handle IO's terminal resize to NEW-WIDTH x NEW-HEIGHT."
   (let ((screen (ebb-io-screen io)))
     (unless (and (= new-width (ebb-screen-width screen))
                  (= new-height (ebb-screen-height screen)))
@@ -726,7 +740,7 @@ queued output so the interrupted program's prompt is not stuck behind it."
 ;;;; ---- Cleanup --------------------------------------------------------
 
 (defun ebb-io-stop (io)
-  "Stop the terminal process and clean up."
+  "Stop IO's terminal process and clean up."
   (when (ebb-io-render-timer io)
     (cancel-timer (ebb-io-render-timer io))
     (setf (ebb-io-render-timer io) nil))

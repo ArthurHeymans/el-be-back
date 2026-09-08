@@ -15,6 +15,8 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'ebb-io)
+(require 'ebb-render)
 
 ;;;; ---- Trace State ----------------------------------------------------
 
@@ -34,7 +36,7 @@ TIME defaults to current time."
       (goto-char (point-max))
       (insert
        (replace-regexp-in-string
-        (rx (any (0 . 31)))
+        "[\0-\37]"
         (lambda (s) (format "\\\\x%02x" (aref s 0)))
         (format "%S" `(,(float-time (or time (current-time)))
                         ,operation ,@args)))
@@ -77,6 +79,9 @@ cycles are logged to a trace buffer."
       (advice-add 'ebb-io--filter :around #'ebb-trace--filter-advice)
       (advice-add 'ebb-io-handle-resize :around #'ebb-trace--resize-advice)
       (advice-add 'ebb-render-refresh :around #'ebb-trace--refresh-advice))
+    ;; Trace processing errors while at least one trace runs.
+    (add-hook 'ebb-io-processing-error-functions
+              #'ebb-trace--processing-error)
     ;; Stop on kill
     (add-hook 'kill-buffer-hook #'ebb-trace--stop nil t)
     (message "Trace started: %s" (buffer-name trace-buf))))
@@ -98,13 +103,18 @@ cycles are logged to a trace buffer."
       (advice-remove 'ebb-io--filter #'ebb-trace--filter-advice)
       (advice-remove 'ebb-io-handle-resize #'ebb-trace--resize-advice)
       (advice-remove 'ebb-render-refresh #'ebb-trace--refresh-advice))
+    ;; The error hook is installed globally; keep it while other traces run.
+    (unless (ebb-trace--other-traces-p)
+      (remove-hook 'ebb-io-processing-error-functions
+                   #'ebb-trace--processing-error))
     (remove-hook 'kill-buffer-hook #'ebb-trace--stop t)
     (setq ebb-trace--buffer nil)))
 
 ;;;; ---- Advice Functions -----------------------------------------------
 
 (defun ebb-trace--filter-advice (orig-fn io process output)
-  "Trace output arriving from the process."
+  "Trace output arriving from the process.
+Apply ORIG-FN to IO, PROCESS and OUTPUT."
   (when-let* ((buffer (ebb-io-buffer io)))
     (with-current-buffer buffer
       (when ebb-trace--buffer
@@ -112,7 +122,8 @@ cycles are logged to a trace buffer."
   (funcall orig-fn io process output))
 
 (defun ebb-trace--resize-advice (orig-fn io new-width new-height)
-  "Trace resize events."
+  "Trace resize events.
+Apply ORIG-FN to IO, NEW-WIDTH and NEW-HEIGHT."
   (when-let* ((buffer (ebb-io-buffer io)))
     (with-current-buffer buffer
       (when ebb-trace--buffer
@@ -120,7 +131,8 @@ cycles are logged to a trace buffer."
   (funcall orig-fn io new-width new-height))
 
 (defun ebb-trace--refresh-advice (orig-fn render)
-  "Trace redisplay events."
+  "Trace redisplay events.
+Apply ORIG-FN to RENDER."
   (with-current-buffer (ebb-render-state-buffer render)
     (when ebb-trace--buffer
       (ebb-trace--log nil 'redisplay)))
@@ -132,8 +144,6 @@ cycles are logged to a trace buffer."
     (with-current-buffer buffer
       (when ebb-trace--buffer
         (ebb-trace--log nil 'processing-error count error-data)))))
-
-(add-hook 'ebb-io-processing-error-functions #'ebb-trace--processing-error)
 
 (provide 'ebb-trace)
 ;;; ebb-trace.el ends here

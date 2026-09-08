@@ -333,8 +333,9 @@ Emacs main thread with a multi-million-iteration compositing loop."
   :group 'ebb)
 
 (defcustom ebb-kitty-graphics-allow-slow-rgba t
-  "If non-nil, composite raw RGBA images in Elisp when the PNG helper is
-unavailable.  The fallback blocks the main thread proportionally to the
+  "If non-nil, composite raw RGBA images in Elisp as a fallback.
+The fallback runs when the PNG helper is unavailable.  It blocks the
+main thread proportionally to the
 image size (bounded by `ebb-kitty-graphics-elisp-rgba-pixel-limit'); set
 to nil on machines without python3 if hostile programs might send raw
 RGBA graphics.  PNG and RGB images are unaffected."
@@ -434,7 +435,7 @@ Eshell retain everything outside an inline terminal."
 ;;;; ---- Main Refresh ---------------------------------------------------
 
 (defun ebb-render-refresh (render)
-  "Refresh the buffer from the screen model.
+  "Refresh RENDER's buffer from the screen model.
 Only dirty display lines are re-rendered, but scrollback and cursor
 state are reconciled independently so metadata-only updates are visible."
   (let* ((screen (ebb-render-state-screen render))
@@ -622,8 +623,8 @@ state are reconciled independently so metadata-only updates are visible."
     (ebb-screen-clear-scrollback-dirty screen)))
 
 (defun ebb-render--restore-window-point (render window anchor)
-  "Move WINDOW's point to ANCHOR, falling back to its window-start.
-A rebuilt scrollback slab collapses window-point markers that were inside
+  "Move WINDOW's point to ANCHOR in RENDER, falling back to its `window-start'.
+A rebuilt scrollback slab collapses `window-point' markers that were inside
 it to the top of the slab; redisplay would then force that stale position
 visible and jump the window into old history."
   (let ((position
@@ -644,7 +645,7 @@ visible and jump the window into old history."
     (* 3 height)))
 
 (defun ebb-render--anchor-location (render anchor total)
-  "Return ANCHOR's current virtual location using history size TOTAL."
+  "Return ANCHOR's current virtual location in RENDER using history size TOTAL."
   (pcase anchor
     (`(history ,id ,offset)
      (ebb-screen-history-anchor-location
@@ -717,7 +718,8 @@ rendering many rows in a loop should compute it once and pass it in."
 
 (defun ebb-render--rebuild-scrollback
     (render &optional start count total generation graphics-generation)
-  "Replace RENDER's bounded history slab from START for COUNT rows."
+  "Replace RENDER's bounded history slab from START for COUNT rows.
+TOTAL, GENERATION and GRAPHICS-GENERATION default to the current model values."
   (let* ((screen (ebb-render-state-screen render))
          (display-begin (ebb-render-state-display-begin render))
          (total (or total (ebb-screen-history-row-count screen)))
@@ -923,7 +925,7 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
     (point)))
 
 (defun ebb-render--line-to-string-scrollback (line width)
-  "Convert LINE for scrollback rendering."
+  "Convert LINE of WIDTH columns for scrollback rendering."
   (when (ebb-line-text line)
     (setf (ebb-line-text line)
           (ebb-render--safe-string (ebb-line-text line))))
@@ -951,7 +953,8 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
    width))
 
 (defun ebb-render--cells-to-string-scrollback-fast (cells width)
-  "Return unstyled CELLS as visible scrollback text, or nil if styled."
+  "Return unstyled CELLS as visible scrollback text, or nil if styled.
+WIDTH is the expected column count."
   (catch 'styled
     (let ((chars nil)
           (wide-ranges nil)
@@ -985,7 +988,7 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
         s))))
 
 (defun ebb-render--apply-line-rendition (line string width)
-  "Apply LINE's DEC width rendition to STRING for a WIDTH-column screen."
+  "Apply LINE's DEC width rendition to STRING for a screen of WIDTH columns."
   (if (eq (ebb-line-rendition line) 'normal)
       string
     (let* ((logical-width (max 1 (/ width 2)))
@@ -999,7 +1002,7 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
       result)))
 
 (defun ebb-render--line-to-string (line width)
-  "Convert LINE to a string for a WIDTH-column terminal display."
+  "Convert LINE to a string for a terminal display of WIDTH columns."
   (when (ebb-line-text line)
     (setf (ebb-line-text line)
           (ebb-render--safe-string (ebb-line-text line))))
@@ -1038,7 +1041,8 @@ When NO-RECENTER is non-nil, leave window positioning unchanged."
    width))
 
 (defun ebb-render--text-runs-to-string (line width)
-  "Render LINE's text plus attribute runs into a propertized string."
+  "Render LINE's text plus attribute runs into a propertized string.
+Runs are clipped to WIDTH columns."
   (let ((s (copy-sequence (ebb-line-text line))))
     (dolist (run (ebb-line-attr-runs line))
       (let* ((begin (nth 0 run))
@@ -1211,7 +1215,7 @@ but are never retained, so one huge image cannot evict the whole cache."
       (ebb-render--graphics-cache-touch render key))))
 
 (defun ebb-render--graphics-image-object (render image placement)
-  "Return a cached, cell-box-sized Emacs image for IMAGE and PLACEMENT.
+  "Return a cached, cell-box-sized Emacs image for IMAGE and PLACEMENT in RENDER.
 The box-sized SVG canvas is essential: Emacs clamps slices to the backing
 image dimensions rather than stretching them over the propertized text run."
   (let* ((cell (or (ebb-render-cell-pixel-size render)
@@ -1277,12 +1281,7 @@ image dimensions rather than stretching them over the propertized text run."
              (svg
               (and source (equal mime "image/png")
                    (format
-                    (concat "<svg xmlns='http://www.w3.org/2000/svg' "
-                            "width='%d' height='%d' viewBox='0 0 %d %d'>"
-                            "<rect width='100%%' height='100%%' fill='%s'/>"
-                            "<image x='%d' y='%d' width='%d' height='%d' "
-                            "preserveAspectRatio='none' href='data:%s;base64,%s'/>"
-                            "</svg>")
+                    "<svg xmlns='http://www.w3.org/2000/svg' width='%d' height='%d' viewBox='0 0 %d %d'><rect width='100%%' height='100%%' fill='%s'/><image x='%d' y='%d' width='%d' height='%d' preserveAspectRatio='none' href='data:%s;base64,%s'/></svg>"
                     width height width height fill draw-x draw-y
                     draw-width draw-height mime
                     (base64-encode-string source t))))
@@ -1316,7 +1315,8 @@ image dimensions rather than stretching them over the propertized text run."
    (t nil)))
 
 (defun ebb-render--virtual-placement (graphics image-id placement-id)
-  "Find the newest virtual placement matching IMAGE-ID and PLACEMENT-ID."
+  "Find the newest virtual placement in GRAPHICS.
+It must match IMAGE-ID and PLACEMENT-ID."
   (cl-find-if
    (lambda (placement)
      (and (ebb-graphics-placement-virtual placement)
@@ -1329,7 +1329,7 @@ image dimensions rather than stretching them over the propertized text run."
 
 (defun ebb-render--line-has-placeholder-placement-p
     (screen graphics row target &optional absolute)
-  "Return non-nil when ROW contains a placeholder for TARGET.
+  "Return non-nil when ROW of SCREEN contains a placeholder for TARGET in GRAPHICS.
 ROW addresses history when ABSOLUTE is non-nil."
   (let* ((line (ebb-render--graphics-line screen row absolute))
          (cells (and line (ebb--line-ensure-cells line (ebb-screen-width screen))))
@@ -1384,8 +1384,9 @@ so repeated refreshes and slab rebuilds do not rescan unchanged scrollback."
 
 (defun ebb-render--placeholder-tile-row
     (render screen graphics row placement &optional absolute)
-  "Return PLACEMENT's tile row before ROW, caching line prefixes.
-ROW addresses history when ABSOLUTE is non-nil."
+  "Return PLACEMENT's tile row before ROW in RENDER, caching line prefixes.
+ROW of SCREEN addresses history when ABSOLUTE is non-nil.
+Placements are read from GRAPHICS."
   (let* ((cache
           (if absolute
               (ebb-render--sync-placeholder-history-cache render)
@@ -1413,7 +1414,7 @@ ROW addresses history when ABSOLUTE is non-nil."
       (aref counts row))))
 
 (defun ebb-render--graphics-line (screen row absolute)
-  "Return the model line for ROW, interpreting it as ABSOLUTE when non-nil."
+  "Return SCREEN's model line for ROW, interpreting it as ABSOLUTE when non-nil."
   (if absolute
       (ebb-screen-history-render-row screen row)
     (ebb-screen-get-line screen row)))
@@ -1461,7 +1462,8 @@ the compact history path, where a wide cell is one character carrying an
     indices))
 
 (defun ebb-render--graphics-wide-carriers (line string width owners indices)
-  "Give image-covered wide cells separate character carriers in STRING.
+  "Give image-covered wide cells of LINE separate character carriers.
+Carriers go in STRING; cells span WIDTH columns.
 OWNERS maps columns to placements and INDICES maps the original STRING.
 A wide glyph cannot display just one half as text; blank its uncovered cells,
 like overwriting half a wide glyph in the terminal model.  This also removes
@@ -1515,8 +1517,9 @@ invisible viewport spacers so an image on the second cell is actually visible."
 
 (defun ebb-render--apply-virtual-graphics
     (render row string graphics cell-width cell-height &optional absolute)
-  "Apply Unicode-placeholder graphics on ROW of STRING.
-ROW is history-absolute when ABSOLUTE is non-nil."
+  "Apply Unicode-placeholder graphics from GRAPHICS on ROW of STRING in RENDER.
+ROW is history-absolute when ABSOLUTE is non-nil.  CELL-WIDTH and CELL-HEIGHT
+give the display cell size in pixels."
   (let* ((screen (ebb-render-state-screen render))
          (line (ebb-render--graphics-line screen row absolute))
          (cells (and line (ebb--line-ensure-cells line (ebb-screen-width screen))))
@@ -1617,7 +1620,7 @@ ROW is history-absolute when ABSOLUTE is non-nil."
     result))
 
 (defun ebb-render--apply-graphics (render row string &optional absolute)
-  "Return STRING with graphics placements intersecting ROW.
+  "Return STRING with graphics placements intersecting ROW in RENDER.
 ROW is viewport-relative unless ABSOLUTE is non-nil."
   (if (not (display-graphic-p))
       string
@@ -1747,8 +1750,7 @@ ROW is viewport-relative unless ABSOLUTE is non-nil."
                                      cell-height)
                                object)
                          result)))))
-              (cl-incf column)))))
-      )
+              (cl-incf column))))))
       (ebb-render--apply-virtual-graphics
        render row result graphics cell-width cell-height absolute))))
 
@@ -1775,7 +1777,7 @@ empty padding significant."
     (if (= end (length string)) string (substring string 0 end))))
 
 (defun ebb-render--update-line (render row)
-  "Re-render display line ROW in the buffer."
+  "Re-render display line ROW of RENDER in the buffer."
   (let* ((screen (ebb-render-state-screen render))
          (line (ebb--line-at screen row))
          (width (ebb-screen-width screen))
@@ -1828,8 +1830,9 @@ Clean unibyte ASCII is returned unchanged."
                       collect (ebb-render--safe-char (aref string position)))))))
 
 (defun ebb-render--cells-to-string (cells width)
-  "Convert a vector of ebb-cells to a propertized string.
-Handles double-width characters by inserting invisible spacers."
+  "Convert CELLS, a vector of ebb-cells, to a propertized string.
+Handles double-width characters by inserting invisible spacers.
+WIDTH bounds the scan."
   (or (ebb-render--cells-to-string-fast cells width)
       (ebb-render--cells-to-string-uniform cells width)
       (ebb-render--cells-to-string-general cells width)))
@@ -1848,8 +1851,8 @@ Handles double-width characters by inserting invisible spacers."
 
 (defun ebb-render--cells-to-string-fast (cells width)
   "Fast path for default-attribute CELLS, or nil if styled.
-Builds both single-width and wide characters, and falls back only when a
-styled cell is present."
+Builds both single-width and wide characters over WIDTH columns, and falls
+back only when a styled cell is present."
   (catch 'styled
     (let ((parts nil)
           (wide-ranges nil)
@@ -1883,7 +1886,8 @@ styled cell is present."
         s))))
 
 (defun ebb-render--cells-to-string-uniform (cells width)
-  "Fast path for single-width rows with one shared/equal attribute."
+  "Fast path for single-width rows of CELLS with one shared/equal attribute.
+WIDTH bounds the scan."
   (let ((attr (ebb-cell-attr (aref cells 0)))
         (i 0))
     (when attr
@@ -1903,7 +1907,7 @@ styled cell is present."
           s)))))
 
 (defun ebb-render--cells-to-string-general (cells width)
-  "General propertized conversion for CELLS."
+  "General propertized conversion for CELLS of WIDTH columns."
   (let ((parts nil)
         (i 0))
     ;; Process cells one at a time, grouping single-width same-attr runs
@@ -2055,11 +2059,11 @@ styled cell is present."
     (_ 'box)))
 
 (defun ebb-render--update-cursor (render)
-  "Update the cursor overlay position and visibility.
+  "Update RENDER's cursor overlay position and visibility.
 
 The terminal cursor is drawn with the `ebb-cursor' overlay.  Live
 input modes hide the native Emacs cursor so only one caret is visible;
-point/window-point still track the terminal cell for input and yank.
+point and `window-point' still track the terminal cell for input and yank.
 In `emacs' mode the native cursor follows point and the overlay is a
 hint at the live terminal position."
   (let* ((screen (ebb-render-state-screen render))
@@ -2136,7 +2140,7 @@ hint at the live terminal position."
 (defun ebb-render--apply-viewport-reset (render)
   "Apply a pending viewport reset, moving windows to RENDER's display start.
 
-Must run after any point/window-start restoration so that restoring a
+Must run after any point and `window-start' restoration so that restoring a
 saved window start cannot override the reset, and regardless of cursor
 visibility."
   (when (ebb-screen-take-viewport-reset (ebb-render-state-screen render))
@@ -2171,7 +2175,7 @@ visibility."
   (add-hook 'enable-theme-functions #'ebb-render--theme-changed))
 
 (defun ebb-render-invalidate-all (render)
-  "Mark all display lines as needing re-render."
+  "Mark all of RENDER's display lines as needing re-render."
   (let* ((screen (ebb-render-state-screen render))
          (h (ebb-screen-height screen)))
     (setf (ebb-screen-dirty-lines screen)
@@ -2182,7 +2186,7 @@ visibility."
 ;;;; ---- Full Re-render (for resize) ------------------------------------
 
 (defun ebb-render-full-reset (render)
-  "Completely rebuild the buffer contents from the screen model.
+  "Completely rebuild RENDER's buffer contents from the screen model.
 Used after resize when the display area size has changed."
   (let* ((screen (ebb-render-state-screen render))
          (buffer (ebb-render-state-buffer render))
@@ -2284,8 +2288,7 @@ Used after resize when the display area size has changed."
                     (ebb-render-goto-anchor render saved-mark t)
                     (set-marker (mark-marker) (point)))
                   (setq mark-active saved-mark-active))
-              (set-marker (mark-marker) nil))
-            )
+              (set-marker (mark-marker) nil)))
           (pcase-dolist (`(,window ,start-anchor ,window-point-anchor)
                          saved-windows)
             (when (window-live-p window)
@@ -2377,7 +2380,7 @@ Used after resize when the display area size has changed."
 ;;;; ---- Cleanup --------------------------------------------------------
 
 (defun ebb-render-destroy (render)
-  "Clean up render state."
+  "Clean up RENDER's state."
   (when-let* ((ov (ebb-render-state-cursor-overlay render)))
     (delete-overlay ov))
   (dolist (m (list (ebb-render-state-display-begin render)
