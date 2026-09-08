@@ -29,7 +29,7 @@ per-screen: one screen never deletes images backing another screen's
 placements, so a full main screen can leave an alternate-screen upload
 with ENOSPC.  A value of zero disables Kitty graphics support entirely,
 which is also the kill-switch if untrusted programs abuse the synchronous
-decode helpers (see README)."
+decode helpers (see docs/ebb-graphics.org)."
   :type 'integer
   :group 'ebb)
 

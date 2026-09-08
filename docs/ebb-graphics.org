@@ -1,0 +1,79 @@
+#+TITLE: Kitty graphics as terminal state
+
+Ebb implements the [[https://sw.kovidgoyal.net/kitty/graphics-protocol/][Kitty graphics protocol]] on graphical frames.  PNG, RGB,
+and RGBA payloads are accepted over the direct, temporary-file, and
+shared-memory media, placements and deletions are honored, and Unicode
+placeholder cells (including Kitty's row/column diacritics) resolve to their
+images.  =chafa -f kitty=, =timg=, and =kitten icat= work without
+configuration.
+
+* Pictures are state, not paint
+
+Images follow the split that runs through the rest of Ebb: they are terminal
+state, and the renderer projects them into the buffer.  A placement is
+anchored to a model row when it arrives, and scrolling moves the anchor with
+the content.  Because the model is authoritative rather than the buffer text,
+a picture can leave the viewport into the scrollback slab and be drawn again
+when that history is revisited, without the buffer remembering anything about
+it.  A row is rendered as image slices, one contiguous run of columns per
+owning placement, so a partially scrolled or partially covered picture still
+shows the correct part of its source.
+
+RGBA pixels are composited over Ebb's current background at render time, and
+scaled (=c,r=) placements keep the source aspect ratio, centered with
+letterbox or pillarbox padding.
+
+* Refused rather than faked
+
+The protocol is not implemented in full.  Animation, relative placements,
+source rectangles, in-cell offsets, and negative z-index (under-text)
+placements would need state that scrolls on its own or drawing underneath
+existing text, so requests that use them are refused with an =EINVAL= reply.
+A client told no behaves better than one silently shown the wrong screen.
+
+* Image data is untrusted input
+
+A terminal that displays images has asked Emacs to decode arbitrary payloads
+on the main thread, and Ebb treats that as an attack surface rather than a
+rendering detail.  Memory is bounded at every stage: the default 64 MiB
+storage quota is shared by the main and alternate screens, PNGs are charged
+by their estimated decoded size, and a single image (32 MiB), one APC control
+string (256 KiB), the per-screen placement list (1024 entries), and each
+rendered surface (64 MiB) have their own caps.  Eviction is per screen, so
+the alternate screen's images survive main-screen pressure, at the cost of an
+alternate-screen upload failing with =ENOSPC= while the quota is full.
+
+Decoding runs in =python3= subprocesses with output caps: an inflated image
+is rejected once it exceeds =ebb-kitty-graphics-image-limit=.  When =python3=
+is missing, inflation and file media fail cleanly with =ENOTSUP=; raw RGBA
+then falls back to a slow Elisp compositor, gated by
+=ebb-kitty-graphics-allow-slow-rgba= and capped at
+=ebb-kitty-graphics-elisp-rgba-pixel-limit= pixels.
+
+File media get separate treatment.  Ordinary file reads (=t=f=) are disabled
+by default (=ebb-kitty-graphics-allow-files=), and every file medium is
+refused for remote or TRAMP terminals: a path sent by a remote child would
+otherwise be resolved on the Emacs host.  Temporary-file transmissions are
+accepted only for a name in a known temporary directory whose basename
+contains =tty-graphics-protocol=, and the file is unlinked only while the
+path still names the opened inode.
+
+The budgets bound memory, not time.  The helper calls still run synchronously
+on the main thread, and a hostile child that streams many distinct images can
+stall the UI with back-to-back subprocess spawns.  Do not run untrusted
+programs in Ebb with graphics enabled.  Setting
+=ebb-kitty-graphics-storage-limit= to zero disables graphics outright.
+
+* Pixel geometry
+
+Clients size images from the terminal's pixel geometry, which a PTY does not
+normally report.  Ebb keeps the TIOCGWINSZ pixel fields current through a
+small =python3= or =perl= helper after settled resizes
+(=ebb-report-pixel-size=, on by default), coalesced by
+=ebb-pixel-size-idle-delay=.  When geometry is genuinely unknown, pixel
+queries are answered with zero unless =ebb-report-fallback-pixel-size= is
+enabled, in which case =ebb-graphics-fallback-cell-size= (8x16 by default)
+is reported; custom renderers set that variable to their actual cell size.
+
+Every option mentioned above is a =defcustom= under the =ebb= group, with its
+default recorded in the docstring.
