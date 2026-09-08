@@ -140,6 +140,12 @@ read-only; the terminal modes are writable)."
   (pcase type
     ('bell (ding t))
     ('osc-51 (ebb-shell-handle-osc51 (car args) ebb--screen))
+    ('pixel-size
+     (when ebb-eshell--io
+       (let ((render (ebb-io-render ebb-eshell--io)))
+         (pcase (car args)
+           ('text-area (ebb-render-text-area-pixel-size render))
+           ('cell (ebb-render-cell-pixel-size render))))))
     ('mode-set
      (when (memq (car args) '(1000 1002 1003))
        (ebb--mouse-mode (if (ebb-screen-mouse-mode ebb--screen) 1 -1))))))

@@ -21,6 +21,8 @@
   :group 'processes
   :prefix "ebb-")
 
+(require 'ebb-graphics)
+
 ;;;; ---- Data Structures ------------------------------------------------
 
 (cl-defstruct (ebb-cell (:copier nil))
@@ -105,6 +107,7 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (scroll-top 0) (scroll-bottom 23)
   (scrollback nil)
   (scrollback-length 0)
+  (graphics nil)
   (history-next-id 0)
   (history-generation 0)
   (auto-wrap t)
@@ -149,6 +152,8 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (history-map-count 0)
   (history-row-map-width nil)
   (history-row-map-generation nil)
+  ;; Terminal graphics
+  (graphics nil)
   ;; Title / CWD
   (title "") (cwd nil)
   ;; Tab stops
@@ -645,6 +650,7 @@ and where COL is a continuation cell (width = 0)."
      :height height
      :scroll-bottom (1- height)
      :current-attr (make-ebb-attr)
+     :graphics (ebb-graphics-create)
      :tab-stops (ebb--default-tab-stops width)
      :dirty-lines (number-sequence 0 (1- height))
      :dirty-map (make-vector height t)
@@ -826,13 +832,21 @@ KIND may be `append' for ENTRY or `last' for an extended newest line."
               (ebb-screen-history-row-map-width screen) nil
               (ebb-screen-history-row-map-generation screen) nil))))))
 
+(defun ebb--history-physical-row-count-safe (screen)
+  "Return SCREEN's physical history row count, including legacy test state."
+  (condition-case nil
+      (ebb-screen-history-row-count screen)
+    (error (ebb-screen-scrollback-length screen))))
+
 (defun ebb--history-clear (screen)
   "Clear SCREEN's logical history."
-  (setf (ebb-screen-scrollback screen) nil
-        (ebb-screen-scrollback-length screen) 0
-        (ebb-screen-scrollback-dirty screen) t)
-  (remhash screen ebb--preserved-display-signatures)
-  (ebb--history-changed screen))
+  (let ((old-rows (ebb--history-physical-row-count-safe screen)))
+    (setf (ebb-screen-scrollback screen) nil
+          (ebb-screen-scrollback-length screen) 0
+          (ebb-screen-scrollback-dirty screen) t)
+    (remhash screen ebb--preserved-display-signatures)
+    (ebb--history-changed screen)
+    (ebb-graphics-trim-history (ebb-screen-graphics screen) old-rows)))
 
 (defun ebb--history-normalize (screen)
   "Convert legacy physical rows in SCREEN history to logical lines."
@@ -1318,6 +1332,9 @@ Top lines go to scrollback (if on main screen)."
          (height (ebb-screen-height screen))
          (lines (ebb-screen-lines screen))
          (width (ebb-screen-width screen))
+         (old-base (if (ebb-screen-alt-screen screen)
+                       0
+                     (ebb-screen-history-row-count screen)))
          (n (min count (1+ (- bot top)))))
     ;; Push lines scrolling off the terminal's top edge into scrollback.
     ;; Inner scroll regions do not leave the display and must not become
@@ -1352,6 +1369,24 @@ Top lines go to scrollback (if on main screen)."
         (while (<= i bot)
           (ebb--set-line-at screen i (ebb--make-empty-line width))
           (cl-incf i))))
+    (cond
+     ;; Full-screen main scrolling appends the removed rows to history.  Since
+     ;; main placements use combined history+viewport row coordinates, their
+     ;; anchors remain unchanged as the viewport origin advances.
+     ((and (not (ebb-screen-alt-screen screen))
+           (zerop top) (= bot (1- height))))
+     ;; A top-anchored partial region also grows history.  Placements in the
+     ;; region retain their absolute anchors (including rows that just entered
+     ;; history); placements below it move with the unchanged viewport text.
+     ((and (not (ebb-screen-alt-screen screen)) (zerop top))
+      (ebb-graphics-history-grew
+       (ebb-screen-graphics screen) old-base bot n))
+     (t
+      (let ((base (if (ebb-screen-alt-screen screen)
+                      0
+                    (ebb-screen-history-row-count screen))))
+        (ebb-graphics-scroll (ebb-screen-graphics screen) 'up
+                             (+ base top) (+ base bot) n))))
     ;; Mark all lines in region dirty.
     (ebb--mark-region-dirty screen top bot)
     ;; Trim scrollback
@@ -1385,6 +1420,11 @@ Bottom lines are discarded."
         (while (<= i end)
           (ebb--set-line-at screen i (ebb--make-empty-line width))
           (cl-incf i))))
+    (let ((base (if (ebb-screen-alt-screen screen)
+                    0
+                  (ebb-screen-history-row-count screen))))
+      (ebb-graphics-scroll (ebb-screen-graphics screen) 'down
+                           (+ base top) (+ base bot) n))
     ;; Mark dirty.
     (ebb--mark-region-dirty screen top bot)))
 
@@ -1394,34 +1434,41 @@ Bottom lines are discarded."
         (len (ebb-screen-scrollback-length screen))
         (batch (ebb-screen-scrollback-trim-batch screen)))
     (when (> len (+ max batch))
-      ;; Keep the newest MAX logical lines (the list is newest first).
-      ;; A boundary chunk retains only its newest suffix via FIRST.
-      (if (zerop max)
-          (setf (ebb-screen-scrollback screen) nil)
-        (let ((remaining max)
-              (entries (ebb-screen-scrollback screen))
-              previous)
-          (while (and entries (> remaining 0))
-            (let* ((entry (car entries))
-                   (count (ebb--history-entry-line-count entry)))
-              (if (<= count remaining)
-                  (progn
-                    (cl-decf remaining count)
-                    (setq previous entries
-                          entries (cdr entries)))
-                (when (ebb-history-chunk-p entry)
-                  (setf (ebb-history-chunk-first entry)
-                        (- (length (ebb-history-chunk-lengths entry)) remaining)
-                        (ebb-history-chunk-row-ends entry) nil
-                        (ebb-history-chunk-row-map-width entry) nil)
-                  (ebb--history-chunk-compact entry))
-                (setq remaining 0
-                      previous entries
-                      entries (cdr entries)))))
-          (when previous
-            (setcdr previous nil)))
-        (setf (ebb-screen-scrollback-length screen) max)
-        (ebb--history-changed screen)))))
+      (let ((old-rows (ebb--history-physical-row-count-safe screen)))
+        ;; Keep the newest MAX logical lines (the list is newest first).
+        ;; A boundary chunk retains only its newest suffix via FIRST.
+        (if (zerop max)
+            (progn
+              (setf (ebb-screen-scrollback screen) nil
+                    (ebb-screen-scrollback-length screen) 0)
+              (ebb--history-changed screen))
+          (let ((remaining max)
+                (entries (ebb-screen-scrollback screen))
+                previous)
+            (while (and entries (> remaining 0))
+              (let* ((entry (car entries))
+                     (count (ebb--history-entry-line-count entry)))
+                (if (<= count remaining)
+                    (progn
+                      (cl-decf remaining count)
+                      (setq previous entries
+                            entries (cdr entries)))
+                  (when (ebb-history-chunk-p entry)
+                    (setf (ebb-history-chunk-first entry)
+                          (- (length (ebb-history-chunk-lengths entry)) remaining)
+                          (ebb-history-chunk-row-ends entry) nil
+                          (ebb-history-chunk-row-map-width entry) nil)
+                    (ebb--history-chunk-compact entry))
+                  (setq remaining 0
+                        previous entries
+                        entries (cdr entries)))))
+            (when previous
+              (setcdr previous nil)))
+          (setf (ebb-screen-scrollback-length screen) max)
+          (ebb--history-changed screen))
+        (ebb-graphics-trim-history
+         (ebb-screen-graphics screen)
+         (- old-rows (ebb--history-physical-row-count-safe screen)))))))
 
 ;;;; ---- Character Writing ----------------------------------------------
 
@@ -2183,6 +2230,17 @@ Handles LF, VT, FF."
                                (ebb-cell-width cell)
                                (ebb-cell-attr cell)))))
 
+(defun ebb--viewport-row-has-graphics-p (screen row)
+  "Return non-nil when viewport ROW intersects a static placement."
+  (let ((absolute (+ (ebb--history-physical-row-count-safe screen) row)))
+    (cl-some
+     (lambda (placement)
+       (and (not (ebb-graphics-placement-virtual placement))
+            (<= (ebb-graphics-placement-row placement) absolute)
+            (< absolute (+ (ebb-graphics-placement-row placement)
+                           (ebb-graphics-placement-rows placement)))))
+     (ebb-graphics-state-placements (ebb-screen-graphics screen)))))
+
 (defun ebb--history-preserve-display (screen)
   "Append changed, meaningful main-screen viewport rows to history."
   (unless (ebb-screen-alt-screen screen)
@@ -2190,10 +2248,14 @@ Handles LF, VT, FF."
            (end (ebb-screen-height screen)))
       (while (and (> end 0)
                   (ebb--line-empty-for-history-p
-                   (ebb--line-at screen (1- end)) width))
+                   (ebb--line-at screen (1- end)) width)
+                  (not (ebb--viewport-row-has-graphics-p
+                        screen (1- end))))
         (cl-decf end))
       (let ((signature
-             (cons width
+             (list width
+                   (ebb-graphics-state-generation
+                    (ebb-screen-graphics screen))
                    (cl-loop for row below end
                             collect (ebb--line-history-signature
                                      (ebb--line-at screen row) width)))))
@@ -2216,6 +2278,9 @@ Handles LF, VT, FF."
         (height (ebb-screen-height screen)))
     (pcase mode
       (0 ;; Erase from cursor to end of display
+       ;; Graphics placements are independent terminal objects; partial text
+       ;; erases leave them in place.  ED 2 below is the explicit viewport
+       ;; clearing operation.
        (ebb-screen--erase-in-line-unprotected screen 0)
        (cl-loop for r from (1+ cy) below height
                 do (ebb--erase-whole-line screen r)))
@@ -2228,6 +2293,13 @@ Handles LF, VT, FF."
        ;; This makes shell Ctrl-L visually clear the viewport without deleting
        ;; output that has not yet naturally scrolled off its top edge.
        (ebb--history-preserve-display screen)
+       ;; Preserved placements keep their old absolute rows, which now lie in
+       ;; history.  Delete only placements still intersecting the viewport.
+       (let ((base (if (ebb-screen-alt-screen screen)
+                       0
+                     (ebb--history-physical-row-count-safe screen))))
+         (ebb-graphics-clear-row-range
+          (ebb-screen-graphics screen) base (+ base height -1)))
        (ebb-screen-mark-viewport-reset screen)
        (let ((bg (and (ebb-screen-current-attr screen)
                       (ebb-attr-bg (ebb-screen-current-attr screen)))))
@@ -2536,7 +2608,12 @@ Handles LF, VT, FF."
           (cl-loop for i from bot downto (+ cy n)
                    do (ebb--set-line-at screen i (ebb--line-at screen (- i n))))
           (cl-loop for i from cy below (+ cy n)
-                   do (ebb--set-line-at screen i (ebb--make-empty-line width))))
+                   do (ebb--set-line-at screen i (ebb--make-empty-line width)))
+          (let ((base (if (ebb-screen-alt-screen screen)
+                          0
+                        (ebb-screen-history-row-count screen))))
+            (ebb-graphics-scroll (ebb-screen-graphics screen) 'down
+                                 (+ base cy) (+ base bot) n)))
         (ebb--mark-region-dirty screen cy bot)))))
 
 (defun ebb-screen-delete-lines (screen count)
@@ -2602,7 +2679,12 @@ Handles LF, VT, FF."
           (cl-loop for i from cy to (- bot n)
                    do (ebb--set-line-at screen i (ebb--line-at screen (+ i n))))
           (cl-loop for i from (1+ (- bot n)) to bot
-                   do (ebb--set-line-at screen i (ebb--make-empty-line width))))
+                   do (ebb--set-line-at screen i (ebb--make-empty-line width)))
+          (let ((base (if (ebb-screen-alt-screen screen)
+                          0
+                        (ebb-screen-history-row-count screen))))
+            (ebb-graphics-scroll (ebb-screen-graphics screen) 'up
+                                 (+ base cy) (+ base bot) n)))
         (ebb--mark-region-dirty screen cy bot)))))
 
 ;;;; ---- Character Operations -------------------------------------------
@@ -2755,6 +2837,8 @@ Handles LF, VT, FF."
                :scroll-bottom (ebb-alt-save-scroll-bottom saved)
                :scrollback (ebb-alt-save-scrollback saved)
                :scrollback-length (ebb-alt-save-scrollback-length saved)
+               :graphics (or (ebb-alt-save-graphics saved)
+                             (ebb-graphics-create))
                :history-next-id (ebb-alt-save-history-next-id saved)
                :history-generation (ebb-alt-save-history-generation saved)
                :auto-wrap (ebb-alt-save-auto-wrap saved))))
@@ -2771,6 +2855,7 @@ Handles LF, VT, FF."
           (ebb-alt-save-scrollback saved) (ebb-screen-scrollback main)
           (ebb-alt-save-scrollback-length saved)
           (ebb-screen-scrollback-length main)
+          (ebb-alt-save-graphics saved) (ebb-screen-graphics main)
           (ebb-alt-save-history-next-id saved) (ebb-screen-history-next-id main)
           (ebb-alt-save-history-generation saved)
           (ebb-screen-history-generation main))))
@@ -2800,6 +2885,7 @@ Handles LF, VT, FF."
            :scroll-bottom (ebb-screen-scroll-bottom screen)
            :scrollback (ebb-screen-scrollback screen)
            :scrollback-length (ebb-screen-scrollback-length screen)
+           :graphics (ebb-screen-graphics screen)
            :history-next-id (ebb-screen-history-next-id screen)
            :history-generation (ebb-screen-history-generation screen)
            :auto-wrap (ebb-screen-auto-wrap screen)
@@ -2818,6 +2904,10 @@ Handles LF, VT, FF."
       (setf (ebb-screen-pending-wrap screen) nil)
       (setf (ebb-screen-scroll-top screen) 0)
       (setf (ebb-screen-scroll-bottom screen) (1- h))
+      (setf (ebb-screen-graphics screen)
+            (ebb-graphics-create
+             (ebb-graphics-state-budget
+              (ebb-alt-save-graphics (ebb-screen-alt-screen screen)))))
       (ebb--history-clear screen)
       (setf (ebb-screen-dirty-lines screen)
             (number-sequence 0 (1- h)))
@@ -2827,6 +2917,9 @@ Handles LF, VT, FF."
 (defun ebb-screen-leave-alt (screen)
   "Leave alternate screen buffer, restoring main screen."
   (when-let* ((saved (ebb-screen-alt-screen screen)))
+    ;; Alternate-screen image data is discarded, but its bytes participate in
+    ;; the same terminal-wide quota while the alternate screen is active.
+    (ebb-graphics-reset (ebb-screen-graphics screen))
     (setf (ebb-screen-lines screen) (ebb-alt-save-lines saved))
     (setf (ebb-screen-line-start screen) (ebb-alt-save-line-start saved))
     (setf (ebb-screen-cursor-x screen) (ebb-alt-save-cursor-x saved))
@@ -2845,6 +2938,7 @@ Handles LF, VT, FF."
     (setf (ebb-screen-scrollback screen) (ebb-alt-save-scrollback saved))
     (setf (ebb-screen-scrollback-length screen)
           (ebb-alt-save-scrollback-length saved))
+    (setf (ebb-screen-graphics screen) (ebb-alt-save-graphics saved))
     (setf (ebb-screen-history-next-id screen)
           (ebb-alt-save-history-next-id saved))
     (setf (ebb-screen-history-generation screen)
@@ -3149,6 +3243,11 @@ Reflow main-screen lines, preserve the logical cursor, and reset the region."
                                (ebb--trim-trailing-blank-cells
                                 (ebb--line-ensure-cells line old-width)))))))
         (cl-decf end))
+      ;; Placement anchors are physical rows until logical graphics anchors are
+      ;; introduced.  A width reflow changes those rows, so clear placements
+      ;; rather than display them against unrelated text.
+      (when (/= old-width new-width)
+        (ebb-graphics-clear-placements (ebb-screen-graphics screen)))
       (if (ebb-screen-alt-screen screen)
           (ebb--resize-alt-screen
            screen old-lines old-width old-pending-wrap new-width new-height)
@@ -3493,8 +3592,9 @@ OFFSET, when non-nil, is translated to the normalized cell sequence."
     (setf (ebb-screen-charset-g2 screen) 'us-ascii)
     (setf (ebb-screen-charset-g3 screen) 'us-ascii)
     (setf (ebb-screen-charset-active screen) 'g0)
-    ;; Reset scrollback
+    ;; Reset scrollback and graphics
     (ebb--history-clear screen)
+    (ebb-graphics-reset (ebb-screen-graphics screen))
     ;; Reset tab stops
     (setf (ebb-screen-tab-stops screen)
           (ebb--default-tab-stops w))
