@@ -316,17 +316,23 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
                         (ebb-screen-carriage-return screen)
                         (ebb-screen-index screen)
                         (cl-incf i 2)))))
-              ;; Kitty graphics arrive as long base64 APC payloads; collect a
-              ;; whole printable run at once rather than one byte at a time.
-              (if (and (eq (ebb-parser-state parser) :sos-pm-apc)
+              ;; Control strings (APC/OSC/DCS) carry long printable payloads;
+              ;; collect a whole run at once rather than one byte at a time.
+              (if (and (memq (ebb-parser-state parser)
+                             '(:sos-pm-apc :osc-string :dcs-passthrough))
                        (>= ch ?\s) (< ch ?\x7f))
-                  (let ((run-start i))
+                  (let ((run-start i)
+                        (string-state (ebb-parser-state parser)))
                     (while (and (< i e)
                                 (let ((c (aref string i)))
                                   (and (>= c ?\s) (< c ?\x7f))))
                       (cl-incf i))
-                    (ebb-parse--apc-collect
-                     parser (substring string run-start i)))
+                    (let ((chunk (substring string run-start i)))
+                      (pcase string-state
+                        (:sos-pm-apc (ebb-parse--apc-collect parser chunk))
+                        (:osc-string (ebb-parse--osc-collect parser chunk))
+                        (:dcs-passthrough
+                         (ebb-parse--dcs-collect parser chunk)))))
                 (ebb-parse--process-char parser ch)
                 (cl-incf i))))))))
     (- i (or start 0))))
@@ -757,6 +763,16 @@ in process-char."
 
 ;;;; ---- State: OSC String ----------------------------------------------
 
+(defun ebb-parse--osc-collect (parser chunk)
+  "Retain CHUNK of the pending OSC string in PARSER, within the size bound."
+  (let ((room (- 65536 (ebb-parser-osc-length parser))))
+    (when (> room 0)
+      (let ((chunk (if (> (length chunk) room)
+                       (substring chunk 0 room)
+                     chunk)))
+        (push chunk (ebb-parser-osc-parts parser))
+        (cl-incf (ebb-parser-osc-length parser) (length chunk))))))
+
 (defun ebb-parse--osc-string (parser ch)
   "Collect OSC string payload byte CH into PARSER."
   (cond
@@ -768,9 +784,7 @@ in process-char."
    ;; C0 controls are discarded while the OSC string continues.
    ((< ch ?\s) nil)
    ;; Accumulate (limit length for safety)
-   ((< (ebb-parser-osc-length parser) 65536)
-    (push (string ch) (ebb-parser-osc-parts parser))
-    (cl-incf (ebb-parser-osc-length parser)))))
+   (t (ebb-parse--osc-collect parser (string ch)))))
 
 ;;;; ---- State: DCS Entry/Param/Passthrough -----------------------------
 
@@ -815,12 +829,19 @@ in process-char."
    ((< ch ?\s) nil)
    (t (setf (ebb-parser-state parser) :ground))))
 
+(defun ebb-parse--dcs-collect (parser chunk)
+  "Retain CHUNK of the pending DCS body in PARSER, within the size bound."
+  (let ((room (- 1048576 (ebb-parser-dcs-length parser))))
+    (when (> room 0)
+      (let ((chunk (if (> (length chunk) room)
+                       (substring chunk 0 room)
+                     chunk)))
+        (push chunk (ebb-parser-dcs-parts parser))
+        (cl-incf (ebb-parser-dcs-length parser) (length chunk))))))
+
 (defun ebb-parse--dcs-passthrough (parser ch)
   "Accumulate DCS body byte CH into PARSER.  ESC handled in process-char for ST."
-  ;; Just accumulate (limit for safety)
-  (when (< (ebb-parser-dcs-length parser) 1048576)
-    (push (string ch) (ebb-parser-dcs-parts parser))
-    (cl-incf (ebb-parser-dcs-length parser))))
+  (ebb-parse--dcs-collect parser (string ch)))
 
 (defun ebb-parse--dcs-ignored (_parser _ch)
   "Ignore an overlong DCS through its string terminator.")
@@ -877,7 +898,9 @@ Retain bounded Kitty APC data."
           (ebb-parser-apc-length parser) 0
           (ebb-parser-apc-overflow parser) nil
           (ebb-parser-apc-active parser) nil)
-    (when active
+    ;; Only Kitty graphics APCs need the placement snapshot below; classify the
+    ;; payload first so non-graphics APCs stay O(1).
+    (when (and active (> (length payload) 0) (= (aref payload 0) ?G))
       (condition-case err
           (let* ((screen (ebb-parser-screen parser))
                  (graphics (ebb-screen-graphics screen))

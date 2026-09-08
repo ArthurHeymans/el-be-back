@@ -87,8 +87,11 @@ parsing free; it bounds how long one callback can monopolize Emacs and reduces
 repeated buffer work during output floods.
 
 The trade-off is a little more pipeline state and possible display latency.
-The benefit is a clean place to add back-pressure, tracing, or alternate
-transports without making the parser know about buffers.
+The queue is bounded by =ebb-io-max-pending-bytes=, and while a backlog remains
+the scheduler keeps draining back-to-back so =ebb-maximum-latency= is honored
+instead of restarting its window after every chunk.  The pipeline is also a
+clean place for tracing or alternate transports without making the parser know
+about buffers.
 
 * Consequences
 

@@ -2410,6 +2410,17 @@ Binds `screen' and `parser' in BODY."
       (should-not (ebb-graphics--store-image state second 24 1 1 "def"))
       (should (gethash 1 (ebb-graphics-state-images state))))))
 
+(ert-deftest ebb-test-kitty-image-count-limit ()
+  "Unreferenced images are evicted to honor the image count cap."
+  (let ((ebb-kitty-graphics-image-count-limit 2)
+        (ebb-kitty-graphics-storage-limit (* 1024 1024))
+        (state (ebb-graphics-create)))
+    (dotimes (_ 3)
+      (should (ebb-graphics--store-image
+               state (make-hash-table) 24 1 1 "abc")))
+    (should (<= (hash-table-count (ebb-graphics-state-images state)) 2))
+    (should (<= (length (ebb-graphics-state-image-order state)) 2))))
+
 (ert-deftest ebb-test-kitty-placement-resources-are-bounded ()
   "Surface dimensions and retained placement count have independent limits."
   (let ((ebb-kitty-graphics-placement-limit 2)
@@ -5106,6 +5117,9 @@ the pixel helper is coalesced."
         (cl-letf (((symbol-function 'ebb-parse-bytes)
                    (lambda (&rest _) (error "test failure"))))
           (ebb-io--process-pending io t)
+          ;; A parse error now discards the offending chunk, so feed another
+          ;; one to exercise the consecutive-error counter.
+          (ebb-io--enqueue-output io "bad")
           (ebb-io--process-pending io t))
         (should (equal '(2 1) counts))))))
 

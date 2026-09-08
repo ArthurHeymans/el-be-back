@@ -51,6 +51,30 @@ terminals, since their paths would otherwise be resolved on the Emacs host."
   :type 'integer
   :group 'ebb)
 
+(defcustom ebb-kitty-graphics-image-count-limit 4096
+  "Maximum number of Kitty images retained by one terminal screen.
+Bounds the retained image structs, hash entries, and eviction-order
+entries, which are not covered by the byte quota alone.  Images without a
+placement (`a=t') count toward this limit."
+  :type 'natnum
+  :group 'ebb)
+
+(defcustom ebb-kitty-graphics-subprocess-budget 8
+  "Maximum graphics helper subprocesses started per terminal drain.
+Bounds main-thread stalls from decoding untrusted images in `python3'."
+  :type 'natnum
+  :group 'ebb)
+
+(defvar ebb-graphics--subprocess-budget most-positive-fixnum
+  "Remaining helper subprocess launches allowed in the current drain.
+Dynamically bound by the I/O loop to `ebb-kitty-graphics-subprocess-budget'.")
+
+(defun ebb-graphics--consume-subprocess-budget ()
+  "Claim one helper subprocess launch, or return nil when exhausted."
+  (when (> ebb-graphics--subprocess-budget 0)
+    (cl-decf ebb-graphics--subprocess-budget)
+    t))
+
 (defcustom ebb-kitty-graphics-surface-limit (* 64 1024 1024)
   "Maximum estimated bytes in one rendered placement surface.
 The estimate uses four bytes per pixel for the complete occupied cell box."
@@ -245,6 +269,8 @@ MESSAGE is the response body; ACTUAL-ID overrides the reported image number."
 Use a bounded helper so a small compressed input cannot make Emacs allocate
 an unbounded output buffer."
   (or
+   (unless (ebb-graphics--consume-subprocess-budget)
+     (ebb-graphics--error "EAGAIN:graphics helper budget exhausted"))
    (when-let* ((python (executable-find "python3")))
      (with-temp-buffer
       (set-buffer-multibyte nil)
@@ -301,6 +327,8 @@ still names the opened inode.  Return bytes or an error marker."
   (cond
    ((ebb-graphics--sensitive-path-p path)
     (ebb-graphics--error "EPERM:refusing to read from a sensitive path"))
+   ((not (ebb-graphics--consume-subprocess-budget))
+    (ebb-graphics--error "EAGAIN:graphics helper budget exhausted"))
    ((not (executable-find "python3"))
     (ebb-graphics--error "ENOTSUP:safe file helper unavailable"))
    (t
@@ -525,9 +553,10 @@ pending, or an error marker."
 (defun ebb-graphics--image-storage-size (format width height data)
   "Return the retained-memory charge for image DATA with FORMAT.
 WIDTH and HEIGHT give the decoded pixel dimensions.
-WIDTH and HEIGHT are the decoded pixel dimensions.
 PNG storage is charged at no less than its estimated four-byte decoded
-surface so compressed images cannot bypass the terminal storage quota."
+surface so compressed images cannot bypass the terminal storage quota.
+`ebb-kitty-graphics-image-count-limit' separately bounds the retained
+struct/hash/order overhead that DATA does not cover."
   (max (length data)
        (if (and (eql format 100) (integerp width) (integerp height))
            (* width height 4)
@@ -578,26 +607,33 @@ surface so compressed images cannot bypass the terminal storage quota."
                      :key #'ebb-graphics-placement-image-id :test #'eql))
     t))
 
-(defun ebb-graphics--eviction-plan (state required-bytes excluded-id)
+(defun ebb-graphics--eviction-plan (state required-bytes excluded-id
+                                           &optional required-count)
   "Return oldest unreferenced image IDs in STATE freeing REQUIRED-BYTES, or nil.
-EXCLUDED-ID is a replacement target and is never considered a victim."
-  (if (<= required-bytes 0)
-      'fit
-    (let ((oldest (reverse (ebb-graphics-state-image-order state)))
-          (freed 0)
-          victims)
-      (while (and oldest (< freed required-bytes))
-        (let ((image-id (pop oldest)))
-          (when (and (not (eql image-id excluded-id))
-                     (not (cl-find
-                           image-id (ebb-graphics-state-placements state)
-                           :key #'ebb-graphics-placement-image-id :test #'eql)))
-            (push image-id victims)
-            (cl-incf freed
-                     (ebb-graphics--image-storage-bytes
-                      (gethash image-id
-                               (ebb-graphics-state-images state)))))))
-      (and (>= freed required-bytes) (nreverse victims)))))
+EXCLUDED-ID is a replacement target and is never considered a victim.
+When REQUIRED-COUNT is non-nil, also evict at least that many images."
+  (let ((needed-count (or required-count 0)))
+    (if (and (<= required-bytes 0) (<= needed-count 0))
+        'fit
+      (let ((oldest (reverse (ebb-graphics-state-image-order state)))
+            (freed 0)
+            victims)
+        (while (and oldest
+                    (or (< freed required-bytes)
+                        (< (length victims) needed-count)))
+          (let ((image-id (pop oldest)))
+            (when (and (not (eql image-id excluded-id))
+                       (not (cl-find
+                             image-id (ebb-graphics-state-placements state)
+                             :key #'ebb-graphics-placement-image-id :test #'eql)))
+              (push image-id victims)
+              (cl-incf freed
+                       (ebb-graphics--image-storage-bytes
+                        (gethash image-id
+                                 (ebb-graphics-state-images state)))))))
+        (and (>= freed required-bytes)
+             (>= (length victims) needed-count)
+             (nreverse victims))))))
 
 (defun ebb-graphics--store-image (state params format width height data)
   "Store DATA of FORMAT and WIDTH by HEIGHT under PARAMS in STATE.
@@ -614,9 +650,14 @@ Return the image ID, or nil when the storage quota cannot admit it."
            (projected (+ (- (ebb-graphics-state-byte-count state) old-bytes)
                          new-bytes))
            (required (- projected ebb-kitty-graphics-storage-limit))
+           (count-limit (max 1 ebb-kitty-graphics-image-count-limit))
+           (required-count
+            (if old 0
+              (max 0 (- (hash-table-count (ebb-graphics-state-images state))
+                        (1- count-limit)))))
            (victims (and (<= new-bytes ebb-kitty-graphics-storage-limit)
                          (ebb-graphics--eviction-plan
-                          state required image-id))))
+                          state required image-id required-count))))
       ;; Do not mutate the old image, its placements, or accounting until a
       ;; complete admission plan has been proved to fit.
       (when victims

@@ -59,10 +59,11 @@ contains =tty-graphics-protocol=, and the file is unlinked only while the
 path still names the opened inode.
 
 The budgets bound memory, not time.  The helper calls still run synchronously
-on the main thread, and a hostile child that streams many distinct images can
-stall the UI with back-to-back subprocess spawns.  Do not run untrusted
-programs in Ebb with graphics enabled.  Setting
-=ebb-kitty-graphics-storage-limit= to zero disables graphics outright.
+on the main thread, but =ebb-kitty-graphics-subprocess-budget= caps how many
+helpers one drain may start, so a hostile child cannot stall the UI with
+unbounded back-to-back subprocess spawns.  Do not run untrusted programs in
+Ebb with graphics enabled.  Setting =ebb-kitty-graphics-storage-limit= to zero
+disables graphics outright.
 
 * Pixel geometry
 
