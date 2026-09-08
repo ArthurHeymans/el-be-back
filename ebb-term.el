@@ -1712,7 +1712,9 @@ instead of moving off the screen."
           (setq column 0
                 row (ebb-screen-cursor-y screen)
                 line (ebb--line-at screen row)
-                cells (ebb--line-ensure-cells line screen-width))
+                screen-width (ebb-screen-line-width screen row)
+                cells (ebb--line-ensure-cells
+                       line (ebb-screen-width screen)))
           ;; The wrapped-to row now holds cells; drop any stale text cache so
           ;; the renderer does not keep showing its pre-wrap contents.
           (setf (ebb-line-text line) nil
@@ -3217,7 +3219,8 @@ DECCOLM clears the display, restores full-screen margins, and homes the cursor."
   "Resize SCREEN's alternate grid without reflowing OLD-LINES.
 OLD-WIDTH and OLD-PENDING-WRAP describe the previous grid; NEW-WIDTH and
 NEW-HEIGHT specify the replacement grid."
-  (let ((lines (make-vector new-height nil)))
+  (let ((lines (make-vector new-height nil))
+        (old-logical-width (ebb-screen-line-width screen)))
     (dotimes (row new-height)
       (aset lines row
             (if (< row (length old-lines))
@@ -3239,16 +3242,18 @@ NEW-HEIGHT specify the replacement grid."
           (ebb-screen-line-start screen) 0
           (ebb-screen-width screen) new-width
           (ebb-screen-height screen) new-height
-          (ebb-screen-cursor-x screen)
-          (if (and old-pending-wrap (> new-width old-width))
-              old-width
-            (min (ebb-screen-cursor-x screen) (1- new-width)))
           (ebb-screen-cursor-y screen)
-          (min (ebb-screen-cursor-y screen) (1- new-height))
-          (ebb-screen-pending-wrap screen)
-          (and old-pending-wrap
-               (<= new-width old-width)
-               (ebb-screen-auto-wrap screen)))))
+          (min (ebb-screen-cursor-y screen) (1- new-height)))
+    (let ((new-logical-width (ebb-screen-line-width screen)))
+      (setf (ebb-screen-cursor-x screen)
+            (if (and old-pending-wrap
+                     (> new-logical-width old-logical-width))
+                old-logical-width
+              (min (ebb-screen-cursor-x screen) (1- new-logical-width)))
+            (ebb-screen-pending-wrap screen)
+            (and old-pending-wrap
+                 (<= new-logical-width old-logical-width)
+                 (ebb-screen-auto-wrap screen))))))
 
 (defun ebb--normalize-logical-lines-for-width
     (logical-lines cursor-index cursor-offset new-width)
