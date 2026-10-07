@@ -2906,6 +2906,19 @@ The shared quota is conservative: a full main screen leaves an
           (should (eq string
                       (ebb-render--apply-graphics render 0 string absolute))))))))
 
+(ert-deftest ebb-test-render-virtual-graphics-skips-non-placeholder-rows ()
+  "Virtual graphics do not inspect model cells without a placeholder."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((render (make-ebb-render-state :screen screen))
+          (string (propertize "plain" 'face 'bold)))
+      (cl-letf (((symbol-function 'ebb-render--graphics-line)
+                 (lambda (&rest _) (ert-fail "Unexpected model line lookup"))))
+        (dolist (absolute '(nil t))
+          (should (eq string
+                      (ebb-render--apply-virtual-graphics
+                       render 0 string (ebb-screen-graphics screen)
+                       8 16 absolute))))))))
+
 (ert-deftest ebb-test-render-kitty-placement-as-row-slices ()
   "Static Kitty placements render as cell-sized image slices per row."
   (ebb-test-with-screen (:width 20 :height 6)

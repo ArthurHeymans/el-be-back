@@ -1590,104 +1590,106 @@ invisible viewport spacers so an image on the second cell is actually visible."
   "Apply Unicode-placeholder graphics from GRAPHICS on ROW of STRING in RENDER.
 ROW is history-absolute when ABSOLUTE is non-nil.  CELL-WIDTH and CELL-HEIGHT
 give the display cell size in pixels."
-  (let* ((screen (ebb-render-state-screen render))
-         (line (ebb-render--graphics-line screen row absolute))
-         (cells (and line (ebb--line-ensure-cells line (ebb-screen-width screen))))
-         (result string)
-         (indices (ebb-render--graphics-column-indices
-                   line string (ebb-screen-width screen) absolute))
-         (per-placement-columns (make-hash-table :test #'eq))
-         previous-placeholder previous-low-id previous-placement-id
-         previous-row previous-column previous-high-byte)
-    (when (and cells (string-search (string #x10eeee) result))
-      (dotimes (column (length cells))
-        (let* ((cell (aref cells column))
-               (attr (ebb-cell-attr cell)))
-          (if (not (and (= (ebb-cell-char cell) #x10eeee) attr))
-              (setq previous-placeholder nil)
-            (pcase-let* ((`(,encoded-row ,encoded-column ,encoded-high-byte)
-                          (ebb-render--placeholder-coordinates cell))
-                         (low-id (ebb-render--graphics-color-id
-                                  (ebb-attr-fg attr)))
-                         (placement-id
-                          (ebb-render--graphics-color-id
-                           (ebb-attr-ul-color attr)))
-                         (same-colors
-                          (and previous-placeholder
-                               (equal low-id previous-low-id)
-                               (equal placement-id previous-placement-id)))
+  (if (not (string-search (string #x10eeee) string))
+      string
+    (let* ((screen (ebb-render-state-screen render))
+           (line (ebb-render--graphics-line screen row absolute))
+           (cells (and line (ebb--line-ensure-cells line (ebb-screen-width screen))))
+           (result string)
+           (indices (ebb-render--graphics-column-indices
+                     line string (ebb-screen-width screen) absolute))
+           (per-placement-columns (make-hash-table :test #'eq))
+           previous-placeholder previous-low-id previous-placement-id
+           previous-row previous-column previous-high-byte)
+      (when cells
+        (dotimes (column (length cells))
+          (let* ((cell (aref cells column))
+                 (attr (ebb-cell-attr cell)))
+            (if (not (and (= (ebb-cell-char cell) #x10eeee) attr))
+                (setq previous-placeholder nil)
+              (pcase-let* ((`(,encoded-row ,encoded-column ,encoded-high-byte)
+                            (ebb-render--placeholder-coordinates cell))
+                           (low-id (ebb-render--graphics-color-id
+                                    (ebb-attr-fg attr)))
+                           (placement-id
+                            (ebb-render--graphics-color-id
+                             (ebb-attr-ul-color attr)))
+                           (same-colors
+                            (and previous-placeholder
+                                 (equal low-id previous-low-id)
+                                 (equal placement-id previous-placement-id)))
+                           (tile-row
+                            (or encoded-row (and same-colors previous-row)))
+                           (tile-column
+                            (or encoded-column
+                                (and same-colors tile-row
+                                     (eql tile-row previous-row)
+                                     (integerp previous-column)
+                                     (1+ previous-column))))
+                           (high-byte
+                            (or encoded-high-byte
+                                (and same-colors tile-row tile-column
+                                     (eql tile-row previous-row)
+                                     (integerp previous-column)
+                                     (= tile-column (1+ previous-column))
+                                     previous-high-byte)
+                                0))
+                           (image-id (and low-id
+                                          (+ low-id (ash high-byte 24))))
+                           (placement (and image-id
+                                           (ebb-render--virtual-placement
+                                            graphics image-id placement-id))))
+                (when placement
+                  (let* ((fallback-column
+                          (gethash placement per-placement-columns 0))
+                         (tile-column (or tile-column fallback-column))
                          (tile-row
-                          (or encoded-row (and same-colors previous-row)))
-                         (tile-column
-                          (or encoded-column
-                              (and same-colors tile-row
-                                   (eql tile-row previous-row)
-                                   (integerp previous-column)
-                                   (1+ previous-column))))
-                         (high-byte
-                          (or encoded-high-byte
-                              (and same-colors tile-row tile-column
-                                   (eql tile-row previous-row)
-                                   (integerp previous-column)
-                                   (= tile-column (1+ previous-column))
-                                   previous-high-byte)
-                              0))
-                         (image-id (and low-id
-                                        (+ low-id (ash high-byte 24))))
-                         (placement (and image-id
-                                         (ebb-render--virtual-placement
-                                          graphics image-id placement-id))))
-              (when placement
-                (let* ((fallback-column
-                        (gethash placement per-placement-columns 0))
-                       (tile-column (or tile-column fallback-column))
-                       (tile-row
-                        (or tile-row
-                            (ebb-render--placeholder-tile-row
-                             render screen graphics row placement absolute)))
-                       (columns (ebb-graphics-placement-columns placement))
-                       (rows (ebb-graphics-placement-rows placement))
-                       (image (gethash image-id
-                                       (ebb-graphics-state-images graphics))))
-                  (puthash placement (1+ tile-column) per-placement-columns)
-                  (setq previous-row tile-row
-                        previous-column tile-column)
-                  (when (and image tile-row
-                             (< tile-column columns) (< tile-row rows))
-                    (when-let* ((object
-                                 (ebb-render--graphics-image-object
-                                  render image placement)))
-                      (unless (multibyte-string-p result)
-                        (setq result (string-to-multibyte result)))
-                      ;; The carrier string may be trimmed or empty while
-                      ;; indices reserve one character per terminal column.
-                      ;; Pad first: positions past the end of the string
-                      ;; would otherwise signal args-out-of-range here and
-                      ;; break the whole refresh.
-                      (let* ((text-start (aref indices column))
-                             (text-end (max (1+ text-start)
-                                            (aref indices (min (1+ column)
-                                                               (1- (length indices)))))))
-                        (when (< (length result) text-end)
-                          (setq result
-                                (concat result
-                                        (make-string
-                                         (- text-end (length result)) ?\s))))
-                        (put-text-property
-                         text-start text-end 'display
-                         (list (list 'slice
-                                     (* tile-column cell-width)
-                                     (* tile-row cell-height)
-                                     cell-width cell-height)
-                               object)
-                         result))))))
-              (setq previous-placeholder t
-                    previous-low-id low-id
-                    previous-placement-id placement-id
-                    previous-row (or tile-row previous-row)
-                    previous-column (or tile-column previous-column)
-                    previous-high-byte high-byte))))))
-    result))
+                          (or tile-row
+                              (ebb-render--placeholder-tile-row
+                               render screen graphics row placement absolute)))
+                         (columns (ebb-graphics-placement-columns placement))
+                         (rows (ebb-graphics-placement-rows placement))
+                         (image (gethash image-id
+                                         (ebb-graphics-state-images graphics))))
+                    (puthash placement (1+ tile-column) per-placement-columns)
+                    (setq previous-row tile-row
+                          previous-column tile-column)
+                    (when (and image tile-row
+                               (< tile-column columns) (< tile-row rows))
+                      (when-let* ((object
+                                   (ebb-render--graphics-image-object
+                                    render image placement)))
+                        (unless (multibyte-string-p result)
+                          (setq result (string-to-multibyte result)))
+                        ;; The carrier string may be trimmed or empty while
+                        ;; indices reserve one character per terminal column.
+                        ;; Pad first: positions past the end of the string
+                        ;; would otherwise signal args-out-of-range here and
+                        ;; break the whole refresh.
+                        (let* ((text-start (aref indices column))
+                               (text-end (max (1+ text-start)
+                                              (aref indices (min (1+ column)
+                                                                 (1- (length indices)))))))
+                          (when (< (length result) text-end)
+                            (setq result
+                                  (concat result
+                                          (make-string
+                                           (- text-end (length result)) ?\s))))
+                          (put-text-property
+                           text-start text-end 'display
+                           (list (list 'slice
+                                       (* tile-column cell-width)
+                                       (* tile-row cell-height)
+                                       cell-width cell-height)
+                                 object)
+                           result))))))
+                (setq previous-placeholder t
+                      previous-low-id low-id
+                      previous-placement-id placement-id
+                      previous-row (or tile-row previous-row)
+                      previous-column (or tile-column previous-column)
+                      previous-high-byte high-byte))))))
+      result)))
 
 (defun ebb-render--apply-graphics (render row string &optional absolute)
   "Return STRING with graphics placements intersecting ROW in RENDER.
