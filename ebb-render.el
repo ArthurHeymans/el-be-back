@@ -1692,7 +1692,13 @@ give the display cell size in pixels."
 (defun ebb-render--apply-graphics (render row string &optional absolute)
   "Return STRING with graphics placements intersecting ROW in RENDER.
 ROW is viewport-relative unless ABSOLUTE is non-nil."
-  (if (not (display-graphic-p))
+  ;; Plain text needs neither column maps nor expanded model cells.  Leave
+  ;; graphics caches untouched here; the generation check below refreshes
+  ;; them when placements are present again.
+  (if (or (not (display-graphic-p))
+          (not (or (ebb-graphics-state-placements
+                    (ebb-screen-graphics (ebb-render-state-screen render)))
+                   (string-search (string #x10eeee) string))))
       string
     (let* ((screen (ebb-render-state-screen render))
            (graphics (ebb-screen-graphics screen))
