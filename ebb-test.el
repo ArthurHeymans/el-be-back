@@ -2919,6 +2919,25 @@ The shared quota is conservative: a full main screen leaves an
                        render 0 string (ebb-screen-graphics screen)
                        8 16 absolute))))))))
 
+(ert-deftest ebb-test-render-graphics-skips-uncovered-rows ()
+  "Placements elsewhere do not force column maps or model cell expansion."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((render (make-ebb-render-state :screen screen :graphics-generation -1))
+          (string "plain"))
+      (setf (ebb-graphics-state-placements (ebb-screen-graphics screen))
+            (list (make-ebb-graphics-placement
+                   :image-id 1 :row 4 :column 0 :columns 2 :rows 1)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'ebb-render-cell-pixel-size)
+                 (lambda (_) '(8 . 16)))
+                ((symbol-function 'ebb-render--graphics-line)
+                 (lambda (&rest _) (ert-fail "Unexpected model line lookup"))))
+        (dolist (absolute '(nil t))
+          ;; Exercise both a newly computed layout and its cached reuse.
+          (dotimes (_ 2)
+            (should (eq string
+                        (ebb-render--apply-graphics render 0 string absolute)))))))))
+
 (ert-deftest ebb-test-render-kitty-placement-as-row-slices ()
   "Static Kitty placements render as cell-sized image slices per row."
   (ebb-test-with-screen (:width 20 :height 6)

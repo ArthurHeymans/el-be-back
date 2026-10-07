@@ -1713,10 +1713,8 @@ ROW is viewport-relative unless ABSOLUTE is non-nil."
            (cell-width (max 1 (car cell)))
            (cell-height (max 1 (cdr cell)))
            (width (ebb-screen-width screen))
-           (line (ebb-render--graphics-line screen row absolute))
            (result string)
-           (indices (ebb-render--graphics-column-indices
-                     line string width absolute)))
+           line indices)
       (unless (and (eq graphics (ebb-render-state-graphics-state render))
                    (= generation
                       (ebb-render-state-graphics-generation render)))
@@ -1776,6 +1774,11 @@ ROW is viewport-relative unless ABSOLUTE is non-nil."
           (when (> ebb-kitty-graphics-layout-cache-limit 0)
             (puthash layout-key owners layout-cache)))
       (when (cl-find-if #'identity owners)
+        ;; Rows outside static placements need neither a model line nor a
+        ;; column map.  In particular, keep compact history lines compact.
+        (setq line (ebb-render--graphics-line screen row absolute)
+              indices (ebb-render--graphics-column-indices
+                       line string width absolute))
         (setq result (ebb-render--graphics-wide-carriers
                       line result width owners indices)
               indices (ebb-render--graphics-column-indices
