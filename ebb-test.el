@@ -2892,6 +2892,52 @@ The shared quota is conservative: a full main screen leaves an
       (ebb-test-output parser "\e[14t\e[16t")
       (should (equal '("\e[6;0;0t" "\e[4;0;0t") responses)))))
 
+(ert-deftest ebb-test-render-plain-text-skips-graphics-work ()
+  "Plain viewport and history text needs no graphics maps or cell expansion."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((render (make-ebb-render-state :screen screen))
+          (string (propertize "e\u0301中 text" 'face 'bold)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'ebb-render--graphics-line)
+                 (lambda (&rest _) (ert-fail "Unexpected model line lookup")))
+                ((symbol-function 'ebb-render-cell-pixel-size)
+                 (lambda (&rest _) (ert-fail "Unexpected cell size lookup"))))
+        (dolist (absolute '(nil t))
+          (should (eq string
+                      (ebb-render--apply-graphics render 0 string absolute))))))))
+
+(ert-deftest ebb-test-render-virtual-graphics-skips-non-placeholder-rows ()
+  "Virtual graphics do not inspect model cells without a placeholder."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((render (make-ebb-render-state :screen screen))
+          (string (propertize "plain" 'face 'bold)))
+      (cl-letf (((symbol-function 'ebb-render--graphics-line)
+                 (lambda (&rest _) (ert-fail "Unexpected model line lookup"))))
+        (dolist (absolute '(nil t))
+          (should (eq string
+                      (ebb-render--apply-virtual-graphics
+                       render 0 string (ebb-screen-graphics screen)
+                       8 16 absolute))))))))
+
+(ert-deftest ebb-test-render-graphics-skips-uncovered-rows ()
+  "Placements elsewhere do not force column maps or model cell expansion."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((render (make-ebb-render-state :screen screen :graphics-generation -1))
+          (string "plain"))
+      (setf (ebb-graphics-state-placements (ebb-screen-graphics screen))
+            (list (make-ebb-graphics-placement
+                   :image-id 1 :row 4 :column 0 :columns 2 :rows 1)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'ebb-render-cell-pixel-size)
+                 (lambda (_) '(8 . 16)))
+                ((symbol-function 'ebb-render--graphics-line)
+                 (lambda (&rest _) (ert-fail "Unexpected model line lookup"))))
+        (dolist (absolute '(nil t))
+          ;; Exercise both a newly computed layout and its cached reuse.
+          (dotimes (_ 2)
+            (should (eq string
+                        (ebb-render--apply-graphics render 0 string absolute)))))))))
+
 (ert-deftest ebb-test-render-kitty-placement-as-row-slices ()
   "Static Kitty placements render as cell-sized image slices per row."
   (ebb-test-with-screen (:width 20 :height 6)
@@ -2917,6 +2963,27 @@ The shared quota is conservative: a full main screen leaves an
                          (get-text-property 0 'display top)))
           (should (equal '((slice 0 16 24 16) mock-image)
                          (get-text-property 0 'display bottom))))))))
+
+(ert-deftest ebb-test-render-graphics-cache-after-plain-text ()
+  "Graphics caches catch up after skipping rows with no placements."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((render (make-ebb-render-state :screen screen :graphics-generation -1)))
+      (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'ebb-render-cell-pixel-size)
+                 (lambda (_) '(8 . 16)))
+                ((symbol-function 'ebb-render--graphics-image-object)
+                 (lambda (&rest _) 'mock-image)))
+        (ebb-test-output parser "\e_Ga=T,f=24,s=1,v=1,i=1,c=3,r=1,C=1;AQID\e\\")
+        (should (get-text-property
+                 2 'display (ebb-render--apply-graphics render 0 "   ")))
+        (ebb-test-output parser "\e_Ga=d,d=A\e\\")
+        (let ((plain "plain"))
+          (should (eq plain (ebb-render--apply-graphics render 0 plain))))
+        (ebb-test-output parser "\e_Ga=T,f=24,s=1,v=1,i=2,c=1,r=1,C=1;AQID\e\\")
+        (let ((result (ebb-render--apply-graphics render 0 "   ")))
+          (should (get-text-property 0 'display result))
+          (should-not (get-text-property 1 'display result))
+          (should-not (get-text-property 2 'display result)))))))
 
 (ert-deftest ebb-test-render-kitty-slices-have-real-cell-box-geometry ()
   "GUI redisplay gives every requested row the complete placement width."
@@ -3574,6 +3641,26 @@ The shared quota is conservative: a full main screen leaves an
       (ebb-render--install-theme-invalidation))
     (should (equal '(enable-theme-functions ebb-render--theme-changed)
                    hook))))
+
+(ert-deftest ebb-test-render-text-runs-properties ()
+  "Direct range styling preserves faces, links, clipping, and model text."
+  (let* ((text "abcdefgh")
+         (bold (make-ebb-attr :bold t))
+         (link (make-ebb-attr :fg 1 :hyperlink "https://example.org"
+                              :hyperlink-id "link"))
+         (line (make-ebb-line :text text
+                              :attr-runs (list (list 1 3 bold)
+                                               (list 4 8 link))))
+         (expected (concat "a"
+                           (ebb-render--apply-attr-properties "bc" bold)
+                           "d"
+                           (ebb-render--apply-attr-properties "ef" link)
+                           "gh"))
+         (result (ebb-render--text-runs-to-string line 6)))
+    (should (equal-including-properties result expected))
+    (should-not (text-properties-at 0 text))
+    (should-not (text-properties-at 1 text))
+    (should-not (text-properties-at 4 text))))
 
 (ert-deftest ebb-test-render-attr-to-face ()
   "Attribute to face conversion works."
