@@ -3642,6 +3642,26 @@ The shared quota is conservative: a full main screen leaves an
     (should (equal '(enable-theme-functions ebb-render--theme-changed)
                    hook))))
 
+(ert-deftest ebb-test-render-text-runs-properties ()
+  "Direct range styling preserves faces, links, clipping, and model text."
+  (let* ((text "abcdefgh")
+         (bold (make-ebb-attr :bold t))
+         (link (make-ebb-attr :fg 1 :hyperlink "https://example.org"
+                              :hyperlink-id "link"))
+         (line (make-ebb-line :text text
+                              :attr-runs (list (list 1 3 bold)
+                                               (list 4 8 link))))
+         (expected (concat "a"
+                           (ebb-render--apply-attr-properties "bc" bold)
+                           "d"
+                           (ebb-render--apply-attr-properties "ef" link)
+                           "gh"))
+         (result (ebb-render--text-runs-to-string line 6)))
+    (should (equal-including-properties result expected))
+    (should-not (text-properties-at 0 text))
+    (should-not (text-properties-at 1 text))
+    (should-not (text-properties-at 4 text))))
+
 (ert-deftest ebb-test-render-attr-to-face ()
   "Attribute to face conversion works."
   ;; Default attr -> nil

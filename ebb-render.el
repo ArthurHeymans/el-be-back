@@ -1113,10 +1113,8 @@ Runs are clipped to WIDTH columns."
   (let ((s (copy-sequence (ebb-line-text line))))
     (dolist (run (ebb-line-attr-runs line))
       (let* ((begin (nth 0 run))
-             (end (min width (nth 1 run)))
-             (part (substring s begin end)))
-        (ebb-render--apply-attr-properties part (nth 2 run))
-        (setf (substring s begin end) part)))
+             (end (min width (nth 1 run))))
+        (ebb-render--apply-attr-properties s (nth 2 run) begin end)))
     s))
 
 (defun ebb-render--apply-line-metadata (line string)
@@ -1918,16 +1916,19 @@ WIDTH bounds the scan."
       (ebb-render--cells-to-string-uniform cells width)
       (ebb-render--cells-to-string-general cells width)))
 
-(defun ebb-render--apply-attr-properties (string attr)
-  "Apply face and hyperlink properties from ATTR to STRING."
-  (when-let* ((face (ebb-render--attr-to-face attr)))
-    (put-text-property 0 (length string) 'face face string))
-  (when-let* ((uri (and attr (ebb-attr-hyperlink attr))))
-    (put-text-property 0 (length string) 'help-echo uri string)
-    (put-text-property 0 (length string) 'mouse-face 'highlight string)
-    (put-text-property 0 (length string) 'keymap ebb-link-map string)
-    (put-text-property 0 (length string) 'ebb-link-id
-                       (ebb-attr-hyperlink-id attr) string))
+(defun ebb-render--apply-attr-properties (string attr &optional begin end)
+  "Apply face and hyperlink properties from ATTR to STRING.
+BEGIN and END delimit the range, defaulting to the whole string."
+  (let ((begin (or begin 0))
+        (end (or end (length string))))
+    (when-let* ((face (ebb-render--attr-to-face attr)))
+      (put-text-property begin end 'face face string))
+    (when-let* ((uri (and attr (ebb-attr-hyperlink attr))))
+      (put-text-property begin end 'help-echo uri string)
+      (put-text-property begin end 'mouse-face 'highlight string)
+      (put-text-property begin end 'keymap ebb-link-map string)
+      (put-text-property begin end 'ebb-link-id
+                         (ebb-attr-hyperlink-id attr) string)))
   string)
 
 (defun ebb-render--cells-to-string-fast (cells width)
