@@ -23,6 +23,10 @@
 
 (require 'ebb-graphics)
 
+(defvar-local ebb--preserve-history-on-reset nil
+  "Non-nil to retain main-screen output across full terminal resets.
+Serial buffers enable this so firmware initialization cannot erase logs.")
+
 ;;;; ---- Data Structures ------------------------------------------------
 
 (cl-defstruct (ebb-cell (:copier nil))
@@ -3677,7 +3681,12 @@ Does not clear the display (DECSTR)."
   (remhash screen ebb--iso-protection-mode-screens))
 
 (defun ebb-screen-reset (screen)
-  "Full terminal reset of SCREEN (RIS)."
+  "Full terminal reset of SCREEN (RIS).
+Retain main-screen output when `ebb--preserve-history-on-reset' is non-nil."
+  (when ebb--preserve-history-on-reset
+    (when (ebb-screen-alt-screen screen)
+      (ebb-screen-leave-alt screen))
+    (ebb--history-preserve-display screen))
   (when (gethash screen ebb--column-mode-screens)
     (ebb-screen-resize screen 80 (ebb-screen-height screen)))
   (remhash screen ebb--column-mode-screens)
@@ -3731,8 +3740,9 @@ Does not clear the display (DECSTR)."
     (setf (ebb-screen-charset-g2 screen) 'us-ascii)
     (setf (ebb-screen-charset-g3 screen) 'us-ascii)
     (setf (ebb-screen-charset-active screen) 'g0)
-    ;; Reset scrollback and graphics
-    (ebb--history-clear screen)
+    ;; Serial resets clear the viewport and modes, not the captured log.
+    (unless ebb--preserve-history-on-reset
+      (ebb--history-clear screen))
     (ebb-graphics-reset (ebb-screen-graphics screen))
     ;; Reset tab stops
     (setf (ebb-screen-tab-stops screen)

@@ -172,6 +172,74 @@
     (should-not (memq #'ebb-serial--resize-terminal-to-window
                       window-size-change-functions))))
 
+(ert-deftest ebb-serial-reset-preserves-boot-log ()
+  "Firmware RIS preserves both scrollback and the main-screen viewport."
+  (ebb-serial-tests--require-ebb-serial)
+  (dolist (alternate '(nil t))
+    (with-temp-buffer
+      (ebb-serial--setup-buffer "/tmp/ebb-serial-test-port" 115200)
+      (ebb-io-handle-resize ebb--io 40 4)
+      (ebb-serial--queue-output
+       "early-boot\r\nline-2\r\nline-3\r\nlast-boot-line\r\n")
+      (ebb-io--process-pending ebb--io t)
+      (should (> (ebb-screen-scrollback-length ebb--screen) 0))
+      (when alternate
+        (ebb-serial--queue-output "\e[?1049halternate-screen")
+        (ebb-io--process-pending ebb--io t))
+      (ebb-serial--queue-output "\ecSeaBIOS\r\n")
+      (ebb-io--process-pending ebb--io t)
+      (let ((text (ebb-screen-plain-text ebb--screen)))
+        (should (string-match-p "early-boot" text))
+        (should (string-match-p "last-boot-line" text))
+        (should (string-match-p "SeaBIOS" text))
+        (should-not (string-match-p "alternate-screen" text)))
+      (should-not (ebb-screen-alt-screen ebb--screen))
+      ;; An explicit request to erase scrollback must still work.
+      (ebb-serial--queue-output "\e[3J")
+      (ebb-io--process-pending ebb--io t)
+      (should (= 0 (ebb-screen-scrollback-length ebb--screen))))))
+
+(ert-deftest ebb-serial-mouse-wheel-reaches-unmaterialized-history ()
+  "Both wheel event families can scroll beyond the rendered history slice."
+  (ebb-serial-tests--require-ebb-serial)
+  (let ((buffer (generate-new-buffer " *ebb-serial-scroll*"))
+        (mouse-wheel-scroll-amount '(5))
+        (mouse-wheel-progressive-speed nil))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (ebb-serial--setup-buffer "/tmp/ebb-serial-test-port" 115200)
+          (ebb-serial--queue-output
+           (string-as-unibyte
+            (mapconcat (lambda (i) (format "line-%04d\r\n" i))
+                       (number-sequence 0 999) "")))
+          (ebb-io--process-pending ebb--io t)
+          (let* ((render ebb--render)
+                 (window (selected-window))
+                 (total (ebb-screen-history-row-count ebb--screen))
+                 (distance (* 5 (+ 4 (/ (ebb-render--history-capacity render)
+                                       5)))))
+            (should (> total distance))
+            (dolist (events '((mouse-4 . mouse-5)
+                              (double-mouse-4 . double-mouse-5)
+                              (triple-mouse-4 . triple-mouse-5)
+                              (wheel-up . wheel-down)
+                              (double-wheel-up . double-wheel-down)
+                              (triple-wheel-up . triple-wheel-down)))
+              (ebb-render-scroll-history render total)
+              (dotimes (_ (/ distance 5))
+                (funcall (key-binding (vector (car events)))
+                         (list (car events) (list window (point) '(0 . 0) 0))))
+              (should (= (- total distance)
+                         (car (ebb-render-buffer-location
+                               render (window-start window)))))
+              (funcall (key-binding (vector (cdr events)))
+                       (list (cdr events) (list window (point) '(0 . 0) 0)))
+              (should (= (+ (- total distance) 5)
+                         (car (ebb-render-buffer-location
+                               render (window-start window))))))))
+      (kill-buffer buffer))))
+
 (ert-deftest ebb-serial-reuses-live-process-and-reconfigures-speed ()
   (ebb-serial-tests--require-ebb-serial)
   (let* ((port "/tmp/ebb-serial-test-port")
