@@ -9,6 +9,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'mwheel)
 (require 'ebb-serial-codec)
 
 (declare-function ebb-serial "ebb-serial")
