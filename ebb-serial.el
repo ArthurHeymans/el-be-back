@@ -263,6 +263,7 @@ Emacs does not currently expose a portable serial-break primitive."
   (unless (derived-mode-p 'ebb-mode)
     (ebb-mode))
   (ebb-serial-mode 1)
+  (setq-local ebb--preserve-history-on-reset t)
   (ebb-serial--install-mode-line)
   (setq ebb-serial--port port)
   (unless (ebb-serial--live-process-p)

@@ -585,10 +585,14 @@ paste from the kill ring."
     (define-key map [remap scroll-up-command] #'ebb-scroll-up)
     (define-key map [remap scroll-down-command] #'ebb-scroll-down)
     ;; Scroll the window under the mouse, not the selected window, and
-    ;; cover the double/triple events Emacs generates for fast wheels.
-    (dolist (key '([wheel-up] [double-wheel-up] [triple-wheel-up]))
+    ;; cover both event families and double/triple events for fast wheels.
+    ;; Otherwise mouse-4/5 fall through to `mwheel-scroll', which only sees
+    ;; the materialized slab, not the rest of the terminal history.
+    (dolist (key '([wheel-up] [double-wheel-up] [triple-wheel-up]
+                   [mouse-4] [double-mouse-4] [triple-mouse-4]))
       (define-key map key #'ebb-mouse-scroll-down))
-    (dolist (key '([wheel-down] [double-wheel-down] [triple-wheel-down]))
+    (dolist (key '([wheel-down] [double-wheel-down] [triple-wheel-down]
+                   [mouse-5] [double-mouse-5] [triple-mouse-5]))
       (define-key map key #'ebb-mouse-scroll-up))
     (define-key map [remap kill-ring-save] #'ebb-copy-region)
     map)
