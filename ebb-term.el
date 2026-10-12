@@ -2253,6 +2253,20 @@ Handles LF, VT, FF."
 
 ;;;; ---- Erasing --------------------------------------------------------
 
+(defun ebb--line-blank-text-p (line)
+  "Return non-nil when LINE's lazy text form is entirely default blanks.
+This is the text-form equivalent of every cell satisfying
+`ebb--blank-cell-p' after materialization."
+  (let ((text (ebb-line-text line)))
+    (and text
+         (null (ebb-line-uniform-attr line))
+         (null (ebb-line-attr-runs line))
+         (let ((i 0)
+               (len (length text)))
+           (while (and (< i len) (= (aref text i) ?\s))
+             (cl-incf i))
+           (= i len)))))
+
 (defun ebb--line-empty-for-history-p (line width)
   "Return non-nil when LINE has no content worth preserving in history.
 LINE must already span WIDTH columns."
@@ -2260,9 +2274,38 @@ LINE must already span WIDTH columns."
        (eq (ebb-line-rendition line) 'normal)
        (null (ebb-line-prompt-begins line))
        (null (ebb-line-prompt-ends line))
-       (zerop (length
-               (ebb--trim-trailing-blank-cells
-                (ebb--line-ensure-cells line width))))))
+       ;; A lazy text row can answer this from its string; forcing
+       ;; cell materialization here would allocate WIDTH cell structs
+       ;; per row on every erase-display just to throw them away.
+       (if (and (not (ebb-line-cells-valid line))
+                (ebb-line-text line))
+           (ebb--line-blank-text-p line)
+         (zerop (length
+                 (ebb--trim-trailing-blank-cells
+                  (ebb--line-ensure-cells line width)))))))
+
+(defun ebb--line-text-signature-cells (line width)
+  "Return LINE's per-cell signature list from its lazy text form.
+The result is identical to materializing the cells first: text rows
+are single-width with no combining characters, and each cell's
+attribute is the uniform attribute overridden by any run covering
+it, exactly as `ebb--line-ensure-cells' would build them."
+  (let* ((text (ebb-line-text line))
+         (len (length text))
+         (uniform (ebb-line-uniform-attr line))
+         (runs (ebb-line-attr-runs line))
+         (run (car runs))
+         (result nil))
+    (dotimes (i width)
+      (while (and run (>= i (nth 1 run)))
+        (setq runs (cdr runs)
+              run (car runs)))
+      (push (list (if (< i len) (aref text i) ?\s) nil 1
+                  (if (and run (>= i (nth 0 run)))
+                      (nth 2 run)
+                    uniform))
+            result))
+    (nreverse result)))
 
 (defun ebb--line-history-signature (line width)
   "Return a stable content signature for LINE at WIDTH."
@@ -2270,11 +2313,14 @@ LINE must already span WIDTH columns."
         (ebb-line-rendition line)
         (copy-sequence (ebb-line-prompt-begins line))
         (copy-sequence (ebb-line-prompt-ends line))
-        (cl-loop for cell across (ebb--line-ensure-cells line width)
-                 collect (list (ebb-cell-char cell)
-                               (ebb-cell-combining cell)
-                               (ebb-cell-width cell)
-                               (ebb-cell-attr cell)))))
+        (if (and (not (ebb-line-cells-valid line))
+                 (ebb-line-text line))
+            (ebb--line-text-signature-cells line width)
+          (cl-loop for cell across (ebb--line-ensure-cells line width)
+                   collect (list (ebb-cell-char cell)
+                                 (ebb-cell-combining cell)
+                                 (ebb-cell-width cell)
+                                 (ebb-cell-attr cell))))))
 
 (defun ebb--viewport-row-has-graphics-p (screen row)
   "Return non-nil when viewport ROW of SCREEN intersects a static placement."

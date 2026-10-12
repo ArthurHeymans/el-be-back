@@ -2859,6 +2859,28 @@ The shared quota is conservative: a full main screen leaves an
       (should (> (ebb-screen-history-row-count screen) 0))
       (should (gethash 1 (ebb-graphics-state-images graphics))))))
 
+(ert-deftest ebb-test-ed2-history-signature-matches-text-and-cells ()
+  "The lazy text signature equals the materialized-cell signature.
+ED 2 must therefore preserve a text-form viewport exactly once,
+whether or not something materialized its cells in between."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e[31mab\e[0mcd")
+    (let* ((line (ebb--line-at screen 0))
+           (text-signature (ebb--line-history-signature line 10)))
+      (should-not (ebb-line-cells-valid line))
+      (ebb--line-ensure-cells line 10)
+      (should (ebb-line-cells-valid line))
+      (should (equal text-signature
+                     (ebb--line-history-signature line 10))))
+    (ebb-screen-erase-in-display screen 2)
+    (let ((rows (ebb-screen-history-row-count screen)))
+      (should (> rows 0))
+      ;; Rewriting identical content and clearing again must not
+      ;; duplicate the preserved viewport in history.
+      (ebb-test-output parser "\e[H\e[31mab\e[0mcd")
+      (ebb-screen-erase-in-display screen 2)
+      (should (= rows (ebb-screen-history-row-count screen))))))
+
 (ert-deftest ebb-test-kitty-partial-ed-leaves-independent-placements ()
   "ED 0 and ED 1 erase text without deleting Kitty placement objects."
   (dolist (mode '(0 1))
