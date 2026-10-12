@@ -2319,43 +2319,96 @@ LINE must already span WIDTH columns."
                  (ebb--trim-trailing-blank-cells
                   (ebb--line-ensure-cells line width)))))))
 
-(defun ebb--line-text-signature-cells (line width)
-  "Return LINE's per-cell signature list from its lazy text form.
-The result is identical to materializing the cells first: text rows
-are single-width with no combining characters, and each cell's
-attribute is the uniform attribute overridden by any run covering
-it, exactly as `ebb--line-ensure-cells' would build them."
-  (let* ((text (ebb-line-text line))
-         (len (length text))
-         (uniform (ebb-line-uniform-attr line))
-         (runs (ebb-line-attr-runs line))
-         (run (car runs))
-         (result nil))
+(defun ebb--signature-runs-from-text (line width)
+  "Return LINE's attribute runs at WIDTH in canonical signature form.
+The uniform attribute fills the gaps between the line's runs.
+Attributes are kept exactly as stored -- a default-valued attr
+struct remains distinct from nil, as in the original per-cell
+signature -- so this matches the runs grouped from materialized
+cells, and a line has the same signature in either representation.
+
+Line runs are maintained sorted and non-overlapping by
+`ebb--line-set-attr-run', so one left-to-right sweep suffices;
+overlaying each run into a scratch line instead would be quadratic
+in the number of runs (per-cell styling makes as many runs as
+columns)."
+  (let ((uniform (ebb-line-uniform-attr line))
+        (out nil)
+        (pos 0))
+    (cl-flet ((emit (start end attr)
+                (when (and attr (< start end))
+                  (if (and out
+                           (= (nth 1 (car out)) start)
+                           (equal (nth 2 (car out)) attr))
+                      (setcar (cdr (car out)) end)
+                    (push (list start end attr) out)))))
+      (dolist (run (ebb-line-attr-runs line))
+        (let ((rs (min width (nth 0 run)))
+              (re (min width (nth 1 run))))
+          (emit pos rs uniform)
+          (emit rs re (nth 2 run))
+          (setq pos (max pos re))))
+      (emit pos width uniform)
+      (nreverse out))))
+
+(defun ebb--signature-from-cells (cells)
+  "Return (TEXT RUNS EXTRAS) signature parts for materialized CELLS.
+TEXT is the cell characters as a string, RUNS groups consecutive
+cells sharing a non-nil attribute (kept exactly as stored), and
+EXTRAS records \(INDEX WIDTH COMBINING) for cells the other parts
+cannot express.  A plain single-width row thus has the same
+signature parts as the equivalent lazy text row."
+  (let* ((width (length cells))
+         ;; Build TEXT from a character vector: storing a non-ASCII
+         ;; character into a preallocated string with `aset' fails
+         ;; (its byte length cannot grow), while `concat' on a vector
+         ;; of characters produces a proper multibyte string.
+         (chars (make-vector width ?\s))
+         runs extras run-start run-attr)
     (dotimes (i width)
-      (while (and run (>= i (nth 1 run)))
-        (setq runs (cdr runs)
-              run (car runs)))
-      (push (list (if (< i len) (aref text i) ?\s) nil 1
-                  (if (and run (>= i (nth 0 run)))
-                      (nth 2 run)
-                    uniform))
-            result))
-    (nreverse result)))
+      (let* ((cell (aref cells i))
+             (effective (ebb-cell-attr cell)))
+        (aset chars i (ebb-cell-char cell))
+        (unless (and (= (ebb-cell-width cell) 1)
+                     (null (ebb-cell-combining cell)))
+          (push (list i (ebb-cell-width cell)
+                      (copy-sequence (ebb-cell-combining cell)))
+                extras))
+        (unless (equal effective run-attr)
+          (when run-attr
+            (push (list run-start i run-attr) runs))
+          (setq run-start i
+                run-attr effective))))
+    (when run-attr
+      (push (list run-start width run-attr) runs))
+    (list (concat chars) (nreverse runs) (nreverse extras))))
 
 (defun ebb--line-history-signature (line width)
-  "Return a stable content signature for LINE at WIDTH."
-  (list (ebb-line-wrapped line)
-        (ebb-line-rendition line)
-        (copy-sequence (ebb-line-prompt-begins line))
-        (copy-sequence (ebb-line-prompt-ends line))
-        (if (and (not (ebb-line-cells-valid line))
-                 (ebb-line-text line))
-            (ebb--line-text-signature-cells line width)
-          (cl-loop for cell across (ebb--line-ensure-cells line width)
-                   collect (list (ebb-cell-char cell)
-                                 (ebb-cell-combining cell)
-                                 (ebb-cell-width cell)
-                                 (ebb-cell-attr cell))))))
+  "Return a stable content signature for LINE at WIDTH.
+The signature is the wrapped flag, rendition, prompt markers, the
+row text, canonical attribute runs, and any wide/combining-cell
+extras -- compact to build and compare, and identical whether the
+line is in lazy text form or materialized cells."
+  (let ((parts
+         (if (and (not (ebb-line-cells-valid line))
+                  (ebb-line-text line))
+             (let* ((text (ebb-line-text line))
+                    (len (length text))
+                    (padded (cond ((= len width) (copy-sequence text))
+                                  ((< len width)
+                                   (concat text
+                                           (make-string (- width len) ?\s)))
+                                  (t (substring text 0 width)))))
+               (list padded
+                     (ebb--signature-runs-from-text line width)
+                     nil))
+           (ebb--signature-from-cells
+            (ebb--line-ensure-cells line width)))))
+    (list (ebb-line-wrapped line)
+          (ebb-line-rendition line)
+          (copy-sequence (ebb-line-prompt-begins line))
+          (copy-sequence (ebb-line-prompt-ends line))
+          (nth 0 parts) (nth 1 parts) (nth 2 parts))))
 
 (defun ebb--viewport-row-has-graphics-p (screen row)
   "Return non-nil when viewport ROW of SCREEN intersects a static placement."

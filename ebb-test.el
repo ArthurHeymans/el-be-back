@@ -2929,6 +2929,28 @@ whether or not something materialized its cells in between."
       (ebb-screen-erase-in-display screen 2)
       (should (= rows (ebb-screen-history-row-count screen))))))
 
+(ert-deftest ebb-test-ed2-history-signature-non-ascii ()
+  "ED 2 signatures handle wide, emoji, and accented cell-backed rows.
+Building the signature text by storing characters into a
+preallocated string fails for non-ASCII characters (a string's byte
+length cannot grow), which broke erase-display for such frames."
+  (dolist (frame (list "界x" "\u00e9x" "e\u0301x" "\u2764\ufe0fx"))
+    (ebb-test-with-screen (:width 12 :height 3)
+      (ebb-test-output parser frame)
+      (ebb-screen-erase-in-display screen 2)
+      (should (= 1 (ebb-screen-scrollback-length screen)))
+      ;; An identical repaint, with cells forced materialized this
+      ;; time, must still deduplicate.
+      (ebb-test-output parser (concat "\e[H" frame))
+      (dotimes (row 3)
+        (ebb--line-ensure-cells (ebb--line-at screen row) 12))
+      (ebb-screen-erase-in-display screen 2)
+      (should (= 1 (ebb-screen-scrollback-length screen)))
+      ;; A changed frame is preserved again.
+      (ebb-test-output parser (concat "\e[H" frame "y"))
+      (ebb-screen-erase-in-display screen 2)
+      (should (= 2 (ebb-screen-scrollback-length screen))))))
+
 (ert-deftest ebb-test-kitty-partial-ed-leaves-independent-placements ()
   "ED 0 and ED 1 erase text without deleting Kitty placement objects."
   (dolist (mode '(0 1))
