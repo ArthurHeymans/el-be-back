@@ -891,22 +891,6 @@ KIND may be `append' for ENTRY or `last' for an extended newest line."
             (ebb--history-push-row screen row (ebb-screen-width screen)))
           (setf (ebb-screen-scrollback-dirty screen) t))))))
 
-(defun ebb--history-plain-row-text (line width wrapped)
-  "Return (TEXT . LENGTH) for a lazy plain LINE of WIDTH columns, or nil.
-Preserve all columns when WRAPPED; otherwise LENGTH omits trailing blanks.
-TEXT is transferred directly to history without copying."
-  (when (and (ebb-line-text line)
-             (= (length (ebb-line-text line)) width)
-             (null (ebb-line-attr-runs line))
-             (null (ebb-line-uniform-attr line)))
-    (let* ((text (ebb-line-text line))
-           (end (if wrapped width
-                  (let ((i width))
-                    (while (and (> i 0) (= (aref text (1- i)) ?\s))
-                      (cl-decf i))
-                    i))))
-      (cons text end))))
-
 (defun ebb--history-text-row-info (line width wrapped)
   "Return lazy single-width history metadata for LINE of WIDTH columns, or nil.
 The result is (TEXT LENGTH ATTR-RUNS).  When WRAPPED is non-nil, LENGTH
@@ -980,6 +964,8 @@ remain logical content; unstyled presentation padding is excluded."
 STARTS and LENGTHS describe all scanned lines; FIRST selects the first line
 that actually scrolled off the display."
   (when (> count 0)
+    (unless (ebb-screen-history-logical-p screen)
+      (ebb--history-normalize screen))
     (let* ((id-start (ebb-screen-history-next-id screen))
            (selected-starts (cl-subseq starts first (+ first count)))
            (selected-lengths (cl-subseq lengths first (+ first count)))
@@ -1054,15 +1040,26 @@ that actually scrolled off the display."
 
 (defun ebb--history-push-row (screen line width)
   "Append physical LINE of WIDTH columns to SCREEN's logical history."
-  (setf (ebb-screen-history-logical-p screen) t)
+  ;; Convert any legacy physical rows first: appending a logical
+  ;; entry (and marking history logical) would strand them in the
+  ;; list, where later history lookups expect history entries.
+  ;; This used to happen as a side effect of the history row count
+  ;; every scroll computed; the predicate alone is one slot read.
+  (unless (ebb-screen-history-logical-p screen)
+    (ebb--history-normalize screen))
   (let* ((wrapped (ebb-line-wrapped line))
          (rendition (ebb-line-rendition line))
          (normal (eq rendition 'normal))
          (logical-width (if normal width (max 1 (/ width 2))))
-         (plain-info (and normal
-                          (ebb--history-plain-row-text line width wrapped)))
          (text-info (and normal
                          (ebb--history-text-row-info line width wrapped)))
+         ;; A plain row (no attribute runs) can enter the plain batch
+         ;; path with the same text/end text-info already computed;
+         ;; the end is the same because runs are what would extend it.
+         ;; Deriving it avoids a second trailing-blank scan per row.
+         (plain-info (and text-info
+                          (null (nth 2 text-info))
+                          (cons (nth 0 text-info) (nth 1 text-info))))
          (text (nth 0 text-info))
          (text-length (or (nth 1 text-info) 0))
          (attr-runs (nth 2 text-info))
@@ -1363,9 +1360,19 @@ Top lines go to scrollback (if on main screen)."
          (height (ebb-screen-height screen))
          (lines (ebb-screen-lines screen))
          (width (ebb-screen-width screen))
-         (old-base (if (ebb-screen-alt-screen screen)
-                       0
-                     (ebb-screen-history-row-count screen)))
+         ;; The pre-scroll history base is only needed to adjust
+         ;; graphics placements for a top-anchored partial region on
+         ;; the main screen.  The dominant full-screen scroll never
+         ;; uses it, and computing it forces a history row-map rebuild
+         ;; after any invalidation (e.g. a scrollback trim) in the
+         ;; middle of bulk output.
+         (old-base (if (and (not (ebb-screen-alt-screen screen))
+                            (zerop top)
+                            (/= bot (1- height))
+                            (ebb-graphics-state-placements
+                             (ebb-screen-graphics screen)))
+                       (ebb-screen-history-row-count screen)
+                     0))
          (n (min count (1+ (- bot top)))))
     ;; Push lines scrolling off the terminal's top edge into scrollback.
     ;; Inner scroll regions do not leave the display and must not become
@@ -1410,14 +1417,18 @@ Top lines go to scrollback (if on main screen)."
      ;; region retain their absolute anchors (including rows that just entered
      ;; history); placements below it move with the unchanged viewport text.
      ((and (not (ebb-screen-alt-screen screen)) (zerop top))
-      (ebb-graphics-history-grew
-       (ebb-screen-graphics screen) old-base bot n))
+      (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+        (ebb-graphics-history-grew
+         (ebb-screen-graphics screen) old-base bot n)))
      (t
-      (let ((base (if (ebb-screen-alt-screen screen)
-                      0
-                    (ebb-screen-history-row-count screen))))
-        (ebb-graphics-scroll (ebb-screen-graphics screen) 'up
-                             (+ base top) (+ base bot) n))))
+      ;; With no placements the graphics scroll is a no-op; skip the
+      ;; history row count it would otherwise need on every scroll.
+      (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+        (let ((base (if (ebb-screen-alt-screen screen)
+                        0
+                      (ebb-screen-history-row-count screen))))
+          (ebb-graphics-scroll (ebb-screen-graphics screen) 'up
+                               (+ base top) (+ base bot) n)))))
     ;; Mark all lines in region dirty.
     (ebb--mark-region-dirty screen top bot)
     ;; Trim scrollback
@@ -1451,21 +1462,36 @@ Bottom lines are discarded."
         (while (<= i end)
           (ebb--set-line-at screen i (ebb--make-empty-line width))
           (cl-incf i))))
-    (let ((base (if (ebb-screen-alt-screen screen)
-                    0
-                  (ebb-screen-history-row-count screen))))
-      (ebb-graphics-scroll (ebb-screen-graphics screen) 'down
-                           (+ base top) (+ base bot) n))
+    ;; As in `ebb--scroll-region-up', avoid the history row count
+    ;; when there are no placements to move.
+    (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+      (let ((base (if (ebb-screen-alt-screen screen)
+                      0
+                    (ebb-screen-history-row-count screen))))
+        (ebb-graphics-scroll (ebb-screen-graphics screen) 'down
+                             (+ base top) (+ base bot) n)))
     ;; Mark dirty.
     (ebb--mark-region-dirty screen top bot)))
 
 (defun ebb--trim-scrollback (screen)
   "Trim SCREEN's scrollback to max lines."
+  ;; The limit counts logical lines, so legacy physical rows must
+  ;; merge first -- trimming them directly could cut a wrapped
+  ;; logical line in half.
+  (unless (ebb-screen-history-logical-p screen)
+    (ebb--history-normalize screen))
   (let ((max (ebb-screen-scrollback-max screen))
         (len (ebb-screen-scrollback-length screen))
         (batch (ebb-screen-scrollback-trim-batch screen)))
     (when (> len (+ max batch))
-      (let ((old-rows (ebb--history-physical-row-count-safe screen)))
+      ;; Graphics placements are the only consumer of the physical-row
+      ;; delta, and computing it takes full history row counts.  After
+      ;; the first trim invalidates the row map, each count would
+      ;; rebuild it over every history entry -- quadratic in bulk
+      ;; output.  With no placements the trim needs no delta at all.
+      (let ((old-rows (and (ebb-graphics-state-placements
+                            (ebb-screen-graphics screen))
+                           (ebb--history-physical-row-count-safe screen))))
         ;; Keep the newest MAX logical lines (the list is newest first).
         ;; A boundary chunk retains only its newest suffix via FIRST.
         (if (zerop max)
@@ -1497,9 +1523,10 @@ Bottom lines are discarded."
               (setcdr previous nil)))
           (setf (ebb-screen-scrollback-length screen) max)
           (ebb--history-changed screen))
-        (ebb-graphics-trim-history
-         (ebb-screen-graphics screen)
-         (- old-rows (ebb--history-physical-row-count-safe screen)))))))
+        (when old-rows
+          (ebb-graphics-trim-history
+           (ebb-screen-graphics screen)
+           (- old-rows (ebb--history-physical-row-count-safe screen))))))))
 
 ;;;; ---- Character Writing ----------------------------------------------
 

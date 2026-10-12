@@ -777,6 +777,42 @@ Binds `screen' and `parser' in BODY."
       (should (equal "abc " (ebb-line-text rendered)))
       (should-not (ebb-line-cells-valid rendered)))))
 
+(ert-deftest ebb-test-legacy-history-normalizes-on-scroll ()
+  "Scrolling converts legacy physical scrollback rows before appending.
+The scroll hot path no longer computes a history row count first,
+which used to normalize legacy rows as a side effect; without an
+explicit conversion the physical row would be stranded among
+logical entries and later history lookups would fail."
+  (let ((screen (ebb-screen-create 4 2)))
+    (setf (ebb-screen-scrollback screen)
+          (list (make-ebb-line :text "old " :cells-valid nil
+                               :prompt-ends '(3)))
+          (ebb-screen-scrollback-length screen) 1)
+    (ebb-screen-cursor-goto screen 1 0)
+    (ebb-screen-index screen)
+    (should (= 2 (ebb-screen-history-row-count screen)))
+    (should (equal "old" (ebb-screen-plain-text screen)))
+    (should (equal '((0 . 3)) (ebb-screen-prompt-end-locations screen)))))
+
+(ert-deftest ebb-test-legacy-history-normalizes-before-trim ()
+  "Trimming counts logical lines: wrapped legacy rows merge first.
+An inner-region scroll appends nothing, so no history append runs
+to normalize; trimming the physical rows directly would cut the
+wrapped logical line in half and lose its first half."
+  (let ((screen (ebb-screen-create 4 3)))
+    (setf (ebb-screen-scrollback screen)
+          (list (make-ebb-line :text "cd  " :cells-valid nil)
+                (make-ebb-line :text "ab  " :cells-valid nil :wrapped t))
+          (ebb-screen-scrollback-length screen) 2
+          (ebb-screen-scrollback-max screen) 1
+          (ebb-screen-scrollback-trim-batch screen) 0
+          (ebb-screen-scroll-top screen) 1
+          (ebb-screen-scroll-bottom screen) 2)
+    (ebb-screen-cursor-goto screen 2 0)
+    (ebb-screen-index screen)
+    (should (= 2 (ebb-screen-history-row-count screen)))
+    (should (equal "abcd" (ebb-screen-plain-text screen)))))
+
 (ert-deftest ebb-test-plain-crlf-history-is-chunked-and-lazy ()
   "Complete plain lines share one chunk and materialize only rendered rows."
   (ebb-test-with-screen (:width 4 :height 2)
