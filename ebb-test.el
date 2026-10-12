@@ -1583,6 +1583,18 @@ wrapped logical line in half and lose its first half."
       (should (= 2 (ebb-attr-fg attr)))
       (should-not (ebb-attr-bg attr)))))
 
+(ert-deftest ebb-test-parse-sgr-indexed-bg-and-underline-color ()
+  "The indexed-color fast path handles 48;5 and 58;5 like the generic path."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e[48;5;22mB\e[58;5;33mU\e[0m")
+    (let* ((line (ebb-screen-get-line screen 0))
+           (bg-attr (ebb-cell-attr (aref (ebb-line-cells line) 0)))
+           (ul-attr (ebb-cell-attr (aref (ebb-line-cells line) 1))))
+      (should (= 22 (ebb-attr-bg bg-attr)))
+      (should (= 33 (ebb-attr-ul-color ul-attr)))
+      ;; The first cell predates the underline color.
+      (should-not (ebb-attr-ul-color bg-attr)))))
+
 (ert-deftest ebb-test-parse-sgr-truecolor ()
   "Parser handles truecolor SGR."
   (ebb-test-with-screen (:width 20 :height 6)

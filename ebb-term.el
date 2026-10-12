@@ -53,6 +53,12 @@ Serial buffers enable this so firmware initialization cannot erase logs.")
   (hyperlink nil)
   (hyperlink-id nil))
 
+(defconst ebb--default-attr (make-ebb-attr)
+  "Shared all-default attribute.
+Current attributes are copy-on-write (`ebb-screen-set-attr' and
+`ebb-screen-set-hyperlink' copy before mutating), so this instance
+is never modified and resets can reuse it instead of allocating.")
+
 (cl-defstruct (ebb-line (:copier nil))
   "A single line in the terminal."
   (cells nil)       ; vector of ebb-cell
@@ -2267,8 +2273,10 @@ Handles LF, VT, FF."
   "Reset all of SCREEN's attributes to defaults."
   (let ((old (ebb-screen-current-attr screen)))
     (setf (ebb-screen-current-attr screen)
-          (make-ebb-attr :hyperlink (ebb-attr-hyperlink old)
-                         :hyperlink-id (ebb-attr-hyperlink-id old)))))
+          (if (or (ebb-attr-hyperlink old) (ebb-attr-hyperlink-id old))
+              (make-ebb-attr :hyperlink (ebb-attr-hyperlink old)
+                             :hyperlink-id (ebb-attr-hyperlink-id old))
+            ebb--default-attr))))
 
 (defun ebb-screen-set-hyperlink (screen uri &optional id)
   "Set SCREEN's active OSC 8 hyperlink to URI and ID."
