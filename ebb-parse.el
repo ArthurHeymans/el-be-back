@@ -270,6 +270,24 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
                   (ebb-parser-string-state parser) nil))
           (cl-incf i))
          (t
+          (if (and (eq (ebb-parser-state parser) :ground)
+                   (< ch ?\s)
+                   (/= ch ?\e))
+              ;; C0 controls in ground state have fixed one-byte
+              ;; semantics (CAN/SUB included: they are no-ops there).
+              ;; Dispatch them here, consuming a CRLF pair together,
+              ;; instead of re-entering the state machine's dispatch
+              ;; chain for every line ending that follows an escape
+              ;; sequence rather than printable text.
+              (if (and (= ch ?\r)
+                       (< (1+ i) e)
+                       (= (aref string (1+ i)) ?\n))
+                  (progn
+                    (ebb-screen-carriage-return screen)
+                    (ebb-screen-index screen)
+                    (cl-incf i 2))
+                (ebb-parse--dispatch-c0 parser ch)
+                (cl-incf i))
           ;; The common case for terminal output is a run of printable text while
           ;; the parser is in ground state.  Dispatch that whole run to the
           ;; screen model at once instead of re-entering the parser for each byte.
@@ -334,7 +352,7 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
                         (:dcs-passthrough
                          (ebb-parse--dcs-collect parser chunk)))))
                 (ebb-parse--process-char parser ch)
-                (cl-incf i))))))))
+                (cl-incf i)))))))))
     (- i (or start 0))))
 
 (defsubst ebb-parse--cup-coords (string start end)
@@ -444,6 +462,36 @@ only digits and semicolons."
                                 screen params idx count))))
             t)))))))
 
+(defun ebb-parse--fast-indexed-sgr-at (screen string start end)
+  "Handle an indexed-color SGR (38;5;N / 48;5;N / 58;5;N) on SCREEN.
+STRING[START, END) holds only digits and semicolons (verified by the
+caller).  Return non-nil when the whole parameter string is exactly
+one indexed-color form; the effect is identical to the generic
+parameter-vector path, without allocating the vector.  The 38/48/58
+target mapping below mirrors `ebb-parse--sgr-step'; keep them in
+sync -- a duplicated SGR table here once drifted from the generic
+one (see commit 62d9d02)."
+  (let ((attr (cond ((and (= (aref string start) ?3)
+                          (= (aref string (1+ start)) ?8)) :fg)
+                    ((and (= (aref string start) ?4)
+                          (= (aref string (1+ start)) ?8)) :bg)
+                    ((and (= (aref string start) ?5)
+                          (= (aref string (1+ start)) ?8)) :ul-color))))
+    (and attr
+         (= (aref string (+ start 2)) ?\;)
+         (= (aref string (+ start 3)) ?5)
+         (= (aref string (+ start 4)) ?\;)
+         (let ((value 0)
+               (digits 0)
+               (i (+ start 5)))
+           (while (and (< i end)
+                       (<= ?0 (aref string i)) (<= (aref string i) ?9))
+             (setq value (+ (* value 10) (- (aref string i) ?0)))
+             (cl-incf digits)
+             (cl-incf i))
+           (and (= i end) (> digits 0)
+                (progn (ebb-screen-set-attr screen attr value) t))))))
+
 (defun ebb-parse--fast-simple-sgr-at (screen string start end)
   "Handle the shortest and most frequent SGR forms on SCREEN in STRING[START, END)."
   (let ((len (- end start)))
@@ -451,6 +499,8 @@ only digits and semicolons."
      ((and (= len 1) (= (aref string start) ?0))
       (ebb-screen-reset-attr screen)
       t)
+     ((and (>= len 6) (= (aref string (+ start 2)) ?\;))
+      (ebb-parse--fast-indexed-sgr-at screen string start end))
      ((and (= len 2)
            (= (aref string start) ?3)
            (<= ?0 (aref string (1+ start)))

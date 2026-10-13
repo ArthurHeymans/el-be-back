@@ -47,19 +47,27 @@ trap 'rm -rf "$NATIVE"' EXIT
 
 # Compile the implementations used by the benchmark.  Loading the resulting
 # .eln files is preferable to relying on whatever stale .elc/.eln files happen
-# to be in a checkout.
+# to be in a checkout.  Note a .eln placed on load-path is silently ignored
+# (only native-comp-eln-load-path is searched, keyed by a hash of the
+# compiled file's path), so compile into a scratch eln directory and record
+# explicit native-elisp-load forms, in dependency order, for the benchmark
+# process to load first.
 "$EMACS" --batch -Q \
+    --eval "(setq native-comp-eln-load-path (list \"$NATIVE\"))" \
     -L "$ROOT" -L "$EAT" -L "$GHOSTEL/lisp" -L "$GHOSTEL" \
     --eval "(progn
       (require 'native-compile)
-      (native-compile \"$ROOT/ebb-term.el\" \"$NATIVE/ebb-term.eln\")
-      (native-compile \"$ROOT/ebb-parse.el\" \"$NATIVE/ebb-parse.eln\")
-      (native-compile \"$ROOT/ebb-render.el\" \"$NATIVE/ebb-render.eln\")
-      (native-compile \"$EAT/eat.el\" \"$NATIVE/eat.eln\")
-      (native-compile \"$GHOSTEL/lisp/ghostel.el\" \"$NATIVE/ghostel.eln\"))"
+      (with-temp-file \"$NATIVE/load-native.el\"
+        (dolist (f '(\"$ROOT/ebb-graphics.el\" \"$ROOT/ebb-term.el\"
+                     \"$ROOT/ebb-parse.el\" \"$ROOT/ebb-render.el\"
+                     \"$EAT/eat.el\" \"$GHOSTEL/lisp/ghostel.el\"))
+          (insert (format \"(native-elisp-load %S)\\n\"
+                          (native-compile f))))))"
 
-exec "$EMACS" --batch -Q \
-    -L "$NATIVE" -L "$ROOT" -L "$EAT" -L "$GHOSTEL/lisp" -L "$GHOSTEL" \
+# Not exec: the EXIT trap above must run to remove the scratch eln directory.
+"$EMACS" --batch -Q \
+    -L "$ROOT" -L "$EAT" -L "$GHOSTEL/lisp" -L "$GHOSTEL" \
+    -l "$NATIVE/load-native.el" \
     -l "$ROOT/bench/ebb-bench.el" \
     --eval "(setq ebb-bench-size $SIZE ebb-bench-iterations $ITERATIONS)" \
     --eval '(ebb-bench-run)'

@@ -53,6 +53,12 @@ Serial buffers enable this so firmware initialization cannot erase logs.")
   (hyperlink nil)
   (hyperlink-id nil))
 
+(defconst ebb--default-attr (make-ebb-attr)
+  "Shared all-default attribute.
+Current attributes are copy-on-write (`ebb-screen-set-attr' and
+`ebb-screen-set-hyperlink' copy before mutating), so this instance
+is never modified and resets can reuse it instead of allocating.")
+
 (cl-defstruct (ebb-line (:copier nil))
   "A single line in the terminal."
   (cells nil)       ; vector of ebb-cell
@@ -891,22 +897,6 @@ KIND may be `append' for ENTRY or `last' for an extended newest line."
             (ebb--history-push-row screen row (ebb-screen-width screen)))
           (setf (ebb-screen-scrollback-dirty screen) t))))))
 
-(defun ebb--history-plain-row-text (line width wrapped)
-  "Return (TEXT . LENGTH) for a lazy plain LINE of WIDTH columns, or nil.
-Preserve all columns when WRAPPED; otherwise LENGTH omits trailing blanks.
-TEXT is transferred directly to history without copying."
-  (when (and (ebb-line-text line)
-             (= (length (ebb-line-text line)) width)
-             (null (ebb-line-attr-runs line))
-             (null (ebb-line-uniform-attr line)))
-    (let* ((text (ebb-line-text line))
-           (end (if wrapped width
-                  (let ((i width))
-                    (while (and (> i 0) (= (aref text (1- i)) ?\s))
-                      (cl-decf i))
-                    i))))
-      (cons text end))))
-
 (defun ebb--history-text-row-info (line width wrapped)
   "Return lazy single-width history metadata for LINE of WIDTH columns, or nil.
 The result is (TEXT LENGTH ATTR-RUNS).  When WRAPPED is non-nil, LENGTH
@@ -980,6 +970,8 @@ remain logical content; unstyled presentation padding is excluded."
 STARTS and LENGTHS describe all scanned lines; FIRST selects the first line
 that actually scrolled off the display."
   (when (> count 0)
+    (unless (ebb-screen-history-logical-p screen)
+      (ebb--history-normalize screen))
     (let* ((id-start (ebb-screen-history-next-id screen))
            (selected-starts (cl-subseq starts first (+ first count)))
            (selected-lengths (cl-subseq lengths first (+ first count)))
@@ -1054,15 +1046,26 @@ that actually scrolled off the display."
 
 (defun ebb--history-push-row (screen line width)
   "Append physical LINE of WIDTH columns to SCREEN's logical history."
-  (setf (ebb-screen-history-logical-p screen) t)
+  ;; Convert any legacy physical rows first: appending a logical
+  ;; entry (and marking history logical) would strand them in the
+  ;; list, where later history lookups expect history entries.
+  ;; This used to happen as a side effect of the history row count
+  ;; every scroll computed; the predicate alone is one slot read.
+  (unless (ebb-screen-history-logical-p screen)
+    (ebb--history-normalize screen))
   (let* ((wrapped (ebb-line-wrapped line))
          (rendition (ebb-line-rendition line))
          (normal (eq rendition 'normal))
          (logical-width (if normal width (max 1 (/ width 2))))
-         (plain-info (and normal
-                          (ebb--history-plain-row-text line width wrapped)))
          (text-info (and normal
                          (ebb--history-text-row-info line width wrapped)))
+         ;; A plain row (no attribute runs) can enter the plain batch
+         ;; path with the same text/end text-info already computed;
+         ;; the end is the same because runs are what would extend it.
+         ;; Deriving it avoids a second trailing-blank scan per row.
+         (plain-info (and text-info
+                          (null (nth 2 text-info))
+                          (cons (nth 0 text-info) (nth 1 text-info))))
          (text (nth 0 text-info))
          (text-length (or (nth 1 text-info) 0))
          (attr-runs (nth 2 text-info))
@@ -1363,9 +1366,19 @@ Top lines go to scrollback (if on main screen)."
          (height (ebb-screen-height screen))
          (lines (ebb-screen-lines screen))
          (width (ebb-screen-width screen))
-         (old-base (if (ebb-screen-alt-screen screen)
-                       0
-                     (ebb-screen-history-row-count screen)))
+         ;; The pre-scroll history base is only needed to adjust
+         ;; graphics placements for a top-anchored partial region on
+         ;; the main screen.  The dominant full-screen scroll never
+         ;; uses it, and computing it forces a history row-map rebuild
+         ;; after any invalidation (e.g. a scrollback trim) in the
+         ;; middle of bulk output.
+         (old-base (if (and (not (ebb-screen-alt-screen screen))
+                            (zerop top)
+                            (/= bot (1- height))
+                            (ebb-graphics-state-placements
+                             (ebb-screen-graphics screen)))
+                       (ebb-screen-history-row-count screen)
+                     0))
          (n (min count (1+ (- bot top)))))
     ;; Push lines scrolling off the terminal's top edge into scrollback.
     ;; Inner scroll regions do not leave the display and must not become
@@ -1410,14 +1423,18 @@ Top lines go to scrollback (if on main screen)."
      ;; region retain their absolute anchors (including rows that just entered
      ;; history); placements below it move with the unchanged viewport text.
      ((and (not (ebb-screen-alt-screen screen)) (zerop top))
-      (ebb-graphics-history-grew
-       (ebb-screen-graphics screen) old-base bot n))
+      (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+        (ebb-graphics-history-grew
+         (ebb-screen-graphics screen) old-base bot n)))
      (t
-      (let ((base (if (ebb-screen-alt-screen screen)
-                      0
-                    (ebb-screen-history-row-count screen))))
-        (ebb-graphics-scroll (ebb-screen-graphics screen) 'up
-                             (+ base top) (+ base bot) n))))
+      ;; With no placements the graphics scroll is a no-op; skip the
+      ;; history row count it would otherwise need on every scroll.
+      (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+        (let ((base (if (ebb-screen-alt-screen screen)
+                        0
+                      (ebb-screen-history-row-count screen))))
+          (ebb-graphics-scroll (ebb-screen-graphics screen) 'up
+                               (+ base top) (+ base bot) n)))))
     ;; Mark all lines in region dirty.
     (ebb--mark-region-dirty screen top bot)
     ;; Trim scrollback
@@ -1451,21 +1468,36 @@ Bottom lines are discarded."
         (while (<= i end)
           (ebb--set-line-at screen i (ebb--make-empty-line width))
           (cl-incf i))))
-    (let ((base (if (ebb-screen-alt-screen screen)
-                    0
-                  (ebb-screen-history-row-count screen))))
-      (ebb-graphics-scroll (ebb-screen-graphics screen) 'down
-                           (+ base top) (+ base bot) n))
+    ;; As in `ebb--scroll-region-up', avoid the history row count
+    ;; when there are no placements to move.
+    (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+      (let ((base (if (ebb-screen-alt-screen screen)
+                      0
+                    (ebb-screen-history-row-count screen))))
+        (ebb-graphics-scroll (ebb-screen-graphics screen) 'down
+                             (+ base top) (+ base bot) n)))
     ;; Mark dirty.
     (ebb--mark-region-dirty screen top bot)))
 
 (defun ebb--trim-scrollback (screen)
   "Trim SCREEN's scrollback to max lines."
+  ;; The limit counts logical lines, so legacy physical rows must
+  ;; merge first -- trimming them directly could cut a wrapped
+  ;; logical line in half.
+  (unless (ebb-screen-history-logical-p screen)
+    (ebb--history-normalize screen))
   (let ((max (ebb-screen-scrollback-max screen))
         (len (ebb-screen-scrollback-length screen))
         (batch (ebb-screen-scrollback-trim-batch screen)))
     (when (> len (+ max batch))
-      (let ((old-rows (ebb--history-physical-row-count-safe screen)))
+      ;; Graphics placements are the only consumer of the physical-row
+      ;; delta, and computing it takes full history row counts.  After
+      ;; the first trim invalidates the row map, each count would
+      ;; rebuild it over every history entry -- quadratic in bulk
+      ;; output.  With no placements the trim needs no delta at all.
+      (let ((old-rows (and (ebb-graphics-state-placements
+                            (ebb-screen-graphics screen))
+                           (ebb--history-physical-row-count-safe screen))))
         ;; Keep the newest MAX logical lines (the list is newest first).
         ;; A boundary chunk retains only its newest suffix via FIRST.
         (if (zerop max)
@@ -1497,9 +1529,10 @@ Bottom lines are discarded."
               (setcdr previous nil)))
           (setf (ebb-screen-scrollback-length screen) max)
           (ebb--history-changed screen))
-        (ebb-graphics-trim-history
-         (ebb-screen-graphics screen)
-         (- old-rows (ebb--history-physical-row-count-safe screen)))))))
+        (when old-rows
+          (ebb-graphics-trim-history
+           (ebb-screen-graphics screen)
+           (- old-rows (ebb--history-physical-row-count-safe screen))))))))
 
 ;;;; ---- Character Writing ----------------------------------------------
 
@@ -2240,8 +2273,10 @@ Handles LF, VT, FF."
   "Reset all of SCREEN's attributes to defaults."
   (let ((old (ebb-screen-current-attr screen)))
     (setf (ebb-screen-current-attr screen)
-          (make-ebb-attr :hyperlink (ebb-attr-hyperlink old)
-                         :hyperlink-id (ebb-attr-hyperlink-id old)))))
+          (if (or (ebb-attr-hyperlink old) (ebb-attr-hyperlink-id old))
+              (make-ebb-attr :hyperlink (ebb-attr-hyperlink old)
+                             :hyperlink-id (ebb-attr-hyperlink-id old))
+            ebb--default-attr))))
 
 (defun ebb-screen-set-hyperlink (screen uri &optional id)
   "Set SCREEN's active OSC 8 hyperlink to URI and ID."
@@ -2253,6 +2288,20 @@ Handles LF, VT, FF."
 
 ;;;; ---- Erasing --------------------------------------------------------
 
+(defun ebb--line-blank-text-p (line)
+  "Return non-nil when LINE's lazy text form is entirely default blanks.
+This is the text-form equivalent of every cell satisfying
+`ebb--blank-cell-p' after materialization."
+  (let ((text (ebb-line-text line)))
+    (and text
+         (null (ebb-line-uniform-attr line))
+         (null (ebb-line-attr-runs line))
+         (let ((i 0)
+               (len (length text)))
+           (while (and (< i len) (= (aref text i) ?\s))
+             (cl-incf i))
+           (= i len)))))
+
 (defun ebb--line-empty-for-history-p (line width)
   "Return non-nil when LINE has no content worth preserving in history.
 LINE must already span WIDTH columns."
@@ -2260,21 +2309,106 @@ LINE must already span WIDTH columns."
        (eq (ebb-line-rendition line) 'normal)
        (null (ebb-line-prompt-begins line))
        (null (ebb-line-prompt-ends line))
-       (zerop (length
-               (ebb--trim-trailing-blank-cells
-                (ebb--line-ensure-cells line width))))))
+       ;; A lazy text row can answer this from its string; forcing
+       ;; cell materialization here would allocate WIDTH cell structs
+       ;; per row on every erase-display just to throw them away.
+       (if (and (not (ebb-line-cells-valid line))
+                (ebb-line-text line))
+           (ebb--line-blank-text-p line)
+         (zerop (length
+                 (ebb--trim-trailing-blank-cells
+                  (ebb--line-ensure-cells line width)))))))
+
+(defun ebb--signature-runs-from-text (line width)
+  "Return LINE's attribute runs at WIDTH in canonical signature form.
+The uniform attribute fills the gaps between the line's runs.
+Attributes are kept exactly as stored -- a default-valued attr
+struct remains distinct from nil, as in the original per-cell
+signature -- so this matches the runs grouped from materialized
+cells, and a line has the same signature in either representation.
+
+Line runs are maintained sorted and non-overlapping by
+`ebb--line-set-attr-run', so one left-to-right sweep suffices;
+overlaying each run into a scratch line instead would be quadratic
+in the number of runs (per-cell styling makes as many runs as
+columns)."
+  (let ((uniform (ebb-line-uniform-attr line))
+        (out nil)
+        (pos 0))
+    (cl-flet ((emit (start end attr)
+                (when (and attr (< start end))
+                  (if (and out
+                           (= (nth 1 (car out)) start)
+                           (equal (nth 2 (car out)) attr))
+                      (setcar (cdr (car out)) end)
+                    (push (list start end attr) out)))))
+      (dolist (run (ebb-line-attr-runs line))
+        (let ((rs (min width (nth 0 run)))
+              (re (min width (nth 1 run))))
+          (emit pos rs uniform)
+          (emit rs re (nth 2 run))
+          (setq pos (max pos re))))
+      (emit pos width uniform)
+      (nreverse out))))
+
+(defun ebb--signature-from-cells (cells)
+  "Return (TEXT RUNS EXTRAS) signature parts for materialized CELLS.
+TEXT is the cell characters as a string, RUNS groups consecutive
+cells sharing a non-nil attribute (kept exactly as stored), and
+EXTRAS records \(INDEX WIDTH COMBINING) for cells the other parts
+cannot express.  A plain single-width row thus has the same
+signature parts as the equivalent lazy text row."
+  (let* ((width (length cells))
+         ;; Build TEXT from a character vector: storing a non-ASCII
+         ;; character into a preallocated string with `aset' fails
+         ;; (its byte length cannot grow), while `concat' on a vector
+         ;; of characters produces a proper multibyte string.
+         (chars (make-vector width ?\s))
+         runs extras run-start run-attr)
+    (dotimes (i width)
+      (let* ((cell (aref cells i))
+             (effective (ebb-cell-attr cell)))
+        (aset chars i (ebb-cell-char cell))
+        (unless (and (= (ebb-cell-width cell) 1)
+                     (null (ebb-cell-combining cell)))
+          (push (list i (ebb-cell-width cell)
+                      (copy-sequence (ebb-cell-combining cell)))
+                extras))
+        (unless (equal effective run-attr)
+          (when run-attr
+            (push (list run-start i run-attr) runs))
+          (setq run-start i
+                run-attr effective))))
+    (when run-attr
+      (push (list run-start width run-attr) runs))
+    (list (concat chars) (nreverse runs) (nreverse extras))))
 
 (defun ebb--line-history-signature (line width)
-  "Return a stable content signature for LINE at WIDTH."
-  (list (ebb-line-wrapped line)
-        (ebb-line-rendition line)
-        (copy-sequence (ebb-line-prompt-begins line))
-        (copy-sequence (ebb-line-prompt-ends line))
-        (cl-loop for cell across (ebb--line-ensure-cells line width)
-                 collect (list (ebb-cell-char cell)
-                               (ebb-cell-combining cell)
-                               (ebb-cell-width cell)
-                               (ebb-cell-attr cell)))))
+  "Return a stable content signature for LINE at WIDTH.
+The signature is the wrapped flag, rendition, prompt markers, the
+row text, canonical attribute runs, and any wide/combining-cell
+extras -- compact to build and compare, and identical whether the
+line is in lazy text form or materialized cells."
+  (let ((parts
+         (if (and (not (ebb-line-cells-valid line))
+                  (ebb-line-text line))
+             (let* ((text (ebb-line-text line))
+                    (len (length text))
+                    (padded (cond ((= len width) (copy-sequence text))
+                                  ((< len width)
+                                   (concat text
+                                           (make-string (- width len) ?\s)))
+                                  (t (substring text 0 width)))))
+               (list padded
+                     (ebb--signature-runs-from-text line width)
+                     nil))
+           (ebb--signature-from-cells
+            (ebb--line-ensure-cells line width)))))
+    (list (ebb-line-wrapped line)
+          (ebb-line-rendition line)
+          (copy-sequence (ebb-line-prompt-begins line))
+          (copy-sequence (ebb-line-prompt-ends line))
+          (nth 0 parts) (nth 1 parts) (nth 2 parts))))
 
 (defun ebb--viewport-row-has-graphics-p (screen row)
   "Return non-nil when viewport ROW of SCREEN intersects a static placement."

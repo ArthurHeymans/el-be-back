@@ -777,6 +777,42 @@ Binds `screen' and `parser' in BODY."
       (should (equal "abc " (ebb-line-text rendered)))
       (should-not (ebb-line-cells-valid rendered)))))
 
+(ert-deftest ebb-test-legacy-history-normalizes-on-scroll ()
+  "Scrolling converts legacy physical scrollback rows before appending.
+The scroll hot path no longer computes a history row count first,
+which used to normalize legacy rows as a side effect; without an
+explicit conversion the physical row would be stranded among
+logical entries and later history lookups would fail."
+  (let ((screen (ebb-screen-create 4 2)))
+    (setf (ebb-screen-scrollback screen)
+          (list (make-ebb-line :text "old " :cells-valid nil
+                               :prompt-ends '(3)))
+          (ebb-screen-scrollback-length screen) 1)
+    (ebb-screen-cursor-goto screen 1 0)
+    (ebb-screen-index screen)
+    (should (= 2 (ebb-screen-history-row-count screen)))
+    (should (equal "old" (ebb-screen-plain-text screen)))
+    (should (equal '((0 . 3)) (ebb-screen-prompt-end-locations screen)))))
+
+(ert-deftest ebb-test-legacy-history-normalizes-before-trim ()
+  "Trimming counts logical lines: wrapped legacy rows merge first.
+An inner-region scroll appends nothing, so no history append runs
+to normalize; trimming the physical rows directly would cut the
+wrapped logical line in half and lose its first half."
+  (let ((screen (ebb-screen-create 4 3)))
+    (setf (ebb-screen-scrollback screen)
+          (list (make-ebb-line :text "cd  " :cells-valid nil)
+                (make-ebb-line :text "ab  " :cells-valid nil :wrapped t))
+          (ebb-screen-scrollback-length screen) 2
+          (ebb-screen-scrollback-max screen) 1
+          (ebb-screen-scrollback-trim-batch screen) 0
+          (ebb-screen-scroll-top screen) 1
+          (ebb-screen-scroll-bottom screen) 2)
+    (ebb-screen-cursor-goto screen 2 0)
+    (ebb-screen-index screen)
+    (should (= 2 (ebb-screen-history-row-count screen)))
+    (should (equal "abcd" (ebb-screen-plain-text screen)))))
+
 (ert-deftest ebb-test-plain-crlf-history-is-chunked-and-lazy ()
   "Complete plain lines share one chunk and materialize only rendered rows."
   (ebb-test-with-screen (:width 4 :height 2)
@@ -1546,6 +1582,18 @@ Binds `screen' and `parser' in BODY."
            (attr (ebb-cell-attr cell)))
       (should (= 2 (ebb-attr-fg attr)))
       (should-not (ebb-attr-bg attr)))))
+
+(ert-deftest ebb-test-parse-sgr-indexed-bg-and-underline-color ()
+  "The indexed-color fast path handles 48;5 and 58;5 like the generic path."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (ebb-test-output parser "\e[48;5;22mB\e[58;5;33mU\e[0m")
+    (let* ((line (ebb-screen-get-line screen 0))
+           (bg-attr (ebb-cell-attr (aref (ebb-line-cells line) 0)))
+           (ul-attr (ebb-cell-attr (aref (ebb-line-cells line) 1))))
+      (should (= 22 (ebb-attr-bg bg-attr)))
+      (should (= 33 (ebb-attr-ul-color ul-attr)))
+      ;; The first cell predates the underline color.
+      (should-not (ebb-attr-ul-color bg-attr)))))
 
 (ert-deftest ebb-test-parse-sgr-truecolor ()
   "Parser handles truecolor SGR."
@@ -2858,6 +2906,50 @@ The shared quota is conservative: a full main screen leaves an
       (should (= 1 (length (ebb-graphics-state-placements graphics))))
       (should (> (ebb-screen-history-row-count screen) 0))
       (should (gethash 1 (ebb-graphics-state-images graphics))))))
+
+(ert-deftest ebb-test-ed2-history-signature-matches-text-and-cells ()
+  "The lazy text signature equals the materialized-cell signature.
+ED 2 must therefore preserve a text-form viewport exactly once,
+whether or not something materialized its cells in between."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (ebb-test-output parser "\e[31mab\e[0mcd")
+    (let* ((line (ebb--line-at screen 0))
+           (text-signature (ebb--line-history-signature line 10)))
+      (should-not (ebb-line-cells-valid line))
+      (ebb--line-ensure-cells line 10)
+      (should (ebb-line-cells-valid line))
+      (should (equal text-signature
+                     (ebb--line-history-signature line 10))))
+    (ebb-screen-erase-in-display screen 2)
+    (let ((rows (ebb-screen-history-row-count screen)))
+      (should (> rows 0))
+      ;; Rewriting identical content and clearing again must not
+      ;; duplicate the preserved viewport in history.
+      (ebb-test-output parser "\e[H\e[31mab\e[0mcd")
+      (ebb-screen-erase-in-display screen 2)
+      (should (= rows (ebb-screen-history-row-count screen))))))
+
+(ert-deftest ebb-test-ed2-history-signature-non-ascii ()
+  "ED 2 signatures handle wide, emoji, and accented cell-backed rows.
+Building the signature text by storing characters into a
+preallocated string fails for non-ASCII characters (a string's byte
+length cannot grow), which broke erase-display for such frames."
+  (dolist (frame (list "界x" "\u00e9x" "e\u0301x" "\u2764\ufe0fx"))
+    (ebb-test-with-screen (:width 12 :height 3)
+      (ebb-test-output parser frame)
+      (ebb-screen-erase-in-display screen 2)
+      (should (= 1 (ebb-screen-scrollback-length screen)))
+      ;; An identical repaint, with cells forced materialized this
+      ;; time, must still deduplicate.
+      (ebb-test-output parser (concat "\e[H" frame))
+      (dotimes (row 3)
+        (ebb--line-ensure-cells (ebb--line-at screen row) 12))
+      (ebb-screen-erase-in-display screen 2)
+      (should (= 1 (ebb-screen-scrollback-length screen)))
+      ;; A changed frame is preserved again.
+      (ebb-test-output parser (concat "\e[H" frame "y"))
+      (ebb-screen-erase-in-display screen 2)
+      (should (= 2 (ebb-screen-scrollback-length screen))))))
 
 (ert-deftest ebb-test-kitty-partial-ed-leaves-independent-placements ()
   "ED 0 and ED 1 erase text without deleting Kitty placement objects."
