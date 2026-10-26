@@ -499,7 +499,8 @@ values accepted by `serial-process-configure'."
   (when (ebb-serial--live-process-p)
     (let ((old-process ebb-serial--process))
       (ebb-serial--clear-process-state 'disconnected)
-      (delete-process old-process)))
+      (delete-process old-process)
+      (ebb-serial--flush-codec)))
   (setq ebb-serial--codec-state
         (ebb-serial-codec-make-state ebb-serial-invalid-byte-policy))
   (setq ebb-serial--connection-state 'connecting)
@@ -527,6 +528,12 @@ values accepted by `serial-process-configure'."
   (when (and ebb--io (> (length text) 0))
     (ebb-io-receive ebb--io text)))
 
+(defun ebb-serial--flush-codec ()
+  "Queue any incomplete bytes from the current decoder."
+  (when ebb-serial--codec-state
+    (ebb-serial--queue-output
+     (ebb-serial-codec-flush ebb-serial--codec-state))))
+
 (defun ebb-serial--filter (process chunk)
   "Decode raw serial CHUNK from PROCESS and feed it to Ebb."
   (when-let* ((buffer (process-get process 'ebb-serial-buffer)))
@@ -547,9 +554,7 @@ values accepted by `serial-process-configure'."
       (with-current-buffer buffer
         (when (and (eq process ebb-serial--process)
                    (not (ebb-serial--live-process-p process)))
-          (when ebb-serial--codec-state
-            (ebb-serial--queue-output
-             (ebb-serial-codec-flush ebb-serial--codec-state)))
+          (ebb-serial--flush-codec)
           (when (and ebb--io (ebb-io--pending-p ebb--io))
             (ebb-io--process-pending ebb--io t))
           (ebb-serial--clear-process-state 'disconnected)
@@ -620,7 +625,8 @@ values accepted by `serial-process-configure'."
   (when (ebb-serial--live-process-p)
     (let ((process ebb-serial--process))
       (ebb-serial--clear-process-state 'disconnected)
-      (delete-process process)))
+      (delete-process process)
+      (ebb-serial--flush-codec)))
   (force-mode-line-update))
 
 (defun ebb-serial--read-choice (prompt choices current)
