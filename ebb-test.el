@@ -4496,6 +4496,30 @@ length cannot grow), which broke erase-display for such frames."
                      (ebb-test--mouse-event 'down-mouse-1 (point-min))
                      screen display-begin))))))
 
+(ert-deftest ebb-test-mouse-legacy-release ()
+  "Legacy mouse releases use button code 3 and retain modifiers."
+  (let ((screen (ebb-screen-create 10 3)))
+    (setf (ebb-screen-mouse-mode screen) 'normal)
+    (with-temp-buffer
+      (insert "abc\n")
+      (should (equal "\e[M !!"
+                     (ebb-input-encode-mouse
+                      (ebb-test--mouse-event 'down-mouse-1 (point-min))
+                      screen (point-min))))
+      (should (equal "\e[M#!!"
+                     (ebb-input-encode-mouse
+                      (ebb-test--mouse-event 'mouse-1 (point-min))
+                      screen (point-min))))
+      (should (equal "\e[M !!"
+                     (ebb-input-encode-mouse
+                      (ebb-test--mouse-event 'down-mouse-1 (point-min))
+                      screen (point-min))))
+      (should (equal "\e[M3!!"
+                     (ebb-input-encode-mouse
+                      (ebb-test--mouse-event 'C-mouse-1 (point-min))
+                      screen (point-min))))
+      (should-not (ebb-screen-mouse-pressed screen)))))
+
 (ert-deftest ebb-test-mouse-trimmed-row-recovers-window-column ()
   "Clicks past trimmed text use the window-relative visual column."
   (let ((screen (ebb-screen-create 10 3))

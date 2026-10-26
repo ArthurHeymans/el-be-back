@@ -241,7 +241,10 @@ Returns a string or nil."
             ;; Legacy encoding (coordinates limited to 223)
             (when (and (<= x 222) (<= y 222))
               (format "\e[M%c%c%c"
-                      (+ code 32)
+                      (+ (if (ebb-input--mouse-release-p event)
+                             (+ 3 (ebb-input--mouse-mod-bits event))
+                           code)
+                         32)
                       (+ x 33)
                       (+ y 33)))))))))
 
