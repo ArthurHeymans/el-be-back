@@ -291,7 +291,7 @@ POS-OFFSET is the buffer position of display line 0, col 0."
       ('x10
        (and (memq 'down mods) (memq basic '(mouse-1 mouse-2 mouse-3))))
       ('normal
-       (not (or (mouse-movement-p event) (memq 'drag mods))))
+       (not (mouse-movement-p event)))
       ('button-event
        (or (not (mouse-movement-p event))
            (ebb-screen-mouse-pressed screen)))
