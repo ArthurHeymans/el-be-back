@@ -4520,6 +4520,26 @@ length cannot grow), which broke erase-display for such frames."
                       screen (point-min))))
       (should-not (ebb-screen-mouse-pressed screen)))))
 
+(ert-deftest ebb-test-mouse-normal-drag-release ()
+  "Normal mouse tracking reports the release at the end of a drag."
+  (let ((screen (ebb-screen-create 10 3)))
+    (setf (ebb-screen-mouse-mode screen) 'normal
+          (ebb-screen-mouse-sgr screen) t)
+    (with-temp-buffer
+      (insert "abc\n")
+      (should (equal "\e[<0;1;1M"
+                     (ebb-input-encode-mouse
+                      (ebb-test--mouse-event 'down-mouse-1 (point-min))
+                      screen (point-min))))
+      (should-not (ebb-input-encode-mouse
+                   (ebb-test--mouse-event 'mouse-movement (point-min))
+                   screen (point-min)))
+      (should (equal "\e[<0;1;1m"
+                     (ebb-input-encode-mouse
+                      (ebb-test--mouse-event 'drag-mouse-1 (point-min))
+                      screen (point-min))))
+      (should-not (ebb-screen-mouse-pressed screen)))))
+
 (ert-deftest ebb-test-mouse-trimmed-row-recovers-window-column ()
   "Clicks past trimmed text use the window-relative visual column."
   (let ((screen (ebb-screen-create 10 3))
