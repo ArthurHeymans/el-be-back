@@ -416,6 +416,40 @@
         (delete-process process))
       (kill-buffer buffer))))
 
+(ert-deftest ebb-serial-close-flushes-incomplete-utf-8 ()
+  "Reconnect and disconnect flush pending bytes before resetting the codec."
+  (ebb-serial-tests--require-ebb-serial)
+  (dolist (action '(reconnect disconnect))
+    (let* ((buffer (generate-new-buffer " *ebb-serial-flush*"))
+           (process (ebb-serial-tests--sleep-process buffer))
+           replacement queued)
+      (unwind-protect
+          (with-current-buffer buffer
+            (ebb-serial--setup-buffer "/tmp/ebb-serial-test-port" 115200)
+            (setq ebb-serial--process process
+                  ebb-serial--codec-state (ebb-serial-codec-make-state 'hex))
+            (process-put process 'ebb-serial-buffer buffer)
+            (set-process-sentinel process #'ebb-serial--sentinel)
+            (ebb-serial-codec-decode ebb-serial--codec-state
+                                     (unibyte-string #xe2 #x98))
+            (cl-letf (((symbol-function 'ebb-serial--queue-output)
+                       (lambda (text) (push text queued)))
+                      ((symbol-function 'ebb-serial--make-process)
+                       (lambda ()
+                         (setq replacement
+                               (ebb-serial-tests--sleep-process buffer)))))
+              (pcase action
+                ('reconnect (ebb-serial-reconnect))
+                ('disconnect (ebb-serial-disconnect))))
+            (should (equal queued '("<E2><98>")))
+            (when (eq action 'reconnect)
+              (should (equal "" (ebb-serial-codec-state-pending
+                                  ebb-serial--codec-state)))))
+        (when (process-live-p process) (delete-process process))
+        (when (and replacement (process-live-p replacement))
+          (delete-process replacement))
+        (kill-buffer buffer)))))
+
 (ert-deftest ebb-serial-filter-decodes-and-queues-output ()
   (ebb-serial-tests--require-ebb-serial)
   (let* ((buffer (generate-new-buffer " *ebb-serial-filter*"))
