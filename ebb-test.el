@@ -6417,6 +6417,27 @@ cell is 9x18 unless overridden."
       (should-not (ebb-graphics-state-upload graphics))
       (should-not (gethash 8 (ebb-graphics-state-images graphics))))))
 
+(ert-deftest ebb-test-io-output-gap-cancels-inactive-kitty-uploads ()
+  "An incomplete upload must not reappear when its grid becomes active."
+  (dolist (alternate '(nil t))
+    (with-temp-buffer
+      (let* ((io (ebb-io-create-terminal (current-buffer) #'ignore))
+             (screen (ebb-io-screen io))
+             (ebb-io-max-pending-bytes 64))
+        (when alternate (ebb-screen-enter-alt screen))
+        (ebb-io--enqueue-output io "\e_Ga=t,f=24,s=1,v=1,i=8,m=1;AQI=\e\\")
+        (ebb-io--process-pending io t)
+        (let ((graphics (ebb-screen-graphics screen)))
+          (should (ebb-graphics-state-upload graphics))
+          (if alternate (ebb-screen-leave-alt screen) (ebb-screen-enter-alt screen))
+          (ebb-io--enqueue-output io (make-string 65 ?x))
+          (ebb-io--process-pending io t)
+          (should-not (ebb-graphics-state-upload graphics))
+          (if alternate (ebb-screen-enter-alt screen) (ebb-screen-leave-alt screen))
+          (ebb-io--enqueue-output io "\e_Gm=0;Aw==\e\\")
+          (ebb-io--process-pending io t)
+          (should-not (gethash 8 (ebb-graphics-state-images graphics))))))))
+
 (ert-deftest ebb-test-io-pty-interrupt-recovers-without-dropping-text ()
   "An interrupt resets a partial sequence after the queued prefix."
   (with-temp-buffer

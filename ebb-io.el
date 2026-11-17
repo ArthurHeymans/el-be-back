@@ -218,8 +218,8 @@ total uses `string-bytes'."
 (defun ebb-io--recover-stream (io)
   "Reset state that cannot safely survive a discontinuity in IO's stream."
   (let ((screen (ebb-io-screen io)))
-    (setf (ebb-graphics-state-upload (ebb-screen-graphics screen)) nil
-          (ebb-screen-sync-output screen) nil))
+    (ebb-screen-cancel-graphics-uploads screen)
+    (setf (ebb-screen-sync-output screen) nil))
   (ebb-io--cancel-sync-timer io)
   (ebb-parse-cancel-sequence (ebb-io-parser io)))
 
