@@ -210,6 +210,9 @@ Options: `char', `semi-char', `emacs'."
 (defvar-local ebb--managed-buffer-name nil
   "Last buffer name set by ebb auto-rename, or nil if unmanaged.")
 
+(defvar-local ebb--reported-focus nil
+  "Whether this terminal last received a focus-in report.")
+
 (defvar ebb--focus-change-installed nil
   "Non-nil when `ebb--focus-change' is installed globally.")
 
@@ -761,8 +764,8 @@ selected window."
           ;; window.  Keep the PTY and renderer synchronized with that grid.
           (ebb--sync-model-size))
          (1004
-          ;; Focus events -- could enable focus tracking here
-          nil)
+          (unless (ebb-screen-focus-events ebb--screen)
+            (setq ebb--reported-focus nil)))
          (_ nil))))
     ('reset
      (ebb--sync-model-size))
@@ -808,25 +811,31 @@ selected window."
 
 ;;;; ---- Focus Events ---------------------------------------------------
 
-(defun ebb--focus-change ()
-  "Handle focus changes for ebb buffers."
-  (dolist (frame (frame-list))
-    (let ((focused (frame-focus-state frame)))
-      (dolist (win (window-list frame 'no-minibuf))
-        (let ((buf (window-buffer win)))
-          (when (buffer-local-value 'ebb--io buf)
-            (with-current-buffer buf
-              (when (and ebb--io ebb--screen
-                         (ebb-screen-focus-events ebb--screen))
-                (ebb-io-send ebb--io
-                               (if focused
-                                   (ebb-input-focus-in)
-                                 (ebb-input-focus-out)))))))))))
+(defun ebb--focus-change (&rest _)
+  "Report changes in keyboard focus once per terminal, not per window."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and ebb--io ebb--screen (ebb-screen-focus-events ebb--screen)
+                 (process-live-p (ebb-io-process ebb--io)))
+        (let ((focused
+               (and (cl-some (lambda (window)
+                               (let ((frame (window-frame window)))
+                                 (and (eq window (frame-selected-window frame))
+                                      (memq (frame-focus-state frame) '(t unknown)))))
+                             (get-buffer-window-list buffer nil t))
+                    t)))
+          (unless (eq focused ebb--reported-focus)
+            (setq ebb--reported-focus focused)
+            (ebb-io-send ebb--io (if focused (ebb-input-focus-in)
+                                   (ebb-input-focus-out)))))))))
 
 (defun ebb--ensure-focus-change-hook ()
   "Install global focus tracking once."
   (unless ebb--focus-change-installed
     (add-function :after after-focus-change-function #'ebb--focus-change)
+    (add-hook 'window-selection-change-functions #'ebb--focus-change)
+    (add-hook 'window-buffer-change-functions #'ebb--focus-change)
+    (add-hook 'window-buffer-change-functions #'ebb--refit-displayed-terminals)
     (setq ebb--focus-change-installed t)))
 
 (defun ebb--maybe-remove-focus-change-hook ()
@@ -842,6 +851,9 @@ selected window."
                                       (buffer-local-value 'ebb--io buf))))
                            (buffer-list))))
     (remove-function after-focus-change-function #'ebb--focus-change)
+    (remove-hook 'window-selection-change-functions #'ebb--focus-change)
+    (remove-hook 'window-buffer-change-functions #'ebb--focus-change)
+    (remove-hook 'window-buffer-change-functions #'ebb--refit-displayed-terminals)
     (setq ebb--focus-change-installed nil)))
 
 ;;;; ---- Resize Hook ----------------------------------------------------
@@ -862,6 +874,13 @@ selected window."
                                (window-body-height window))))
           (when (and (> new-width 0) (> new-height 0))
             (ebb-io-handle-resize ebb--io new-width new-height)))))))
+
+(defun ebb--refit-displayed-terminals (_frame)
+  "Refit terminals when a window stops showing their buffer."
+  (dolist (buffer (buffer-list))
+    (when (buffer-local-value 'ebb--io buffer)
+      (when-let* ((window (get-buffer-window buffer t)))
+        (ebb--window-size-change window)))))
 
 ;;;; ---- Major Mode -----------------------------------------------------
 
