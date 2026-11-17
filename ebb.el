@@ -896,9 +896,10 @@ selected window."
      ((string-match "\\`file://\\(?:localhost\\)?\\(/[^#]*\\)\\(?:#\\(.*\\)\\)?\\'" uri)
       (let* ((path (match-string 1 uri))
              (fragment (match-string 2 uri))
+             (coding (or file-name-coding-system default-file-name-coding-system))
              (file (decode-coding-string
-                    (url-unhex-string (encode-coding-string path 'utf-8) t)
-                    'utf-8-unix))
+                    (url-unhex-string (encode-coding-string path coding) t)
+                    coding))
              (location
               (when (and fragment
                          (string-match
@@ -906,12 +907,15 @@ selected window."
                           fragment))
                 (mapcar (lambda (group)
                           (when-let* ((digits (match-string group fragment)))
-                            (max 1 (string-to-number digits))))
+                            (min most-positive-fixnum
+                                 (max 1 (string-to-number digits)))))
                         '(1 2 3)))))
         (unless (string-match-p "\0" file)
           (find-file file)
           (when location
             (pcase-let ((`(,line ,column ,end-line) location))
+              ;; A file URI's coordinates are absolute, not narrowed.
+              (widen)
               (goto-char (point-min))
               (forward-line (1- (if end-line (min line end-line) line)))
               (when end-line
@@ -919,7 +923,10 @@ selected window."
                              (forward-line (1+ (abs (- end-line line))))
                              (point))
                            t t))
-              (when column (move-to-column (1- column))))))))
+              (when column
+                (move-to-column
+                 (min (1- column)
+                      (save-excursion (end-of-line) (current-column))))))))))
      (t (browse-url uri)))))
 
 (defun ebb-open-link-at-click (event)
