@@ -67,9 +67,11 @@ Run the command from DIRECTORY regardless, so the shell executes cd only once."
     (setq-local compilation-arguments (list command))
     (setq-local compilation-directory directory)
     (setq default-directory (ebb-compile--diagnostic-directory command directory))
-    (compilation-insert-annotation
-     (format "-*- mode: compilation; default-directory: %S -*-\n%s\n\n"
-             default-directory command))
+    ;; `compilation-insert-annotation' is not available on Emacs 29.
+    (let ((start (point)))
+      (insert (format "-*- mode: compilation; default-directory: %S -*-\n%s\n\n"
+                      default-directory command))
+      (put-text-property start (point) 'compilation-annotation t))
     (setq compilation-messages-start (copy-marker (1- (point))))
     (insert log)
     (unless (bolp) (insert "\n"))
