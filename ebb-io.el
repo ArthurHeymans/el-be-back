@@ -720,13 +720,14 @@ Ebb through `ebb-io--filter'."
 (defun ebb-io--sentinel (io proc event)
   "Handle process state changes for PROC on IO.
 EVENT describes the transition."
-  (when (string-match-p "\\(finished\\|exited\\|killed\\|deleted\\|failed\\|connection broken\\)" event)
+  (when (or (null proc) (memq (process-status proc) '(exit signal closed failed)))
     ;; Delete the temporary bash integration rcfile, if any.  Read it
     ;; from PROC, not from IO, whose process slot may already be nil.
     (when-let* ((rcfile (and (processp proc)
                              (process-get proc 'ebb-bashrc))))
       (ignore-errors (delete-file rcfile)))
-    (when (buffer-live-p (ebb-io-buffer io))
+    (when (and (eq proc (ebb-io-process io))
+               (buffer-live-p (ebb-io-buffer io)))
       (with-current-buffer (ebb-io-buffer io)
         (when (ebb-io-render-timer io)
           (cancel-timer (ebb-io-render-timer io))
@@ -799,9 +800,10 @@ keys, and non-PTY transports do not request that recovery."
   (ebb-io--cancel-sync-timer io)
   (ebb-io--cancel-pixel-size-timer io)
   (when-let* ((proc (ebb-io-process io)))
+    ;; The sentinel can run synchronously during `delete-process'.
+    (setf (ebb-io-process io) nil)
     (when (process-live-p proc)
-      (delete-process proc))
-    (setf (ebb-io-process io) nil))
+      (delete-process proc)))
   (when (ebb-io-render io)
     (ebb-render-destroy (ebb-io-render io))))
 

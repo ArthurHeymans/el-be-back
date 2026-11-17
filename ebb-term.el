@@ -3927,9 +3927,10 @@ Retain main-screen output when `ebb--preserve-history-on-reset' is non-nil."
 
 ;;;; ---- Plain Text -----------------------------------------------------
 
-(defun ebb--line-plain-text (line width)
+(defun ebb--line-plain-text (line width &optional preserve-wrap-spaces)
   "Return LINE as plain text with terminal padding removed.
-LINE must already span WIDTH columns."
+LINE must already span WIDTH columns.  PRESERVE-WRAP-SPACES keeps spaces
+at soft wraps for consumers such as the compilation diagnostic parser."
   (let ((cells (ebb--line-ensure-cells line width))
         parts)
     (dotimes (i width)
@@ -3938,17 +3939,21 @@ LINE must already span WIDTH columns."
           (push (concat (string (ebb-cell-char cell))
                         (ebb-cell-combining cell))
                 parts))))
-    (string-trim-right (apply #'concat (nreverse parts)))))
+    (let ((text (apply #'concat (nreverse parts))))
+      (if (and preserve-wrap-spaces (ebb-line-wrapped line))
+          text
+        (string-trim-right text)))))
 
-(defun ebb-screen-plain-text (screen)
+(defun ebb-screen-plain-text (screen &optional preserve-wrap-spaces)
   "Return scrollback and viewport text from SCREEN.
-Rows joined by a soft wrap have no intervening newline."
+Rows joined by a soft wrap have no intervening newline.  With
+PRESERVE-WRAP-SPACES, keep spaces at soft-wrap boundaries."
   (let* ((width (ebb-screen-width screen))
          (lines (append (ebb-screen-scrollback-lines-raw screen)
                         (append (ebb--ordered-lines-vector screen) nil)))
          parts)
     (dolist (line lines)
-      (push (ebb--line-plain-text line width) parts)
+      (push (ebb--line-plain-text line width preserve-wrap-spaces) parts)
       (unless (ebb-line-wrapped line)
         (push "\n" parts)))
     (string-trim-right (apply #'concat (nreverse parts)))))

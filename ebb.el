@@ -93,6 +93,10 @@ With the default of t, Ctrl-D / shell exit closes the ebb buffer."
   :type 'boolean
   :group 'ebb)
 
+(defvar ebb-process-exit-hook nil
+  "Functions called in the terminal buffer after its process exits.
+Each receives the process sentinel event string.")
+
 (defcustom ebb-detect-password-prompts t
   "If non-nil, open `read-passwd' when the cursor row looks like a password prompt."
   :type 'boolean
@@ -809,7 +813,8 @@ selected window."
                           (lambda (buf)
                             (when (buffer-live-p buf)
                               (kill-buffer buf)))
-                          (current-buffer)))))))
+                          (current-buffer)))
+           (run-hook-with-args 'ebb-process-exit-hook event)))))
     ('osc-51
      (let ((payload (car args)))
        (ebb-shell-handle-osc51 payload ebb--screen)))
