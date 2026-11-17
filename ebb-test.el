@@ -6545,5 +6545,41 @@ cell is 9x18 unless overridden."
                   (should (equal line (line-at (window-start distant))))))))
         (when (buffer-live-p buffer) (kill-buffer buffer))))))
 
+(ert-deftest ebb-test-compile-keeps-pty-output-navigable ()
+  "A finished PTY run preserves even wrapped diagnostics for `next-error'."
+  (skip-unless (executable-find "sh"))
+  (require 'ebb-compile)
+  (let ((directory (make-temp-file "ebb-compile-test-" t))
+        source buffer (ebb-report-pixel-size nil))
+    (unwind-protect
+        (save-window-excursion
+          (let ((default-directory (file-name-as-directory directory))
+                (shell-file-name (executable-find "sh"))
+                (shell-command-switch "-c"))
+            (setq source (expand-file-name (concat (make-string 95 ?a) ".c")))
+            (write-region "first\nsecond\nthird\n" nil source nil 'silent)
+            (setq buffer
+                  (ebb-compile (format "test -t 1 && printf '\\033[31m%%s\\033[0m\\n' %s; exit 1"
+                                       (shell-quote-argument
+                                        (concat (file-name-nondirectory source) ":2:1: error: example")))))
+            (with-current-buffer buffer
+              (let ((deadline (+ (float-time) 5)))
+                (while (and (not (derived-mode-p 'compilation-mode))
+                            (< (float-time) deadline))
+                  (accept-process-output nil 0.05)))
+              (should (derived-mode-p 'compilation-mode))
+              (should (string-match-p (regexp-quote (file-name-nondirectory source))
+                                      (buffer-string)))
+              (let ((next-error-last-buffer buffer))
+                (next-error 1 t))
+              (should (equal (buffer-file-name (window-buffer (selected-window))) source))
+              (should (= (with-current-buffer (find-buffer-visiting source)
+                           (line-number-at-pos))
+                         2)))))
+      (when (and source (find-buffer-visiting source))
+        (kill-buffer (find-buffer-visiting source)))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
 (provide 'ebb-test)
 ;;; ebb-test.el ends here

@@ -52,6 +52,13 @@ RGB, and RGBA images, placements, and Unicode placeholders.  Protocol support,
 resource limits, and the security model are documented in
 [[file:docs/ebb-graphics.org][docs/ebb-graphics.org]].
 
+* Compilation
+
+Use =M-x ebb-compile= for build commands that need a real terminal. While
+running, the buffer accepts terminal input. When the process exits, Ebb
+turns the retained output into a compilation log for =next-error=, joining
+soft-wrapped lines and including retained scrollback.
+
 * Tests
 
 #+begin_src sh
