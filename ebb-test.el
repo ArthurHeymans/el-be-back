@@ -1912,6 +1912,34 @@ wrapped logical line in half and lose its first half."
             (should-not (get-text-property 7 'help-echo)))
         (kill-buffer buffer)))))
 
+(ert-deftest ebb-test-file-uri-fragments ()
+  "Open encoded paths separately from their line and column fragments."
+  (with-temp-buffer
+    (insert "first\nsecond\nthird\nfourth\n")
+    (cl-letf (((symbol-function 'find-file)
+               (lambda (file) (should (equal file "/tmp/café#notes")))))
+      (ebb--open-link "file://localhost/tmp/caf%C3%A9%23notes#L2C3")
+      (should (= (line-number-at-pos) 2))
+      (should (= (current-column) 2))
+      (ebb--open-link "file:///tmp/caf%C3%A9%23notes#L2-L3")
+      (should (= (line-number-at-pos) 2))
+      (should (= (line-number-at-pos (mark)) 4))
+      (narrow-to-region (line-beginning-position 2) (point-max))
+      (ebb--open-link "file:///tmp/caf%C3%A9%23notes#3")
+      (should (= (line-number-at-pos) 3))
+      (ebb--open-link "file:///tmp/caf%C3%A9%23notes#L2C999999999999999999999")
+      (should (= (line-number-at-pos) 2))
+      (should (eolp)))))
+
+(ert-deftest ebb-test-file-uri-preserves-encoded-filename-bytes ()
+  "Use the filesystem coding system to round-trip percent-encoded bytes."
+  (let ((file-name-coding-system 'iso-latin-1))
+    (cl-letf (((symbol-function 'find-file)
+               (lambda (file)
+                 (should (equal (encode-coding-string file 'iso-latin-1)
+                                (concat "/tmp/" (unibyte-string #xc3 #x9e) ".go"))))))
+      (ebb--open-link "file:///tmp/%C3%9E.go"))))
+
 (ert-deftest ebb-test-plain-url-and-file-detection ()
   "Plain URLs and existing file references become clickable."
   (let ((file (locate-library "ebb")))
