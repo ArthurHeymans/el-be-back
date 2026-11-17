@@ -16,23 +16,60 @@
   "History of shell commands entered with `ebb-compile'.")
 
 (defvar-local ebb-compile--command nil)
+(defvar-local ebb-compile--environment nil)
+
+(defun ebb-compile--diagnostic-directory (command directory)
+  "Find the diagnostic directory for a simple initial cd in COMMAND.
+Run the command from DIRECTORY regardless, so the shell executes cd only once."
+  (let ((default-directory directory))
+    (if (string-match
+         (concat "\\`[ \t]*cd[ \t]+\\('[^']*'\\|\"[^\"`$]*\"\\|[^ \t;&\n|]+\\)"
+                 "[ \t]*\\(?:&&\\|;\\|\n\\)") command)
+        (let* ((word (match-string 1 command))
+               (arg (car (split-string-shell-command word)))
+               (target (and arg (expand-file-name (substitute-env-vars arg)))))
+          (if (and target (file-directory-p target))
+              (file-name-as-directory target)
+            directory))
+      directory)))
+
+(define-derived-mode ebb-compilation-mode compilation-mode "Ebb Compilation"
+  "Read a finished Ebb build log.")
+
+(define-key ebb-compilation-mode-map [remap recompile] #'ebb-recompile)
+
+(defun ebb-recompile (&optional edit-command)
+  "Run the last Ebb build in a new PTY; with EDIT-COMMAND, edit it first."
+  (interactive "P")
+  (let ((default-directory (or compilation-directory default-directory)))
+    (ebb-compile (if edit-command
+                     (compilation-read-command compile-command)
+                   compile-command))))
 
 (defun ebb-compile--finish (event)
   "Turn the live terminal into a compilation log after EVENT."
-  (let ((log (ebb-screen-plain-text ebb--screen))
+  (let ((log (ebb-screen-plain-text ebb--screen t))
         (command ebb-compile--command)
         (directory default-directory)
+        (environment ebb-compile--environment)
         (inhibit-read-only t))
     (ebb-io-stop ebb--io)
     (setq ebb--io nil ebb--render nil)
     (ebb-shell-cleanup)
     (ebb--maybe-remove-focus-change-hook)
     (erase-buffer)
-    (compilation-mode)
-    (setq default-directory directory)
+    (ebb-compilation-mode)
+    (pcase-let ((`(,env ,build-env ,path) environment))
+      (setq-local process-environment env)
+      (setq-local compilation-environment build-env)
+      (setq-local exec-path path))
+    (setq-local compile-command command)
+    (setq-local compilation-arguments (list command))
+    (setq-local compilation-directory directory)
+    (setq default-directory (ebb-compile--diagnostic-directory command directory))
     (compilation-insert-annotation
      (format "-*- mode: compilation; default-directory: %S -*-\n%s\n\n"
-             directory command))
+             default-directory command))
     (setq compilation-messages-start (copy-marker (1- (point))))
     (insert log)
     (unless (bolp) (insert "\n"))
@@ -55,6 +92,9 @@ scrollback, not just the rows currently shown in the terminal."
   (when (string-blank-p command) (user-error "Empty compilation command"))
   (let ((ebb-buffer-name "*ebb-compilation*")
         (ebb-enable-shell-integration nil)
+        (environment (list (copy-sequence process-environment)
+                           (copy-sequence compilation-environment)
+                           (copy-sequence exec-path)))
         (argv (with-connection-local-variables
                 (list shell-file-name shell-command-switch command))))
     (ebb--start
@@ -62,6 +102,9 @@ scrollback, not just the rows currently shown in the terminal."
      (lambda (buffer)
        (with-current-buffer buffer
          (setq-local ebb-compile--command command)
+         (setq-local ebb-compile--environment environment)
+         (setq-local process-environment (append (nth 1 environment) (car environment)))
+         (setq-local exec-path (nth 2 environment))
          (setq-local ebb-kill-buffer-on-exit nil)
          (setq-local ebb-show-title nil)
          (setq-local ebb-enable-directory-tracking nil)

@@ -6556,18 +6556,29 @@ cell is 9x18 unless overridden."
           (let ((default-directory (file-name-as-directory directory))
                 (shell-file-name (executable-find "sh"))
                 (shell-command-switch "-c"))
-            (setq source (expand-file-name (concat (make-string 95 ?a) ".c")))
+            (make-directory "sub dir")
+            (setq source (expand-file-name (concat "sub dir/" (make-string 95 ?a) ".c")))
             (write-region "first\nsecond\nthird\n" nil source nil 'silent)
-            (setq buffer
-                  (ebb-compile (format "test -t 1 && printf '\\033[31m%%s\\033[0m\\n' %s; exit 1"
-                                       (shell-quote-argument
-                                        (concat (file-name-nondirectory source) ":2:1: error: example")))))
+            (write-region "wrong\n" nil (file-name-nondirectory source) nil 'silent)
+            (with-temp-buffer
+              (setq-local process-environment (cons "EBB_LOCAL_TEST=yes" process-environment))
+              (setq-local compilation-environment '("EBB_BUILD_TEST=working"))
+              (setq buffer
+                    (ebb-compile (format (concat "cd 'sub dir' && test -t 1 && "
+                                                 "test \"$EBB_LOCAL_TEST/$EBB_BUILD_TEST\" = yes/working && "
+                                                 "printf '\\033[31m%%s\\033[0m\\n' %s; exit 1")
+                                         (shell-quote-argument
+                                          (concat (file-name-nondirectory source) ":2:1: error: example"))))))
             (with-current-buffer buffer
               (let ((deadline (+ (float-time) 5)))
                 (while (and (not (derived-mode-p 'compilation-mode))
                             (< (float-time) deadline))
                   (accept-process-output nil 0.05)))
               (should (derived-mode-p 'compilation-mode))
+              (should (string-prefix-p "cd 'sub dir'" compile-command))
+              (should (equal compilation-arguments (list compile-command)))
+              (should (equal compilation-directory (file-name-as-directory directory)))
+              (should (eq (lookup-key ebb-compilation-mode-map [remap recompile]) #'ebb-recompile))
               (should (string-match-p (regexp-quote (file-name-nondirectory source))
                                       (buffer-string)))
               (let ((next-error-last-buffer buffer))
@@ -6580,6 +6591,43 @@ cell is 9x18 unless overridden."
         (kill-buffer (find-buffer-visiting source)))
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory directory t))))
+
+(ert-deftest ebb-test-compile-log-keeps-spaces-at-soft-wraps ()
+  "A space before a soft wrap still belongs to the filename."
+  (ebb-test-with-screen (:width 4 :height 3)
+    (ebb-parse-bytes parser "abc def")
+    (should (equal (ebb-screen-plain-text screen t) "abc def"))))
+
+(ert-deftest ebb-test-compile-signal-finalizes-but-buffer-kill-does-not ()
+  "A signal finishes the log; killing the buffer suppresses its finish hook."
+  (skip-unless (executable-find "sh"))
+  (require 'ebb-compile)
+  (let ((shell-file-name (executable-find "sh"))
+        (shell-command-switch "-c")
+        (ebb-report-pixel-size nil)
+        (compilation-finish-functions nil)
+        (calls 0)
+        (next-error-last-buffer nil)
+        buffer)
+    (setq compilation-finish-functions (list (lambda (&rest _) (cl-incf calls))))
+    (unwind-protect
+        (save-window-excursion
+          (setq buffer (ebb-compile "exec sleep 10"))
+          (with-current-buffer buffer
+            (interrupt-process (ebb-io-process ebb--io))
+            (let ((deadline (+ (float-time) 5)))
+              (while (and (derived-mode-p 'ebb-mode) (< (float-time) deadline))
+                (accept-process-output nil 0.05)))
+            (should (derived-mode-p 'compilation-mode))
+            (should (= calls 1)))
+          (kill-buffer buffer)
+          (setq buffer (ebb-compile "exec sleep 10"))
+          (with-current-buffer buffer
+            (remove-hook 'kill-buffer-query-functions #'ebb--kill-buffer-query t))
+          (kill-buffer buffer)
+          (should (= calls 1))
+          (should-not (eq next-error-last-buffer buffer)))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (provide 'ebb-test)
 ;;; ebb-test.el ends here
