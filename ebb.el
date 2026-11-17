@@ -527,7 +527,9 @@ Called after each render.  Debounced so short-lived matches don't flash."
     (when-let* ((seq (ebb-input-encode-mouse
                      event ebb--screen
                      (marker-position
-                      (ebb-render-state-display-begin ebb--render)))))
+                      (ebb-render-state-display-begin ebb--render))
+                     (when (ebb-screen-mouse-sgr-pixels ebb--screen)
+                       (ebb-render-cell-pixel-size ebb--render)))))
       (ebb-io-send ebb--io seq))
     (when (and ebb--mouse-drag-transient-map-exit
                (ebb-input--mouse-release-p event))

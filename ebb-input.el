@@ -218,10 +218,12 @@ A string KEY is committed input text from an input method."
 
 ;;;; ---- Mouse Encoding -------------------------------------------------
 
-(defun ebb-input-encode-mouse (event screen pos-offset)
+(defun ebb-input-encode-mouse (event screen pos-offset &optional cell-size)
   "Encode mouse EVENT on SCREEN as terminal escape sequence.
 POS-OFFSET is the buffer position of display line 0, col 0.
-Returns a string or nil."
+CELL-SIZE is (WIDTH . HEIGHT) in pixels.  Pixel reports use the center
+of the cell under the pointer and are omitted if CELL-SIZE is unknown.
+Return a string or nil."
   (when-let* ((mouse-mode (ebb-screen-mouse-mode screen)))
     (when (ebb-input--mouse-event-allowed-p event mouse-mode screen)
       (when-let* ((coords (ebb-input--mouse-coordinates event screen pos-offset))
@@ -233,11 +235,16 @@ Returns a string or nil."
         (let ((code (+ button (ebb-input--mouse-mod-bits event))))
           (when (ebb-input--mouse-release-p event)
             (ebb-input--mouse-forget-press event screen))
-          (if (ebb-screen-mouse-sgr screen)
-              ;; SGR encoding
-              (format "\e[<%d;%d;%d%c"
-                      code (1+ x) (1+ y)
-                      (if (ebb-input--mouse-release-p event) ?m ?M))
+          (if (or (ebb-screen-mouse-sgr screen)
+                  (ebb-screen-mouse-sgr-pixels screen))
+              (let ((pixels (ebb-screen-mouse-sgr-pixels screen)))
+                (when (or (not pixels)
+                          (and cell-size (> (car cell-size) 0) (> (cdr cell-size) 0)))
+                  (when pixels
+                    (setq x (+ (* x (car cell-size)) (/ (car cell-size) 2))
+                          y (+ (* y (cdr cell-size)) (/ (cdr cell-size) 2))))
+                  (format "\e[<%d;%d;%d%c" code (1+ x) (1+ y)
+                          (if (ebb-input--mouse-release-p event) ?m ?M))))
             ;; Legacy encoding (coordinates limited to 223)
             (when (and (<= x 222) (<= y 222))
               (format "\e[M%c%c%c"

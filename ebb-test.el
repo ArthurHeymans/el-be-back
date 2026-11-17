@@ -4496,6 +4496,26 @@ length cannot grow), which broke erase-display for such frames."
                      (ebb-test--mouse-event 'down-mouse-1 (point-min))
                      screen display-begin))))))
 
+(ert-deftest ebb-test-mouse-sgr-pixel-encoding ()
+  "DEC 1016 reports one-based cell centers in pixels, not cell indices."
+  (ebb-test-with-screen (:width 10 :height 3)
+    (with-temp-buffer
+      (insert "abcdefghij\nklmnopqrst\n")
+      (let ((press (ebb-test--mouse-event 'down-mouse-1 15))
+            (release (ebb-test--mouse-event 'mouse-1 15))
+            replies)
+        (setf (ebb-parser-write-fn parser) (lambda (reply) (push reply replies)))
+        (ebb-parse-bytes parser "\e[?1000;1006;1016h\e[?1016$p")
+        (should (equal (car replies) "\e[?1016;1$y"))
+        (should (equal "\e[<0;29;25M"
+                       (ebb-input-encode-mouse press screen 1 '(8 . 16))))
+        (should (equal "\e[<0;29;25m"
+                       (ebb-input-encode-mouse release screen 1 '(8 . 16))))
+        (should-not (ebb-input-encode-mouse press screen 1))
+        (ebb-parse-bytes parser "\e[?1006h\e[?1016$p")
+        (should (equal (car replies) "\e[?1016;2$y"))
+        (should (equal "\e[<0;4;2M" (ebb-input-encode-mouse press screen 1)))))))
+
 (ert-deftest ebb-test-mouse-legacy-release ()
   "Legacy mouse releases use button code 3 and retain modifiers."
   (let ((screen (ebb-screen-create 10 3)))

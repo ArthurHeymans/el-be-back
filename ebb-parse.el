@@ -1182,6 +1182,10 @@ PARAMS carries the parsed parameters."
                       (if (ebb-screen-cursor-visible screen) 1 2))
                      ((= mode 69)
                       (if (ebb-screen-horizontal-margins-enabled-p screen) 1 2))
+                     ((= mode 1006)
+                      (if (ebb-screen-mouse-sgr screen) 1 2))
+                     ((= mode 1016)
+                      (if (ebb-screen-mouse-sgr-pixels screen) 1 2))
                      ((memq mode '(4 5 18 19 35 42 66 67 2026))
                       (if (ebb-parse--recorded-mode
                            ebb-parse--dec-mode-states screen mode) 1 2))
