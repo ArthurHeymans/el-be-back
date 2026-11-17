@@ -529,7 +529,8 @@ Called after each render.  Debounced so short-lived matches don't flash."
                      (marker-position
                       (ebb-render-state-display-begin ebb--render))
                      (when (ebb-screen-mouse-sgr-pixels ebb--screen)
-                       (ebb-render-cell-pixel-size ebb--render)))))
+                       (or (ebb-io-pixel-cell-size ebb--io)
+                           (ebb-render-cell-pixel-size ebb--render))))))
       (ebb-io-send ebb--io seq))
     (when (and ebb--mouse-drag-transient-map-exit
                (ebb-input--mouse-release-p event))
@@ -774,7 +775,8 @@ selected window."
      (when ebb--render
        (pcase (car args)
          ('text-area (ebb-render-text-area-pixel-size ebb--render))
-         ('cell (ebb-render-cell-pixel-size ebb--render)))))
+         ('cell (or (and ebb--io (ebb-io-pixel-cell-size ebb--io))
+                    (ebb-render-cell-pixel-size ebb--render))))))
     ('process-exit
      (let ((event (car args)))
        (when (buffer-live-p (current-buffer))

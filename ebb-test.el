@@ -4512,9 +4512,29 @@ length cannot grow), which broke erase-display for such frames."
         (should (equal "\e[<0;29;25m"
                        (ebb-input-encode-mouse release screen 1 '(8 . 16))))
         (should-not (ebb-input-encode-mouse press screen 1))
+        (should-not (ebb-screen-mouse-pressed screen))
         (ebb-parse-bytes parser "\e[?1006h\e[?1016$p")
         (should (equal (car replies) "\e[?1016;2$y"))
         (should (equal "\e[<0;4;2M" (ebb-input-encode-mouse press screen 1)))))))
+
+(ert-deftest ebb-test-mouse-sgr-pixel-uses-pointer-offset ()
+  "Different positions in the same GUI cell report different pixels."
+  (with-temp-buffer
+    (let ((screen (ebb-screen-create 10 3))
+          (pixel '(1 . 2)))
+      (setf (ebb-screen-mouse-mode screen) 'normal
+            (ebb-screen-mouse-sgr-pixels screen) t)
+      (cl-letf (((symbol-function 'ebb-input--mouse-coordinates) (lambda (&rest _) '(0 . 0)))
+                ((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+                ((symbol-function 'frame-char-width) (lambda (&rest _) 16))
+                ((symbol-function 'frame-char-height) (lambda (&rest _) 32))
+                ((symbol-function 'posn-at-point) (lambda (&rest _) 'origin))
+                ((symbol-function 'posn-x-y) (lambda (p) (if (eq p 'origin) '(0 . 0) pixel))))
+        (let ((press (ebb-test--mouse-event 'down-mouse-1 1)))
+          (setcar (cadr press) (selected-window))
+          (should (equal "\e[<0;1;2M" (ebb-input-encode-mouse press screen 1 '(8 . 16))))
+          (setq pixel '(14 . 24))
+          (should (equal "\e[<0;8;13M" (ebb-input-encode-mouse press screen 1 '(8 . 16)))))))))
 
 (ert-deftest ebb-test-mouse-legacy-release ()
   "Legacy mouse releases use button code 3 and retain modifiers."
