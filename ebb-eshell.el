@@ -24,6 +24,8 @@
 (declare-function ebb--mouse-mode "ebb")
 (declare-function ebb--refresh-input-cursor "ebb")
 (declare-function ebb--ensure-focus-change-hook "ebb")
+(declare-function ebb--track-focus-mode "ebb")
+(declare-function ebb--window-size-change "ebb" (window))
 (declare-function ebb--maybe-remove-focus-change-hook "ebb")
 (declare-function ebb-shell-cleanup "ebb-shell")
 (declare-function eshell-gather-process-output "esh-proc" (command args))
@@ -149,8 +151,10 @@ read-only; the terminal modes are writable)."
            ('text-area (ebb-render-text-area-pixel-size render))
            ('cell (ebb-render-cell-pixel-size render))))))
     ('mode-set
-     (when (memq (car args) '(1000 1002 1003))
-       (ebb--mouse-mode (if (ebb-screen-mouse-mode ebb--screen) 1 -1))))))
+     (pcase (car args)
+       ((or 1000 1002 1003)
+        (ebb--mouse-mode (if (ebb-screen-mouse-mode ebb--screen) 1 -1)))
+       (1004 (ebb--track-focus-mode))))))
 
 (defun ebb-eshell--output-filter ()
   "Replace Eshell's just-inserted output with terminal rendering."
@@ -172,12 +176,7 @@ read-only; the terminal modes are writable)."
 
 (defun ebb-eshell--resize (window)
   "Resize the inline terminal displayed in WINDOW."
-  (let ((buffer (window-buffer window)))
-    (when (buffer-local-value 'ebb-eshell--io buffer)
-      (with-current-buffer buffer
-        (ebb-io-handle-resize ebb-eshell--io
-                                (window-max-chars-per-line window)
-                                (window-body-height window))))))
+  (ebb--window-size-change window))
 
 (defun ebb-eshell--setup (process)
   "Attach a Ebb terminal to Eshell PROCESS at its output marker."

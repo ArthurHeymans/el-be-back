@@ -80,6 +80,7 @@ Binds `screen' and `parser' in BODY."
           (set-window-buffer window buffer)
           (dolist (resize '(ebb--window-size-change ebb-eshell--resize))
             (ebb-screen-resize screen 1 1)
+            (with-current-buffer buffer (setq ebb--window-fit nil))
             (funcall resize window)
             (should (= (window-max-chars-per-line window)
                        (ebb-screen-width screen)))
@@ -133,6 +134,19 @@ Binds `screen' and `parser' in BODY."
                                  'fake (list large))))))))
         (kill-buffer buffer)))))
 
+(ert-deftest ebb-test-window-refit-preserves-program-size ()
+  "A buffer change elsewhere does not override an unchanged window fit."
+  (save-window-excursion
+    (with-temp-buffer
+      (let* ((window (selected-window))
+             (screen (ebb-screen-create 1 1))
+             (ebb--io (make-ebb-io :screen screen)))
+        (set-window-buffer window (current-buffer))
+        (ebb--window-size-change window)
+        (ebb-screen-resize screen 132 (ebb-screen-height screen))
+        (ebb--refit-displayed-terminals (selected-frame))
+        (should (= (ebb-screen-width screen) 132))))))
+
 (ert-deftest ebb-test-focus-reports-logical-transitions ()
   "Two views share one focus state; selecting another buffer reports out."
   (save-window-excursion
@@ -153,7 +167,7 @@ Binds `screen' and `parser' in BODY."
                       ((symbol-function 'frame-focus-state) #'always)
                       ((symbol-function 'ebb-io-send)
                        (lambda (_io report) (push report reports))))
-              (ebb--focus-change)
+              (with-current-buffer buffer (ebb--track-focus-mode))
               (select-window second)
               (ebb--focus-change)
               (set-window-buffer second other-buffer)
@@ -161,8 +175,7 @@ Binds `screen' and `parser' in BODY."
               (select-window first)
               (ebb--focus-change))
             (should (equal (nreverse reports)
-                           (list (ebb-input-focus-in) (ebb-input-focus-out)
-                                 (ebb-input-focus-in)))))
+                           (list (ebb-input-focus-out) (ebb-input-focus-in)))))
         (kill-buffer buffer)))))
 
 ;;;; ---- Screen Model Tests ---------------------------------------------
