@@ -237,6 +237,10 @@ When DRAIN-ALL is non-nil, ignore chunk budgets."
                       (setf (ebb-io-pending-chunks io)
                             (cdr (ebb-io-pending-chunks io)))
                       (ebb-io--normalize-pending io)
+                      ;; A Kitty upload can span complete APCs, so the
+                      ;; parser may already be in ground state at the gap.
+                      (setf (ebb-graphics-state-upload
+                             (ebb-screen-graphics (ebb-io-screen io))) nil)
                       (ebb-parse-cancel-sequence (ebb-io-parser io)))
                   (let* ((offset (ebb-io-pending-offset io))
                          (chunk-size (min (- (length chunk) offset) budget)))

@@ -6400,6 +6400,21 @@ cell is 9x18 unless overridden."
       (should (equal "abcHello" (ebb-test-display-line (ebb-io-screen io) 0)))
       (should (zerop (ebb-io-pending-bytes io))))))
 
+(ert-deftest ebb-test-io-output-gap-cancels-kitty-upload ()
+  "A continuation after a gap cannot complete an older Kitty upload."
+  (with-temp-buffer
+    (let* ((io (ebb-io-create-terminal (current-buffer) #'ignore))
+           (graphics (ebb-screen-graphics (ebb-io-screen io)))
+           (ebb-io-max-pending-bytes 64))
+      (ebb-io--enqueue-output io "\e_Ga=t,f=24,s=1,v=1,i=8,m=1;AQI=\e\\")
+      (ebb-io--process-pending io t)
+      (should (ebb-graphics-state-upload graphics))
+      (ebb-io--enqueue-output io (make-string 65 ?x))
+      (ebb-io--enqueue-output io "\e_Gm=0;Aw==\e\\")
+      (ebb-io--process-pending io t)
+      (should-not (ebb-graphics-state-upload graphics))
+      (should-not (gethash 8 (ebb-graphics-state-images graphics))))))
+
 (ert-deftest ebb-test-io-normalize-pending-decrements-bytes ()
   "Dropping a consumed multibyte chunk decrements the byte total."
   (let ((io (make-ebb-io)))
