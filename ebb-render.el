@@ -207,6 +207,14 @@ adjustment is actually needed."
 (defvar ebb-render-after-refresh-hook nil
   "Hook run after refreshing an Ebb buffer, with the render state.")
 
+(defvar ebb-render-repaint-functions nil
+  "Functions notified of rendered text, with the start and end positions.")
+
+(defun ebb-render--note-repaint (begin end)
+  "Notify buffer-local consumers that BEGIN through END were repainted."
+  (when (< begin end)
+    (run-hook-with-args 'ebb-render-repaint-functions begin end)))
+
 ;; Palette 0-15 inherit Emacs ansi-color faces (theme-aware), like eat/ghostel.
 (defconst ebb-render--ansi-face-names
   ["black" "red" "green" "yellow" "blue" "magenta" "cyan" "white"]
@@ -754,18 +762,45 @@ TOTAL, GENERATION and GRAPHICS-GENERATION default to the current model values."
           (if (null graphics-generation)
               (ebb-render--history-graphics-signature screen)
             graphics-generation)))
-    (save-excursion
-      (delete-region (ebb-render-state-region-begin render) display-begin)
-      (goto-char (ebb-render-state-region-begin render))
-      (dotimes (offset count)
-        (insert (ebb-render--history-row-string
-                 render (+ start offset) graphics-generation))))
+    (let* ((old-start (ebb-render-state-history-start-row render))
+           (old-end (+ old-start (ebb-render-state-scrollback-count render)))
+           (new-end (+ start count))
+           (first (max start old-start))
+           (last (min new-end old-end))
+           (region-begin (ebb-render-state-region-begin render)))
+      (save-excursion
+        (if (and (< first last)
+                 (eql generation (ebb-render-state-history-generation render))
+                 (equal graphics-generation
+                        (ebb-render-state-history-graphics-generation render)))
+            ;; Preserve overlap (including links and queued markers) when
+            ;; moving the slab through unchanged model history.
+            (progn
+              (goto-char region-begin)
+              (forward-line (- last old-start))
+              (delete-region (point) display-begin)
+              (ebb-render--insert-history-range render last new-end graphics-generation)
+              (goto-char region-begin)
+              (forward-line (- first old-start))
+              (delete-region region-begin (point))
+              (goto-char region-begin)
+              (ebb-render--insert-history-range render start first graphics-generation))
+          (delete-region region-begin display-begin)
+          (goto-char region-begin)
+          (ebb-render--insert-history-range render start new-end graphics-generation))))
     (setf (ebb-render-state-history-start-row render) start
           (ebb-render-state-scrollback-count render) count
           (ebb-render-state-history-total-rows render) total
           (ebb-render-state-history-generation render) generation
           (ebb-render-state-history-graphics-generation render)
           graphics-generation)))
+
+(defun ebb-render--insert-history-range (render start end graphics-generation)
+  "Insert RENDER's history rows from START up to END, notifying repaint hooks."
+  (let ((begin (point)))
+    (cl-loop for row from start below end
+             do (insert (ebb-render--history-row-string render row graphics-generation)))
+    (ebb-render--note-repaint begin (point))))
 
 (defun ebb-render-scroll-history (render rows)
   "Scroll RENDER's selected window by virtual history ROWS."
@@ -1885,7 +1920,8 @@ empty padding significant."
               (insert new)
               ;; Replacing row zero must not move the marker that separates
               ;; scrollback from the terminal viewport.
-              (set-marker display-begin display-start))))))))
+              (set-marker display-begin display-start)
+              (ebb-render--note-repaint bol (point)))))))))
 
 ;;;; ---- Cell-to-String Conversion --------------------------------------
 
@@ -2397,6 +2433,8 @@ Used after resize when the display area size has changed."
           (ebb-render--update-cursor render)
           (ebb-render--apply-viewport-reset render)
           ;; A full rebuild drops link/shell properties; re-apply them.
+          (ebb-render--note-repaint (ebb-render-state-region-begin render)
+                                    (ebb-render-state-region-end render))
           (ebb-render--run-after-refresh-hook render))))))
 
 (defun ebb-render-resize-height (render)
@@ -2470,7 +2508,8 @@ Used after resize when the display area size has changed."
           (ebb-render--apply-viewport-reset render)
           (ebb-screen-clear-dirty screen)
           (ebb-screen-clear-scrollback-dirty screen)
-          ;; A full rebuild drops link/shell properties; re-apply them.
+          ;; The rebuilt viewport needs fresh link/shell properties.
+          (ebb-render--note-repaint display-begin (ebb-render-state-region-end render))
           (ebb-render--run-after-refresh-hook render))))))
 
 ;;;; ---- Cleanup --------------------------------------------------------
