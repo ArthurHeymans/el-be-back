@@ -893,8 +893,33 @@ selected window."
             (goto-char (point-min))
             (forward-line (1- (max 1 line)))
             (when column (move-to-column (1- (max 1 column))))))))
-     ((string-match "\\`file://\\(?:localhost\\)?\\(/.*\\)" uri)
-      (find-file (url-unhex-string (match-string 1 uri))))
+     ((string-match "\\`file://\\(?:localhost\\)?\\(/[^#]*\\)\\(?:#\\(.*\\)\\)?\\'" uri)
+      (let* ((path (match-string 1 uri))
+             (fragment (match-string 2 uri))
+             (file (decode-coding-string
+                    (url-unhex-string (encode-coding-string path 'utf-8) t)
+                    'utf-8-unix))
+             (location
+              (when (and fragment
+                         (string-match
+                          "\\`L?\\([0-9]+\\)\\(?:C\\([0-9]+\\)\\|-L\\([0-9]+\\)\\)?\\'"
+                          fragment))
+                (mapcar (lambda (group)
+                          (when-let* ((digits (match-string group fragment)))
+                            (max 1 (string-to-number digits))))
+                        '(1 2 3)))))
+        (unless (string-match-p "\0" file)
+          (find-file file)
+          (when location
+            (pcase-let ((`(,line ,column ,end-line) location))
+              (goto-char (point-min))
+              (forward-line (1- (if end-line (min line end-line) line)))
+              (when end-line
+                (push-mark (save-excursion
+                             (forward-line (1+ (abs (- end-line line))))
+                             (point))
+                           t t))
+              (when column (move-to-column (1- column))))))))
      (t (browse-url uri)))))
 
 (defun ebb-open-link-at-click (event)

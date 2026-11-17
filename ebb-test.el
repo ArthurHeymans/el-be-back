@@ -1842,6 +1842,21 @@ wrapped logical line in half and lose its first half."
             (should-not (get-text-property 7 'help-echo)))
         (kill-buffer buffer)))))
 
+(ert-deftest ebb-test-file-uri-fragments ()
+  "Open encoded paths separately from their line and column fragments."
+  (with-temp-buffer
+    (insert "first\nsecond\nthird\nfourth\n")
+    (cl-letf (((symbol-function 'find-file)
+               (lambda (file) (should (equal file "/tmp/café#notes")))))
+      (ebb--open-link "file://localhost/tmp/caf%C3%A9%23notes#L2C3")
+      (should (= (line-number-at-pos) 2))
+      (should (= (current-column) 2))
+      (ebb--open-link "file:///tmp/caf%C3%A9%23notes#L2-L3")
+      (should (= (line-number-at-pos) 2))
+      (should (= (line-number-at-pos (mark)) 4))
+      (ebb--open-link "file:///tmp/caf%C3%A9%23notes#3")
+      (should (= (line-number-at-pos) 3)))))
+
 (ert-deftest ebb-test-plain-url-and-file-detection ()
   "Plain URLs and existing file references become clickable."
   (let ((file (locate-library "ebb")))
