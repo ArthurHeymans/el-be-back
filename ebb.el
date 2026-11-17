@@ -914,30 +914,30 @@ selected window."
                          keymap ,ebb-link-map)))
 
 (defvar-local ebb--pending-links nil
-  "Marker pair delimiting the pending plain-text link scan.")
+  "Pending link scans as (BEGIN END DIRECTORY) ranges, newest first.")
 
 (defvar-local ebb--link-scan-timer nil)
 (defvar-local ebb--link-cursor-line nil)
+(defvar-local ebb--link-cursor-directory nil)
 
 (defconst ebb--link-scan-chunk-size 4096
   "Approximate number of characters to scan in one timer tick.")
 
-(defun ebb--link-cursor-position ()
-  "Return the beginning of the rendered cursor row, if any."
-  (when (and ebb--render ebb--screen)
-    (save-excursion
-      (goto-char (ebb-render-state-display-begin ebb--render))
-      (forward-line (ebb-screen-cursor-y ebb--screen))
-      (point))))
+(defun ebb--link-row-position (render row)
+  "Return the start of viewport ROW in RENDER."
+  (save-excursion
+    (goto-char (ebb-render-state-display-begin render))
+    (when (zerop (forward-line row)) (point))))
 
 (defun ebb--cancel-link-scan ()
   "Cancel deferred URL detection and free its markers."
   (when ebb--link-scan-timer (cancel-timer ebb--link-scan-timer))
   (setq ebb--link-scan-timer nil)
-  (dolist (marker (list ebb--link-cursor-line
-                        (car ebb--pending-links) (cdr ebb--pending-links)))
-    (when marker (set-marker marker nil)))
-  (setq ebb--pending-links nil ebb--link-cursor-line nil))
+  (pcase-dolist (`(,begin ,end ,_) ebb--pending-links)
+    (set-marker begin nil)
+    (set-marker end nil))
+  (setq ebb--pending-links nil ebb--link-cursor-line nil
+        ebb--link-cursor-directory nil))
 
 (defun ebb--schedule-link-scan ()
   "Schedule one bounded link scan in the current terminal buffer."
@@ -945,16 +945,18 @@ selected window."
     (setq ebb--link-scan-timer
           (run-with-timer 0.02 nil #'ebb--scan-pending-links (current-buffer)))))
 
-(defun ebb--queue-link-scan (begin end)
-  "Queue repainted text between BEGIN and END for link detection."
+(defun ebb--queue-link-scan (begin end &optional directory)
+  "Queue repainted text between BEGIN and END in DIRECTORY for link detection."
   (when (and (< begin end) (or ebb-enable-url-detection ebb-enable-file-detection))
-    (if ebb--pending-links
-        (progn
-          (when (< begin (car ebb--pending-links))
-            (set-marker (car ebb--pending-links) begin))
-          (when (> end (cdr ebb--pending-links))
-            (set-marker (cdr ebb--pending-links) end)))
-      (setq ebb--pending-links (cons (copy-marker begin) (copy-marker end t))))
+    (let ((directory (or directory default-directory))
+          (head (car ebb--pending-links)))
+      (if (and head (equal (nth 2 head) directory)
+               (<= begin (nth 1 head)) (<= (car head) end))
+          (progn
+            (set-marker (car head) (min begin (marker-position (car head))))
+            (set-marker (nth 1 head) (max end (marker-position (nth 1 head)))))
+        (push (list (copy-marker begin t) (copy-marker end) directory)
+              ebb--pending-links)))
     (ebb--schedule-link-scan)))
 
 (defun ebb--scan-pending-links (buffer)
@@ -962,37 +964,43 @@ selected window."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (setq ebb--link-scan-timer nil)
-      (when ebb--pending-links
-        (let* ((begin (marker-position (car ebb--pending-links)))
-               (end (marker-position (cdr ebb--pending-links)))
-               (chunk (save-excursion
-                        (goto-char (max begin (- end ebb--link-scan-chunk-size)))
-                        (max begin (line-beginning-position)))))
-          (if (> chunk begin)
-              (progn
-                (set-marker (cdr ebb--pending-links) chunk)
-                (ebb--schedule-link-scan))
-            (set-marker (car ebb--pending-links) nil)
-            (set-marker (cdr ebb--pending-links) nil)
-            (setq ebb--pending-links nil))
-          (ebb--detect-plain-links chunk end))))))
+      (save-restriction
+        (widen)
+        (when-let* ((range (car ebb--pending-links)))
+          (pcase-let* ((`(,first ,last ,default-directory) range)
+                       (begin (marker-position first))
+                       (end (marker-position last))
+                       (chunk (save-excursion
+                                (goto-char (max begin (- end ebb--link-scan-chunk-size)))
+                                (max begin (line-beginning-position)))))
+            (if (and (< begin end) (> chunk begin))
+                (set-marker last chunk)
+              (pop ebb--pending-links)
+              (set-marker first nil)
+              (set-marker last nil))
+            (when ebb--pending-links (ebb--schedule-link-scan))
+            (when (< chunk end) (ebb--detect-plain-links chunk end))))))))
 
-(defun ebb--link-scan-cursor-change (_render)
-  "Queue the old cursor row when the cursor moves away from it."
-  (when-let* ((position (ebb--link-cursor-position)))
-    (if ebb--link-cursor-line
-        (unless (= position ebb--link-cursor-line)
-          (save-excursion
-            (goto-char ebb--link-cursor-line)
-            (ebb--queue-link-scan (line-beginning-position) (line-end-position)))
-          (set-marker ebb--link-cursor-line position))
-      (setq ebb--link-cursor-line (copy-marker position)))))
+(defun ebb--link-scan-cursor-change (render)
+  "Remember the cursor of the rendered frame and queue the row it left."
+  (let ((row (ebb-screen-cursor-y (ebb-render-state-screen render))))
+    (unless (eql row ebb--link-cursor-line)
+      (when-let* ((old ebb--link-cursor-line)
+                  (position (ebb--link-row-position render old)))
+        (save-excursion
+          (goto-char position)
+          (ebb--queue-link-scan position (line-end-position)
+                                ebb--link-cursor-directory))))
+    (unless (eql row ebb--link-cursor-line)
+      (setq ebb--link-cursor-line row
+            ebb--link-cursor-directory default-directory))))
 
 (defun ebb--detect-plain-links (start end)
   "Detect plain URLs and file references between START and END."
   (let ((inhibit-read-only t)
         (inhibit-modification-hooks t)
-        (cursor (ebb--link-cursor-position)))
+        (cursor (and ebb--render ebb--link-cursor-line
+                     (ebb--link-row-position ebb--render ebb--link-cursor-line))))
     (save-excursion
       (when ebb-enable-url-detection
         (goto-char start)

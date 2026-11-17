@@ -1887,6 +1887,60 @@ wrapped logical line in half and lose its first half."
         (ebb--scan-pending-links (current-buffer))
         (should (equal "https://example.org" (get-text-property (point-min) 'help-echo)))))))
 
+(ert-deftest ebb-test-deferred-links-use-rendered-cursor-and-directory ()
+  "Timers scan widened ranges with the working directory at repaint time."
+  (with-temp-buffer
+    (let ((directory (file-name-directory (locate-library "ebb"))))
+      (setq default-directory directory)
+      (ebb-mode)
+      (let* ((screen (ebb-screen-create 60 4))
+             (parser (ebb-parse-create screen))
+             (render (ebb-render-create screen (current-buffer))))
+        (setq ebb--screen screen ebb--render render)
+        (cl-letf (((symbol-function 'ebb--schedule-link-scan) #'ignore))
+          (ebb-parse-bytes parser "./ebb.el:42\r\n")
+          (ebb-render-refresh render)
+          ;; Parsed model may run ahead of the displayed frame (DEC 2026).
+          (ebb-parse-bytes parser "\e[?2026h\e[H")
+          (setq default-directory temporary-file-directory)
+          (save-restriction
+            (narrow-to-region (line-beginning-position 2) (point-max))
+            (ebb--scan-pending-links (current-buffer)))
+          (should (equal (get-text-property (point-min) 'help-echo)
+                         (concat "fileref:" directory "ebb.el:42"))))))))
+
+(ert-deftest ebb-test-history-slab-reuses-overlap-and-keeps-cursor-row ()
+  "Changing the history slab repaints only new rows and keeps the live cursor."
+  (with-temp-buffer
+    (ebb-mode)
+    (let* ((screen (ebb-screen-create 40 3))
+           (parser (ebb-parse-create screen))
+           (render (ebb-render-create screen (current-buffer)))
+           (ebb-enable-file-detection nil)
+           repaints
+           (ebb-render-repaint-functions
+            (list #'ebb--queue-link-scan
+                  (lambda (start end) (push (buffer-substring-no-properties start end) repaints)))))
+      (setq ebb--screen screen ebb--render render)
+      (cl-letf (((symbol-function 'ebb--schedule-link-scan) #'ignore))
+        (dotimes (i 8) (ebb-parse-bytes parser (format "row %d\r\n" i)))
+        (ebb-parse-bytes parser "\e[Hhttps://example.org")
+        (ebb-render-refresh render)
+        (let ((inhibit-read-only t)
+              (total (ebb-screen-history-row-count screen)))
+          (ebb-render--rebuild-scrollback render 1 3 total)
+          (setq repaints nil)
+          (ebb-render--rebuild-scrollback render 0 3 total)
+          (should (equal repaints '("row 0\n")))
+          (while ebb--pending-links (ebb--scan-pending-links (current-buffer)))
+          (let ((live-row (ebb-render-state-display-begin render)))
+            (should-not (get-text-property live-row 'help-echo))
+            (ebb-parse-bytes parser "\e[B")
+            (ebb--link-scan-cursor-change render)
+            (while ebb--pending-links (ebb--scan-pending-links (current-buffer)))
+            (should (equal (get-text-property live-row 'help-echo)
+                           "https://example.org"))))))))
+
 (ert-deftest ebb-test-parse-osc-notifications ()
   "OSC 9 and 777 emit only valid normalized notifications."
   (ebb-test-with-screen (:width 20 :height 6)
