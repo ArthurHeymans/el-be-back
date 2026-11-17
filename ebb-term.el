@@ -3003,6 +3003,14 @@ line is in lazy text form or materialized cells."
 
 ;;;; ---- Alternate Screen -----------------------------------------------
 
+(defun ebb-screen-cancel-graphics-uploads (screen)
+  "Discard incomplete uploads on SCREEN and its saved grids."
+  (setf (ebb-graphics-state-upload (ebb-screen-graphics screen)) nil)
+  (dolist (saved (list (ebb-screen-alt-screen screen)
+                       (gethash screen ebb--alt-saved-grid)))
+    (when-let* ((graphics (and saved (ebb-alt-save-graphics saved))))
+      (setf (ebb-graphics-state-upload graphics) nil))))
+
 (defun ebb--resize-alt-save (saved new-width new-height &optional alternate)
   "Resize SAVED's inactive screen model to NEW-WIDTH and NEW-HEIGHT.
 When ALTERNATE is non-nil, resize without main-screen reflow."
