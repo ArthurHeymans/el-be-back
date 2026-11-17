@@ -218,35 +218,61 @@ A string KEY is committed input text from an input method."
 
 ;;;; ---- Mouse Encoding -------------------------------------------------
 
-(defun ebb-input-encode-mouse (event screen pos-offset)
+(defun ebb-input-encode-mouse (event screen pos-offset &optional cell-size)
   "Encode mouse EVENT on SCREEN as terminal escape sequence.
 POS-OFFSET is the buffer position of display line 0, col 0.
-Returns a string or nil."
+CELL-SIZE is (WIDTH . HEIGHT) in pixels.  Pixel reports use the center
+of the cell only when pixel offsets are unavailable.  Reports are
+omitted if CELL-SIZE is unknown.
+Return a string or nil."
   (when-let* ((mouse-mode (ebb-screen-mouse-mode screen)))
     (when (ebb-input--mouse-event-allowed-p event mouse-mode screen)
       (when-let* ((coords (ebb-input--mouse-coordinates event screen pos-offset))
                   (x (car coords))
                   (y (cdr coords))
                   (button (ebb-input--mouse-button event screen)))
-        (when (ebb-input--mouse-press-p event)
-          (ebb-input--mouse-remember-press event screen button))
-        (let ((code (+ button (ebb-input--mouse-mod-bits event))))
-          (when (ebb-input--mouse-release-p event)
-            (ebb-input--mouse-forget-press event screen))
-          (if (ebb-screen-mouse-sgr screen)
-              ;; SGR encoding
-              (format "\e[<%d;%d;%d%c"
-                      code (1+ x) (1+ y)
-                      (if (ebb-input--mouse-release-p event) ?m ?M))
-            ;; Legacy encoding (coordinates limited to 223)
-            (when (and (<= x 222) (<= y 222))
-              (format "\e[M%c%c%c"
-                      (+ (if (ebb-input--mouse-release-p event)
-                             (+ 3 (ebb-input--mouse-mod-bits event))
-                           code)
-                         32)
-                      (+ x 33)
-                      (+ y 33)))))))))
+        (let* ((release (ebb-input--mouse-release-p event))
+               (code (+ button (ebb-input--mouse-mod-bits event)))
+               (pixels (ebb-screen-mouse-sgr-pixels screen))
+               (report
+                (cond
+                 (pixels
+                  (when (and cell-size (> (car cell-size) 0) (> (cdr cell-size) 0))
+                    (let ((p (ebb-input--mouse-pixels event screen pos-offset coords cell-size)))
+                      (format "\e[<%d;%d;%d%c" code (1+ (car p)) (1+ (cdr p))
+                              (if release ?m ?M)))))
+                 ((ebb-screen-mouse-sgr screen)
+                  (format "\e[<%d;%d;%d%c" code (1+ x) (1+ y) (if release ?m ?M)))
+                 ((and (<= x 222) (<= y 222))
+                  (format "\e[M%c%c%c"
+                          (+ (if release (+ 3 (ebb-input--mouse-mod-bits event)) code) 32)
+                          (+ x 33) (+ y 33))))))
+          (when (and report (ebb-input--mouse-press-p event))
+            (ebb-input--mouse-remember-press event screen button))
+          (when release (ebb-input--mouse-forget-press event screen))
+          report)))))
+
+(defun ebb-input--mouse-pixels (event screen origin coords cell-size)
+  "Return EVENT's pixels from ORIGIN in SCREEN's advertised CELL-SIZE.
+COORDS are the logical cell coordinates used when pixel input is absent."
+  (let* ((posn (ebb-input--mouse-posn event))
+         (window (posn-window posn))
+         (width (car cell-size)) (height (cdr cell-size))
+         (pixel (when (and origin (window-live-p window)
+                           (display-graphic-p (window-frame window)))
+                  (let* ((at (posn-x-y posn))
+                         (start (posn-at-point origin window))
+                         (from (and start (posn-x-y start)))
+                         (frame (window-frame window)))
+                    (when (and (consp at) (consp from))
+                      (cons (floor (* (- (car at) (car from)) width)
+                                   (max 1 (frame-char-width frame)))
+                            (floor (* (- (cdr at) (cdr from)) height)
+                                   (max 1 (frame-char-height frame)))))))))
+    (cons (max 0 (min (1- (* width (ebb-screen-width screen)))
+                      (if pixel (car pixel) (+ (* (car coords) width) (/ width 2)))))
+          (max 0 (min (1- (* height (ebb-screen-height screen)))
+                      (if pixel (cdr pixel) (+ (* (cdr coords) height) (/ height 2))))))))
 
 (defun ebb-input--mouse-posn (event)
   "Return the position object for mouse EVENT."

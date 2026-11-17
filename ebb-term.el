@@ -143,7 +143,8 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (auto-wrap t) (insert-mode nil) (origin-mode nil)
   (keypad-mode nil) (bracketed-paste nil) (sync-output nil)
   ;; Mouse
-  (mouse-mode nil) (mouse-sgr nil) (mouse-pressed nil) (focus-events nil)
+  (mouse-mode nil) (mouse-sgr nil) (mouse-sgr-pixels nil)
+  (mouse-pressed nil) (focus-events nil)
   ;; Character sets
   (charset-g0 'us-ascii) (charset-g1 'us-ascii)
   (charset-g2 'us-ascii) (charset-g3 'us-ascii)
@@ -3320,7 +3321,10 @@ DECCOLM clears the display, restores full-screen margins, and homes the cursor."
     (1002 (setf (ebb-screen-mouse-mode screen) (and value 'button-event)))
     (1003 (setf (ebb-screen-mouse-mode screen) (and value 'any-event)))
     (1004 (setf (ebb-screen-focus-events screen) value))
-    (1006 (setf (ebb-screen-mouse-sgr screen) value))
+    (1006 (setf (ebb-screen-mouse-sgr screen) value)
+          (when value (setf (ebb-screen-mouse-sgr-pixels screen) nil)))
+    (1016 (setf (ebb-screen-mouse-sgr-pixels screen) value)
+          (when value (setf (ebb-screen-mouse-sgr screen) nil)))
     (47 ;; Alternate screen only (no cursor save, no clear)
      (if value
          (ebb-screen-enter-alt screen)
@@ -3874,7 +3878,8 @@ Retain main-screen output when `ebb--preserve-history-on-reset' is non-nil."
     (setf (ebb-screen-sync-output screen) nil)
     (setf (ebb-screen-bracketed-paste screen) nil)
     (setf (ebb-screen-mouse-mode screen) nil)
-    (setf (ebb-screen-mouse-sgr screen) nil)
+    (setf (ebb-screen-mouse-sgr screen) nil
+          (ebb-screen-mouse-sgr-pixels screen) nil)
     (setf (ebb-screen-focus-events screen) nil)
     ;; Reset charsets
     (setf (ebb-screen-charset-g0 screen) 'us-ascii)

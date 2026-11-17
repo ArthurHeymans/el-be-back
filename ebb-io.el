@@ -47,6 +47,7 @@
   (render-timer nil)      ; pending render timer
   (sync-timer nil)        ; synchronized-output (DEC 2026) flush timer
   (pixel-size-timer nil)  ; coalesced PTY pixel-size update
+  (pixel-cell-size nil)   ; last cell geometry successfully advertised to the PTY
   (pixel-size-error nil)  ; first helper failure; disables later attempts
   ;; Error reporting
   (last-processing-error nil)
@@ -591,7 +592,8 @@ TIOCSWINSZ could otherwise restore stale rows and columns after a newer resize."
                                       (number-to-string width)
                                       (number-to-string (car cell))
                                       (number-to-string (cdr cell)))))))
-            (unless (eql status 0)
+            (if (eql status 0)
+                (setf (ebb-io-pixel-cell-size io) cell)
               (ebb-io--disable-pixel-size
                io (format "helper failed: %s" status))))
         (error
