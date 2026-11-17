@@ -913,36 +913,107 @@ selected window."
                        `(help-echo ,uri mouse-face highlight
                          keymap ,ebb-link-map)))
 
-(defun ebb--detect-plain-links (_render)
-  "Detect plain URLs and file references after a terminal refresh."
-  (let* ((inhibit-read-only t)
-         (inhibit-modification-hooks t)
-         (cursor (and ebb--render ebb--screen
-                      (save-excursion
-                        (goto-char (ebb-render-state-display-begin ebb--render))
-                        (forward-line (ebb-screen-cursor-y ebb--screen))
-                        (cons (line-beginning-position) (line-end-position))))))
+(defvar-local ebb--pending-links nil
+  "Marker pair delimiting the pending plain-text link scan.")
+
+(defvar-local ebb--link-scan-timer nil)
+(defvar-local ebb--link-cursor-line nil)
+
+(defconst ebb--link-scan-chunk-size 4096
+  "Approximate number of characters to scan in one timer tick.")
+
+(defun ebb--link-cursor-position ()
+  "Return the beginning of the rendered cursor row, if any."
+  (when (and ebb--render ebb--screen)
+    (save-excursion
+      (goto-char (ebb-render-state-display-begin ebb--render))
+      (forward-line (ebb-screen-cursor-y ebb--screen))
+      (point))))
+
+(defun ebb--cancel-link-scan ()
+  "Cancel deferred URL detection and free its markers."
+  (when ebb--link-scan-timer (cancel-timer ebb--link-scan-timer))
+  (setq ebb--link-scan-timer nil)
+  (dolist (marker (list ebb--link-cursor-line
+                        (car ebb--pending-links) (cdr ebb--pending-links)))
+    (when marker (set-marker marker nil)))
+  (setq ebb--pending-links nil ebb--link-cursor-line nil))
+
+(defun ebb--schedule-link-scan ()
+  "Schedule one bounded link scan in the current terminal buffer."
+  (unless ebb--link-scan-timer
+    (setq ebb--link-scan-timer
+          (run-with-timer 0.02 nil #'ebb--scan-pending-links (current-buffer)))))
+
+(defun ebb--queue-link-scan (begin end)
+  "Queue repainted text between BEGIN and END for link detection."
+  (when (and (< begin end) (or ebb-enable-url-detection ebb-enable-file-detection))
+    (if ebb--pending-links
+        (progn
+          (when (< begin (car ebb--pending-links))
+            (set-marker (car ebb--pending-links) begin))
+          (when (> end (cdr ebb--pending-links))
+            (set-marker (cdr ebb--pending-links) end)))
+      (setq ebb--pending-links (cons (copy-marker begin) (copy-marker end t))))
+    (ebb--schedule-link-scan)))
+
+(defun ebb--scan-pending-links (buffer)
+  "Linkify the newest part of BUFFER's pending range and re-arm if needed."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq ebb--link-scan-timer nil)
+      (when ebb--pending-links
+        (let* ((begin (marker-position (car ebb--pending-links)))
+               (end (marker-position (cdr ebb--pending-links)))
+               (chunk (save-excursion
+                        (goto-char (max begin (- end ebb--link-scan-chunk-size)))
+                        (max begin (line-beginning-position)))))
+          (if (> chunk begin)
+              (progn
+                (set-marker (cdr ebb--pending-links) chunk)
+                (ebb--schedule-link-scan))
+            (set-marker (car ebb--pending-links) nil)
+            (set-marker (cdr ebb--pending-links) nil)
+            (setq ebb--pending-links nil))
+          (ebb--detect-plain-links chunk end))))))
+
+(defun ebb--link-scan-cursor-change (_render)
+  "Queue the old cursor row when the cursor moves away from it."
+  (when-let* ((position (ebb--link-cursor-position)))
+    (if ebb--link-cursor-line
+        (unless (= position ebb--link-cursor-line)
+          (save-excursion
+            (goto-char ebb--link-cursor-line)
+            (ebb--queue-link-scan (line-beginning-position) (line-end-position)))
+          (set-marker ebb--link-cursor-line position))
+      (setq ebb--link-cursor-line (copy-marker position)))))
+
+(defun ebb--detect-plain-links (start end)
+  "Detect plain URLs and file references between START and END."
+  (let ((inhibit-read-only t)
+        (inhibit-modification-hooks t)
+        (cursor (ebb--link-cursor-position)))
     (save-excursion
       (when ebb-enable-url-detection
-        (goto-char (point-min))
+        (goto-char start)
         (while (re-search-forward
                 "https?://[^ \t\n\r\"<>]*[^ \t\n\r\"<>.,;:!?)>]"
-                nil t)
+                end t)
           (let ((begin (match-beginning 0)) (end (match-end 0)))
             (unless (or (get-text-property begin 'help-echo)
-                        (and cursor (<= (car cursor) begin (cdr cursor))))
+                        (and cursor (= cursor (line-beginning-position))))
               (ebb--linkify begin end (match-string-no-properties 0))))))
       (when (and ebb-enable-file-detection
                  (not (file-remote-p default-directory)))
-        (goto-char (point-min))
+        (goto-char start)
         (let ((regexp (concat "\\(?:^\\|[^[:alnum:]_./~-]\\)\\("
                               ebb-file-detection-path-regex
                               "\\)\\(\\(?::[0-9]+\\(?::[0-9]+\\)?\\)?\\)"))
               (seen (make-hash-table :test #'equal)))
-          (while (re-search-forward regexp nil t)
+          (while (re-search-forward regexp end t)
             (let ((begin (match-beginning 1)) (end (match-end 2)))
               (unless (or (get-text-property begin 'help-echo)
-                          (and cursor (<= (car cursor) begin (cdr cursor))))
+                          (and cursor (= cursor (line-beginning-position))))
                 (let* ((path (match-string-no-properties 1))
                        (location (match-string-no-properties 2))
                        (file (expand-file-name path))
@@ -1016,7 +1087,10 @@ selected window."
   (setq-local imenu-default-goto-function #'ebb-shell-imenu-goto)
   (setq-local mode-line-process
               '(" " (:eval (ebb--mode-line-input-mode))))
-  (add-hook 'ebb-render-after-refresh-hook #'ebb--detect-plain-links nil t)
+  (add-hook 'ebb-render-repaint-functions #'ebb--queue-link-scan nil t)
+  (add-hook 'ebb-render-after-refresh-hook #'ebb--link-scan-cursor-change nil t)
+  (add-hook 'kill-buffer-hook #'ebb--cancel-link-scan nil t)
+  (add-hook 'change-major-mode-hook #'ebb--cancel-link-scan nil t)
   ;; Set up shell integration margins
   (ebb-shell-setup-margins)
   ;; Buffer-local window-size-change hooks receive a window, not a frame.

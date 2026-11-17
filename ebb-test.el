@@ -1850,7 +1850,7 @@ wrapped logical line in half and lose its first half."
       (insert (format "See https://example.com and ./%s:42:3\n"
                       (file-name-nondirectory file)))
       (let ((ebb--render nil) (ebb--screen nil))
-        (ebb--detect-plain-links nil))
+        (ebb--detect-plain-links (point-min) (point-max)))
       (goto-char (point-min))
       (let ((url-pos (progn (search-forward "https://") (- (point) 8))))
         (should (equal "https://example.com"
@@ -1859,6 +1859,33 @@ wrapped logical line in half and lose its first half."
         (let ((uri (get-text-property file-pos 'help-echo)))
           (should (string-prefix-p "fileref:" uri))
           (should (string-suffix-p ":42:3" uri)))))))
+
+(ert-deftest ebb-test-deferred-link-scan-tracks-repainted-rows ()
+  "Scan changed text, including the cursor row once the cursor leaves it."
+  (with-temp-buffer
+    (ebb-mode)
+    (let* ((ebb-enable-file-detection nil)
+           (screen (ebb-screen-create 40 4))
+           (parser (ebb-parse-create screen))
+           (render (ebb-render-create screen (current-buffer))))
+      (setq ebb--screen screen ebb--render render)
+      (cl-letf (((symbol-function 'ebb--schedule-link-scan) #'ignore))
+        (ebb-parse-bytes parser "https://example.org")
+        (ebb-render-refresh render)
+        (should ebb--pending-links)
+        (should-not (get-text-property (point-min) 'help-echo))
+        (ebb--scan-pending-links (current-buffer))
+        (should-not (get-text-property (point-min) 'help-echo))
+        (ebb-parse-bytes parser "\r\n")
+        (ebb-render-refresh render)
+        (ebb--scan-pending-links (current-buffer))
+        (should (equal "https://example.org" (get-text-property (point-min) 'help-echo)))
+        (ebb-render-refresh render)
+        (should-not ebb--pending-links)
+        (ebb-render-full-reset render)
+        (should ebb--pending-links)
+        (ebb--scan-pending-links (current-buffer))
+        (should (equal "https://example.org" (get-text-property (point-min) 'help-echo)))))))
 
 (ert-deftest ebb-test-parse-osc-notifications ()
   "OSC 9 and 777 emit only valid normalized notifications."
