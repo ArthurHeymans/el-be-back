@@ -4152,7 +4152,9 @@ length cannot grow), which broke erase-display for such frames."
       (setq-local ebb--io (make-ebb-io :process 'fake))
       (cl-letf (((symbol-function 'process-live-p) #'always)
                 ((symbol-function 'ebb-io-send)
-                 (lambda (_io string) (push string sent))))
+                 (lambda (_io string &optional interrupt)
+                   (should (eq interrupt (equal string "\C-c")))
+                   (push string sent))))
         (ebb-send-string (unibyte-string 0 255 ?x))
         (ebb-send-key "up")
         (ebb-send-key "up" "control, shift")
@@ -6413,6 +6415,46 @@ cell is 9x18 unless overridden."
       (ebb-io--enqueue-output io "\e_Gm=0;Aw==\e\\")
       (ebb-io--process-pending io t)
       (should-not (ebb-graphics-state-upload graphics))
+      (should-not (gethash 8 (ebb-graphics-state-images graphics))))))
+
+(ert-deftest ebb-test-io-pty-interrupt-recovers-without-dropping-text ()
+  "An interrupt resets a partial sequence after the queued prefix."
+  (with-temp-buffer
+    (let ((io (ebb-io-create-terminal (current-buffer) #'ignore)))
+      (setf (ebb-io-process io) 'fake)
+      (cl-letf (((symbol-function 'process-live-p) #'always)
+                ((symbol-function 'ebb-io--pty-process-p) #'always)
+                ((symbol-function 'process-send-string) #'ignore))
+        (ebb-io--enqueue-output io "kept\e]2;unfinished")
+        (ebb--send-input-key io "\C-c"))
+      (ebb-io--enqueue-output io " prompt")
+      (ebb-io--process-pending io t)
+      (should (equal "kept prompt" (ebb-test-display-line (ebb-io-screen io) 0))))))
+
+(ert-deftest ebb-test-io-output-gap-releases-sync-output ()
+  "A dropped DEC 2026 release does not keep future frames paused."
+  (with-temp-buffer
+    (let ((io (ebb-io-create-terminal (current-buffer) #'ignore))
+          (ebb-io-max-pending-bytes 24))
+      (dolist (chunk '("\e[?2026h" "0123456789012345" "\e[?2026l"))
+        (ebb-io--enqueue-output io chunk))
+      (ebb-io--process-pending io)
+      (should-not (ebb-screen-sync-output (ebb-io-screen io)))
+      (should-not (ebb-io-sync-timer io)))))
+
+(ert-deftest ebb-test-io-parser-error-cancels-kitty-upload ()
+  "Discarding a bad chunk also cancels graphics data carried across chunks."
+  (with-temp-buffer
+    (let* ((io (ebb-io-create-terminal (current-buffer)
+                                      (lambda (event &rest _)
+                                        (when (eq event 'bell) (error "Bad bell hook")))))
+           (graphics (ebb-screen-graphics (ebb-io-screen io))))
+      (dolist (chunk '("\e_Ga=t,f=24,s=1,v=1,i=8,m=1;AQI=\e\\" "\a"
+                       "\e_Gm=0;Aw==\e\\"))
+        (ebb-io--enqueue-output io chunk))
+      (ebb-io--process-pending io t)
+      (should (= 1 (ebb-io-processing-error-count io)))
+      (ebb-io--process-pending io t)
       (should-not (gethash 8 (ebb-graphics-state-images graphics))))))
 
 (ert-deftest ebb-test-io-normalize-pending-decrements-bytes ()

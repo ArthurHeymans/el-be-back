@@ -308,6 +308,12 @@ Options: `char', `semi-char', `emacs'."
                     (ebb--key-event key modifiers) ebb--screen)))
     (unless sequence
       (user-error "Unsupported key: %s" key))
+    (ebb--send-input-key io sequence)))
+
+(defun ebb--send-input-key (io sequence)
+  "Send translated terminal key SEQUENCE through IO."
+  (if (equal sequence "\C-c")
+      (ebb-io-send io sequence t)
     (ebb-io-send io sequence)))
 
 ;;;###autoload
@@ -345,7 +351,7 @@ N defaults to 1, E defaults to `last-command-event'."
     (let ((seq (ebb-input-translate (or e last-command-event) ebb--screen)))
       (when seq
         (dotimes (_ (or n 1))
-          (ebb-io-send ebb--io seq))))))
+          (ebb--send-input-key ebb--io seq))))))
 
 (defun ebb-quoted-input ()
   "Read the next key event literally and send it to the terminal."

@@ -31,7 +31,7 @@
   (buffer nil)            ; Emacs buffer
   (input-coding-system 'utf-8) ; encoding for multibyte input, or nil
   ;; Output queue
-  (pending-chunks nil)    ; output strings and :gap markers, oldest first
+  (pending-chunks nil)    ; strings and recovery markers, oldest first
   (pending-tail nil)      ; tail cons of pending-chunks for O(1) append
   (pending-offset 0)      ; parse position in the head chunk
   (pending-bytes 0)       ; bytes currently queued (upper bound)
@@ -152,11 +152,15 @@ queued prefix and marking the boundary.  Coalesce consecutive drops."
           (cl-incf (ebb-io-dropped-bytes io) size)
         (cl-incf (ebb-io-pending-bytes io) size))
       (unless (and drop (eq (car tail) :gap))
-        (let ((cell (list (if drop :gap output))))
-          (if tail
-              (setcdr tail cell)
-            (setf (ebb-io-pending-chunks io) cell))
-          (setf (ebb-io-pending-tail io) cell))))))
+        (ebb-io--append-queued io (if drop :gap output))))))
+
+(defun ebb-io--append-queued (io chunk)
+  "Append CHUNK or a recovery marker to IO's queue."
+  (let ((cell (list chunk)))
+    (if-let* ((tail (ebb-io-pending-tail io)))
+        (setcdr tail cell)
+      (setf (ebb-io-pending-chunks io) cell))
+    (setf (ebb-io-pending-tail io) cell)))
 
 (defun ebb-io--normalize-pending (io)
   "Drop fully consumed head chunks from IO's pending queue.
@@ -211,6 +215,14 @@ total uses `string-bytes'."
       (run-hook-with-args 'ebb-io-after-render-functions
                           (ebb-io-render io)))))
 
+(defun ebb-io--recover-stream (io)
+  "Reset state that cannot safely survive a discontinuity in IO's stream."
+  (let ((screen (ebb-io-screen io)))
+    (setf (ebb-graphics-state-upload (ebb-screen-graphics screen)) nil
+          (ebb-screen-sync-output screen) nil))
+  (ebb-io--cancel-sync-timer io)
+  (ebb-parse-cancel-sequence (ebb-io-parser io)))
+
 (defun ebb-io--process-pending (io &optional drain-all)
   "Process IO's pending output: parse chunks, then render.
 When DRAIN-ALL is non-nil, ignore chunk budgets."
@@ -232,16 +244,12 @@ When DRAIN-ALL is non-nil, ignore chunk budgets."
             (while (and (< total-parsed max-parsed)
                         (ebb-io--pending-p io))
               (let ((chunk (car (ebb-io-pending-chunks io))))
-                (if (eq chunk :gap)
+                (if (memq chunk '(:gap :interrupt))
                     (progn
                       (setf (ebb-io-pending-chunks io)
                             (cdr (ebb-io-pending-chunks io)))
                       (ebb-io--normalize-pending io)
-                      ;; A Kitty upload can span complete APCs, so the
-                      ;; parser may already be in ground state at the gap.
-                      (setf (ebb-graphics-state-upload
-                             (ebb-screen-graphics (ebb-io-screen io))) nil)
-                      (ebb-parse-cancel-sequence (ebb-io-parser io)))
+                      (ebb-io--recover-stream io))
                   (let* ((offset (ebb-io-pending-offset io))
                          (chunk-size (min (- (length chunk) offset) budget)))
                     (cl-incf (ebb-io-pending-offset io)
@@ -293,7 +301,7 @@ When DRAIN-ALL is non-nil, ignore chunk budgets."
        (setf (ebb-io-pending-offset io)
              (length (car (ebb-io-pending-chunks io))))
        (ebb-io--normalize-pending io)
-       (ebb-parse-cancel-sequence (ebb-io-parser io)))
+       (ebb-io--recover-stream io))
      (when (ebb-io--pending-p io)
        (ebb-io--schedule-processing io)))))
 
@@ -732,12 +740,19 @@ EVENT describes the transition."
 
 ;;;; ---- Send to Process ------------------------------------------------
 
-(defun ebb-io-send (io string)
+(defun ebb-io-send (io string &optional interrupt)
   "Send STRING to IO's terminal process.
 Multibyte text is encoded with `ebb-io-input-coding-system'.
-Unibyte strings are always sent unchanged."
+Unibyte strings are always sent unchanged.  When INTERRUPT is non-nil,
+a bare Ctrl-C on a PTY may stop a writer mid-sequence; recover at the
+output boundary without losing any queued text.  Raw writes, quoted
+keys, and non-PTY transports do not request that recovery."
   (when-let* ((proc (ebb-io-process io)))
     (when (process-live-p proc)
+      (when (and interrupt (equal string "\C-c") (ebb-io--pty-process-p proc)
+                 (not (memq (car (ebb-io-pending-tail io)) '(:gap :interrupt))))
+        (ebb-io--append-queued io :interrupt)
+        (unless (ebb-io-processing io) (ebb-io--schedule-processing io)))
       (let ((coding (ebb-io-input-coding-system io)))
         (process-send-string
          proc
