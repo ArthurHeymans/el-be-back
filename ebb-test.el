@@ -80,6 +80,7 @@ Binds `screen' and `parser' in BODY."
           (set-window-buffer window buffer)
           (dolist (resize '(ebb--window-size-change ebb-eshell--resize))
             (ebb-screen-resize screen 1 1)
+            (with-current-buffer buffer (setq ebb--window-fit nil))
             (funcall resize window)
             (should (= (window-max-chars-per-line window)
                        (ebb-screen-width screen)))
@@ -106,6 +107,75 @@ Binds `screen' and `parser' in BODY."
                          'fake (get-buffer-window-list buffer nil t))))
               (should (= (car size) (ebb-screen-width screen)))
               (should (= (cdr size) (ebb-screen-height screen)))))
+        (kill-buffer buffer)))))
+
+(ert-deftest ebb-test-window-buffer-change-refits-surviving-window ()
+  "The remaining window determines the new size when a split goes away."
+  (save-window-excursion
+    (let* ((large (selected-window))
+           (other-buffer (window-buffer large))
+           (small (split-window-below))
+           (buffer (generate-new-buffer " *ebb-refit-test*"))
+           (screen (ebb-screen-create 1 1)))
+      (unwind-protect
+          (progn
+            (set-window-buffer large buffer)
+            (set-window-buffer small buffer)
+            (with-current-buffer buffer
+              (setq-local ebb--io (make-ebb-io :screen screen :process 'fake)))
+            (cl-letf (((symbol-function 'process-live-p) #'ignore))
+              (ebb--refit-displayed-terminals (selected-frame))
+              (let ((old-height (ebb-screen-height screen)))
+                (set-window-buffer small other-buffer)
+                (ebb--refit-displayed-terminals (selected-frame))
+                (should (> (ebb-screen-height screen) old-height))
+                (should (= (ebb-screen-height screen)
+                           (cdr (window-adjust-process-window-size-smallest
+                                 'fake (list large))))))))
+        (kill-buffer buffer)))))
+
+(ert-deftest ebb-test-window-refit-preserves-program-size ()
+  "A buffer change elsewhere does not override an unchanged window fit."
+  (save-window-excursion
+    (with-temp-buffer
+      (let* ((window (selected-window))
+             (screen (ebb-screen-create 1 1))
+             (ebb--io (make-ebb-io :screen screen)))
+        (set-window-buffer window (current-buffer))
+        (ebb--window-size-change window)
+        (ebb-screen-resize screen 132 (ebb-screen-height screen))
+        (ebb--refit-displayed-terminals (selected-frame))
+        (should (= (ebb-screen-width screen) 132))))))
+
+(ert-deftest ebb-test-focus-reports-logical-transitions ()
+  "Two views share one focus state; selecting another buffer reports out."
+  (save-window-excursion
+    (let* ((first (selected-window))
+           (other-buffer (window-buffer first))
+           (second (split-window-below))
+           (buffer (generate-new-buffer " *ebb-focus-test*"))
+           reports)
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (setq-local ebb--io (make-ebb-io :process 'fake))
+              (setq-local ebb--screen (ebb-screen-create 5 5))
+              (setf (ebb-screen-focus-events ebb--screen) t))
+            (set-window-buffer first buffer)
+            (set-window-buffer second buffer)
+            (cl-letf (((symbol-function 'process-live-p) (lambda (process) (eq process 'fake)))
+                      ((symbol-function 'frame-focus-state) #'always)
+                      ((symbol-function 'ebb-io-send)
+                       (lambda (_io report) (push report reports))))
+              (with-current-buffer buffer (ebb--track-focus-mode))
+              (select-window second)
+              (ebb--focus-change)
+              (set-window-buffer second other-buffer)
+              (ebb--focus-change)
+              (select-window first)
+              (ebb--focus-change))
+            (should (equal (nreverse reports)
+                           (list (ebb-input-focus-out) (ebb-input-focus-in)))))
         (kill-buffer buffer)))))
 
 ;;;; ---- Screen Model Tests ---------------------------------------------
