@@ -4239,8 +4239,8 @@ length cannot grow), which broke erase-display for such frames."
     (should (equal (encode-coding-string "λ" 'utf-8 t) (car sent)))
     (should (equal (unibyte-string 0 255 ?x) (cadr sent)))))
 
-(ert-deftest ebb-test-io-interrupt-discards-stale-output ()
-  "C-c clears queued output and incomplete parser state before sending."
+(ert-deftest ebb-test-io-interrupt-preserves-output ()
+  "C-c is outbound input and leaves the inbound stream alone."
   (let* ((screen (ebb-screen-create 10 3))
          (parser (ebb-parse-create screen))
          (chunks (list "stale output"))
@@ -4259,13 +4259,12 @@ length cannot grow), which broke erase-display for such frames."
                (lambda (_process string) (setq sent string))))
       (ebb-io-send io "\C-c"))
     (should (equal "\C-c" sent))
-    (should-not (ebb-io-pending-chunks io))
-    (should-not (ebb-io-pending-tail io))
-    (should (zerop (ebb-io-pending-offset io)))
-    (should-not (ebb-io-first-chunk-time io))
-    (should (eq :ground (ebb-parser-state parser)))
-    (should-not (ebb-parser-osc-parts parser))
-    (should (zerop (ebb-parser-osc-length parser)))))
+    (should (eq chunks (ebb-io-pending-chunks io)))
+    (should (eq chunks (ebb-io-pending-tail io)))
+    (should (= 4 (ebb-io-pending-offset io)))
+    (should (ebb-io-first-chunk-time io))
+    (should (eq :osc-string (ebb-parser-state parser)))
+    (should (= 7 (ebb-parser-osc-length parser)))))
 
 (ert-deftest ebb-test-io-process-uses-binary-writes ()
   "PTY output is decoded as UTF-8 while input remains byte-preserving."
@@ -6388,6 +6387,18 @@ cell is 9x18 unless overridden."
     (should (= 6 (ebb-io-dropped-bytes io)))
     (ebb-io--enqueue-output io "\u00e9")
     (should (= 2 (ebb-io-pending-bytes io)))))
+
+(ert-deftest ebb-test-io-resumes-after-output-gap ()
+  "A skipped chunk cannot join a partial control sequence to later text."
+  (with-temp-buffer
+    (let ((io (ebb-io-create-terminal (current-buffer) #'ignore))
+          (ebb-io-max-pending-bytes 11))
+      (dolist (chunk '("abc\e[" "31m0123456789" "32m0123456789" "Hello"))
+        (ebb-io--enqueue-output io chunk))
+      (should (equal '("abc\e[" :gap "Hello") (ebb-io-pending-chunks io)))
+      (ebb-io--process-pending io t)
+      (should (equal "abcHello" (ebb-test-display-line (ebb-io-screen io) 0)))
+      (should (zerop (ebb-io-pending-bytes io))))))
 
 (ert-deftest ebb-test-io-normalize-pending-decrements-bytes ()
   "Dropping a consumed multibyte chunk decrements the byte total."
