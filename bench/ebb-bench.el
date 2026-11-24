@@ -30,15 +30,28 @@
 Each line is \"NAME<TAB>ms-per-iter<TAB>MiB/s\"; bench/compare.py
 consumes this format.")
 
+(defun ebb-bench--to-pty-string (s)
+  "Return S decoded as `utf-8-unix', matching Emacs PTY filter output."
+  (decode-coding-string (encode-coding-string s 'utf-8-unix) 'utf-8-unix))
+
+(defun ebb-bench--repeat-to-size (chunk size)
+  "Repeat CHUNK until at least SIZE bytes, then truncate cleanly."
+  (let ((parts nil)
+        (total 0)
+        (chunk-bytes (string-bytes chunk)))
+    (while (< total size)
+      (push chunk parts)
+      (cl-incf total chunk-bytes))
+    (let* ((joined (apply #'concat (nreverse parts)))
+           (limit (min (length joined) size)))
+      (ebb-bench--to-pty-string
+       (if (= (length joined) (string-bytes joined))
+           (substring joined 0 limit)
+         joined)))))
+
 (defun ebb-bench--plain (size)
   "Return about SIZE bytes of plain terminal output."
-  (let ((line (concat (make-string 78 ?A) "\r\n"))
-        (parts nil)
-        (total 0))
-    (while (< total size)
-      (push line parts)
-      (cl-incf total (length line)))
-    (substring (apply #'concat (nreverse parts)) 0 size)))
+  (ebb-bench--repeat-to-size (concat (make-string 78 ?A) "\r\n") size))
 
 (defun ebb-bench--sgr (size)
   "Return about SIZE bytes of colored terminal output."
@@ -48,7 +61,8 @@ consumes this format.")
         (push part parts)
         (cl-incf total (length part))
         (setq color (mod (1+ color) 256))))
-    (substring (apply #'concat (nreverse parts)) 0 size)))
+    (ebb-bench--to-pty-string
+     (substring (apply #'concat (nreverse parts)) 0 size))))
 
 (defun ebb-bench--tui (size)
   "Return a repeated TUI-like full-screen update stream."
@@ -60,12 +74,8 @@ consumes this format.")
                                   (make-string ebb-bench-cols
                                                (if (cl-evenp row) ?- ?=))))
                         (number-sequence 1 ebb-bench-rows) "")
-                       "\e[0m"))
-        (parts nil) (total 0))
-    (while (< total size)
-      (push frame parts)
-      (cl-incf total (length frame)))
-    (substring (apply #'concat (nreverse parts)) 0 size)))
+                       "\e[0m")))
+    (ebb-bench--repeat-to-size frame size)))
 
 (defun ebb-bench--checker (size)
   "Return a repeated full-screen stream with per-cell attributes.
@@ -82,12 +92,38 @@ rows of the tui case."
                                             "\e[31ma" "\e[34ma"))
                                       (number-sequence 1 ebb-bench-cols) "")
                            "\e[0m\r\n"))
-                        (number-sequence 1 ebb-bench-rows) "")))
-        (parts nil) (total 0))
-    (while (< total size)
-      (push frame parts)
-      (cl-incf total (length frame)))
-    (substring (apply #'concat (nreverse parts)) 0 size)))
+                        (number-sequence 1 ebb-bench-rows) ""))))
+    (ebb-bench--repeat-to-size frame size)))
+
+(defun ebb-bench--gcc-utf8 (size)
+  "Return compiler-like diagnostic output with curly quotes on each line."
+  (ebb-bench--repeat-to-size
+   "src/foo.c:42:9: warning: unused variable \u2018counter\u2019 [-Wunused-variable]\r\n"
+   size))
+
+(defun ebb-bench--box-utf8 (size)
+  "Return TUI-like rows framed with UTF-8 box-drawing glyphs."
+  (let* ((inner (make-string (max 1 (- ebb-bench-cols 4)) ?-))
+         (row (format "\u2502 %s \u2502\r\n" inner)))
+    (ebb-bench--repeat-to-size row size)))
+
+(defun ebb-bench--colorlog (size)
+  "Return colored log output with timestamps, levels, paths, and URLs."
+  (ebb-bench--repeat-to-size
+   "\e[90m2026-04-12 10:00:01\e[0m \e[32mINFO\e[0m src/foo/bar.c:42 rate=12.4 MiB/s https://example.com/a\r\n"
+   size))
+
+(defun ebb-bench--alt-tui (size)
+  "Return an alt-screen TUI stream using EL (\\e[K), SGR, and DECTCEM."
+  (let ((frame (concat "\e[?25l\e[H"
+                       (mapconcat
+                        (lambda (row)
+                          (format "\e[%d;1H\e[%dm row %02d status: ok\e[0m\e[K"
+                                  row (if (cl-evenp row) 36 33) row))
+                        (number-sequence 1 ebb-bench-rows) "")
+                       "\e[?25h")))
+    (concat (ebb-bench--to-pty-string "\e[?1049h")
+            (ebb-bench--repeat-to-size frame size))))
 
 (defun ebb-bench--ebb (data)
   "Process DATA through Ebb's parser and renderer."
@@ -96,6 +132,24 @@ rows of the tui case."
            (render (ebb-render-create screen (current-buffer)))
            (parser (ebb-parse-create screen)))
       (ebb-parse-bytes parser data)
+      (ebb-render-refresh render))))
+
+(defun ebb-bench--ebb-chunked (data)
+  "Process DATA in 4 KiB slices with a render every 16 KiB."
+  (with-temp-buffer
+    (let* ((screen (ebb-screen-create ebb-bench-cols ebb-bench-rows))
+           (render (ebb-render-create screen (current-buffer)))
+           (parser (ebb-parse-create screen))
+           (len (length data))
+           (pos 0)
+           (chunks 0))
+      (while (< pos len)
+        (let ((end (min len (+ pos 4096))))
+          (ebb-parse-bytes parser data pos end)
+          (setq pos end)
+          (cl-incf chunks)
+          (when (= (mod chunks 4) 0)
+            (ebb-render-refresh render))))
       (ebb-render-refresh render))))
 
 (defun ebb-bench--eat (data)
@@ -138,8 +192,8 @@ result -- important when CI compares two runs on the same machine."
     (setq times (sort times #'<))
     (let* ((elapsed (nth (/ (length times) 2) times))
            (per (* 1000.0 elapsed))
-           (mbs (/ (length data) elapsed 1048576.0)))
-      (message "%-18s %8.2f ms/iter %8.2f MiB/s" name per mbs)
+           (mbs (/ (string-bytes data) elapsed 1048576.0)))
+      (message "%-22s %8.2f ms/iter %8.2f MiB/s" name per mbs)
       (when ebb-bench-output-file
         (write-region (format "%s\t%.3f\t%.3f\n" name per mbs) nil
                       ebb-bench-output-file t))
@@ -166,7 +220,11 @@ pull request and its base.  Otherwise run the full comparison."
     (dolist (case '(("plain" . ebb-bench--plain)
                     ("sgr" . ebb-bench--sgr)
                     ("tui" . ebb-bench--tui)
-                    ("checker" . ebb-bench--checker)))
+                    ("checker" . ebb-bench--checker)
+                    ("gcc-utf8" . ebb-bench--gcc-utf8)
+                    ("box-utf8" . ebb-bench--box-utf8)
+                    ("colorlog" . ebb-bench--colorlog)
+                    ("alt-tui" . ebb-bench--alt-tui)))
       (let ((data (funcall (cdr case) ebb-bench-size)))
         (message "\n[%s]" (car case))
         (ebb-bench--measure (concat "ebb/" (car case)) data #'ebb-bench--ebb)
@@ -175,6 +233,9 @@ pull request and its base.  Otherwise run the full comparison."
           (when ghostel-available
             (ebb-bench--measure (concat "ghostel/" (car case)) data
                                 #'ebb-bench--ghostel)))))
+    (let ((data (ebb-bench--plain ebb-bench-size)))
+      (message "\n[plain-chunked]")
+      (ebb-bench--measure "ebb/plain-chunked" data #'ebb-bench--ebb-chunked))
     (message "Done.")))
 
 (provide 'ebb-bench)
