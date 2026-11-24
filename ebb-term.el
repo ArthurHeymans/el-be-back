@@ -318,6 +318,28 @@ ENABLED non-nil enables protection; nil removes it."
         (aset bits column t)))
     bits))
 
+(defun ebb--line-initialized-text (line text width &optional text-end)
+  "Return LINE's WIDTH initialization bits, refreshing them from lazy TEXT.
+TEXT-END, when non-nil, bounds the scan to the written prefix."
+  (let ((bits (ebb--line-initialized-bits line width))
+        (limit (min width (length text) (or text-end width)))
+        (i 0))
+    (while (< i limit)
+      (unless (= (aref text i) ?\s)
+        (aset bits i t))
+      (cl-incf i))
+    bits))
+
+(defun ebb--remap-bool-vector (bits source-map width)
+  "Remap bool-vector BITS to WIDTH using SOURCE-MAP cell index mapping."
+  (let ((result (make-bool-vector width nil))
+        (old-len (length bits)))
+    (dotimes (col width)
+      (when-let* ((src (aref source-map col)))
+        (when (< src old-len)
+          (aset result col (aref bits src)))))
+    result))
+
 (defsubst ebb--line-index (screen row)
   "Return physical line-vector index for logical ROW on SCREEN."
   (% (+ (ebb-screen-line-start screen) row)
@@ -1929,9 +1951,13 @@ combining, ZWJ-joined, raw-byte, non-ASCII-charset, or insert-mode cases."
                     (cl-incf j))
                   j)))
           (cond
-           ;; Text-first hot path: stays lazy for both pure ASCII and
-           ;; width-1 non-combining Unicode segments.
-           ((and line-text (= seg-end limit) (> seg-end i))
+           ;; Text-first hot path: stays lazy for pure ASCII (in-place aset)
+           ;; and for whole-row or longer width-1 Unicode segments; short
+           ;; partial non-ASCII writes materialize once to avoid O(W^2) copies.
+           ((and line-text (= seg-end limit) (> seg-end i)
+                 (or (not (or has-non-ascii (multibyte-string-p line-text)))
+                     (>= (- limit i) 4)
+                     (and (zerop cx) (= (- limit i) (length line-text)))))
             (let ((dst (+ cx (- limit i))))
               (if (or has-non-ascii (multibyte-string-p line-text))
                   (let* ((seg (substring string i limit))
@@ -2010,7 +2036,7 @@ combining, ZWJ-joined, raw-byte, non-ASCII-charset, or insert-mode cases."
     (and text
          (= (length text) width)
          (not (ebb-line-wrapped line))
-         (null (ebb-line-rendition line))
+         (eq (ebb-line-rendition line) 'normal)
          (null (ebb-line-initialized line))
          (null (ebb-line-dec-protected line))
          (null (ebb-line-iso-protected line))
@@ -2672,7 +2698,7 @@ line is in lazy text form or materialized cells."
           (0 ;; cursor to end
            (let* ((text-end (ebb-line-text-end line))
                   (limit (min width (or text-end width)))
-                  (initialized (ebb--line-initialized-bits line width))
+                  (initialized (ebb--line-initialized-text line text width text-end))
                   (i cx))
              (ebb--erase-text-range line text cx limit)
              (while (< i width)
@@ -2687,7 +2713,7 @@ line is in lazy text form or materialized cells."
            (let* ((end (min (1+ cx) width))
                   (text-end (ebb-line-text-end line))
                   (limit (min end (or text-end width)))
-                  (initialized (ebb--line-initialized-bits line width))
+                  (initialized (ebb--line-initialized-text line text width text-end))
                   (i 0))
              (ebb--erase-text-range line text 0 limit)
              (while (< i end)
@@ -2799,7 +2825,7 @@ line is in lazy text form or materialized cells."
              (null (ebb-line-uniform-attr line)))
         (let* ((text-end (ebb-line-text-end line))
                (limit (min end (or text-end width)))
-               (initialized (ebb--line-initialized-bits line width))
+               (initialized (ebb--line-initialized-text line text width text-end))
                (i cx))
           (ebb--erase-text-range line text cx limit)
           (while (< i end)
@@ -3599,10 +3625,13 @@ NEW-HEIGHT specify the replacement grid."
             (if (< row (length old-lines))
                 (let* ((line (aref old-lines row))
                        (cells (ebb--line-ensure-cells line old-width))
-                       (normalized
-                        (car (ebb--normalize-cells-for-width cells new-width))))
+                       (dec (ebb-line-dec-protected line))
+                       (iso (ebb-line-iso-protected line))
+                       (init (ebb-line-initialized line))
+                       (dest-map (when (or dec iso init)
+                                   (make-vector new-width nil))))
                   (setf (ebb-line-cells line)
-                        (ebb--fit-cells-to-width normalized new-width)
+                        (ebb--fit-cells-to-width cells new-width dest-map)
                         (ebb-line-cells-valid line) t
                         (ebb-line-text line) nil
                         (ebb-line-text-end line) nil
@@ -3611,18 +3640,15 @@ NEW-HEIGHT specify the replacement grid."
                         (ebb-line-uniform-attr line) nil
                         (ebb-line-rendered line) nil
                         (ebb-line-dirty line) t)
-                  (when (ebb-line-dec-protected line)
+                  (when dec
                     (setf (ebb-line-dec-protected line)
-                          (ebb--resize-bool-vector
-                           (ebb-line-dec-protected line) new-width)))
-                  (when (ebb-line-iso-protected line)
+                          (ebb--remap-bool-vector dec dest-map new-width)))
+                  (when iso
                     (setf (ebb-line-iso-protected line)
-                          (ebb--resize-bool-vector
-                           (ebb-line-iso-protected line) new-width)))
-                  (when (ebb-line-initialized line)
+                          (ebb--remap-bool-vector iso dest-map new-width)))
+                  (when init
                     (setf (ebb-line-initialized line)
-                          (ebb--resize-bool-vector
-                           (ebb-line-initialized line) new-width)))
+                          (ebb--remap-bool-vector init dest-map new-width)))
                   line)
               (ebb--make-empty-line new-width))))
     (setf (ebb-screen-lines screen) lines
@@ -3986,8 +4012,10 @@ WIDTH is the column count."
                     (max 1 (ebb-cell-width (aref cells offset)))))
       end)))
 
-(defun ebb--fit-cells-to-width (cells target-width)
-  "Fit CELLS into TARGET-WIDTH without splitting an oversized glyph."
+(defun ebb--fit-cells-to-width (cells target-width &optional dest-map)
+  "Fit CELLS into TARGET-WIDTH without splitting an oversized glyph.
+When DEST-MAP is non-nil (a vector of length TARGET-WIDTH), record the
+source index in CELLS for each populated destination column."
   (let ((result (ebb--make-empty-cells target-width))
         (source 0)
         (column 0)
@@ -4005,15 +4033,19 @@ WIDTH is the column count."
                   (ebb-cell-width replacement) 1
                   (ebb-cell-combining replacement) nil)
             (aset result column replacement))
+          (when dest-map (aset dest-map column source))
           (cl-incf column)
           (cl-incf source (max 1 cell-width)))
          (t
           (let ((part 0))
             (while (< part cell-width)
-              (aset result (+ column part)
-                    (if (< (+ source part) length)
-                        (aref cells (+ source part))
-                      (make-ebb-cell :width 0)))
+              (let ((src (+ source part)))
+                (aset result (+ column part)
+                      (if (< src length)
+                          (aref cells src)
+                        (make-ebb-cell :width 0)))
+                (when (and dest-map (< src length))
+                  (aset dest-map (+ column part) src)))
               (cl-incf part)))
           (cl-incf source cell-width)
           (cl-incf column cell-width)))))

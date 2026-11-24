@@ -1987,25 +1987,31 @@ wrapped logical line in half and lose its first half."
 
 (ert-deftest ebb-test-deferred-links-use-rendered-cursor-and-directory ()
   "Timers scan widened ranges with the working directory at repaint time."
-  (with-temp-buffer
-    (let ((directory (file-name-directory (locate-library "ebb"))))
-      (setq default-directory directory)
-      (ebb-mode)
-      (let* ((screen (ebb-screen-create 60 4))
-             (parser (ebb-parse-create screen))
-             (render (ebb-render-create screen (current-buffer))))
-        (setq ebb--screen screen ebb--render render)
-        (cl-letf (((symbol-function 'ebb--schedule-link-scan) #'ignore))
-          (ebb-parse-bytes parser "./ebb.el:42\r\n")
-          (ebb-render-refresh render)
-          ;; Parsed model may run ahead of the displayed frame (DEC 2026).
-          (ebb-parse-bytes parser "\e[?2026h\e[H")
-          (setq default-directory temporary-file-directory)
-          (save-restriction
-            (narrow-to-region (line-beginning-position 2) (point-max))
-            (ebb--scan-pending-links (current-buffer)))
-          (should (equal (get-text-property (point-min) 'help-echo)
-                         (concat "fileref:" directory "ebb.el:42"))))))))
+  (let* ((directory (file-name-as-directory
+                     (make-temp-file "ebb-link-dir-" t)))
+         (target (expand-file-name "target.el" directory)))
+    (unwind-protect
+        (progn
+          (write-region "" nil target nil 'silent)
+          (with-temp-buffer
+            (setq default-directory directory)
+            (ebb-mode)
+            (let* ((screen (ebb-screen-create 60 4))
+                   (parser (ebb-parse-create screen))
+                   (render (ebb-render-create screen (current-buffer))))
+              (setq ebb--screen screen ebb--render render)
+              (cl-letf (((symbol-function 'ebb--schedule-link-scan) #'ignore))
+                (ebb-parse-bytes parser "./target.el:42\r\n")
+                (ebb-render-refresh render)
+                ;; Parsed model may run ahead of the displayed frame (DEC 2026).
+                (ebb-parse-bytes parser "\e[?2026h\e[H")
+                (setq default-directory temporary-file-directory)
+                (save-restriction
+                  (narrow-to-region (line-beginning-position 2) (point-max))
+                  (ebb--scan-pending-links (current-buffer)))
+                (should (equal (get-text-property (point-min) 'help-echo)
+                               (concat "fileref:" target ":42")))))))
+      (delete-directory directory t))))
 
 (ert-deftest ebb-test-history-slab-reuses-overlap-and-keeps-cursor-row ()
   "Changing the history slab repaints only new rows and keeps the live cursor."
@@ -7015,12 +7021,19 @@ cell is 9x18 unless overridden."
 (ert-deftest ebb-test-cup-clamping-matches-split-and-complete ()
   "Complete and split CUP sequences share the same 16384 numeric clamp."
   (let ((s1 (ebb-screen-create 100 4))
-        (s2 (ebb-screen-create 100 4)))
+        (s2 (ebb-screen-create 100 4))
+        (orig (symbol-function 'ebb-screen-cursor-goto))
+        calls)
     (let ((p1 (ebb-parse-create s1))
           (p2 (ebb-parse-create s2)))
-      (ebb-parse-bytes p1 "\e[1;17000H")
-      (ebb-parse-bytes p2 "\e[1;170")
-      (ebb-parse-bytes p2 "00H")
+      (cl-letf (((symbol-function 'ebb-screen-cursor-goto)
+                 (lambda (screen row col)
+                   (push (list row col) calls)
+                   (funcall orig screen row col))))
+        (ebb-parse-bytes p1 "\e[1;17000H")
+        (ebb-parse-bytes p2 "\e[1;170")
+        (ebb-parse-bytes p2 "00H"))
+      (should (equal (nreverse calls) '((0 16383) (0 16383))))
       (should (equal (ebb-test-cursor s1) (ebb-test-cursor s2)))
       (should (equal (ebb-parse--cup-coords "1;17000" 0 7) '(1 . 16384))))))
 
@@ -7031,6 +7044,80 @@ cell is 9x18 unless overridden."
     (ebb-screen-resize screen 20 4)
     (ebb-test-output parser "\e[1;5HXYZ\e[1;1H\e[?2J")
     (should (equal "ABC" (ebb-test-display-line screen 0)))))
+
+(ert-deftest ebb-test-osc7-uppercase-scheme ()
+  "OSC 7 decodes uppercase and lowercase file:// schemes identically."
+  (ebb-test-with-screen (:width 40 :height 4)
+    (ebb-parse-bytes parser "\e]7;FILE://localhost/tmp\e\\")
+    (should (equal "/tmp" (ebb-screen-cwd screen)))
+    (ebb-parse-bytes parser "\e]7;file://localhost/var\e\\")
+    (should (equal "/var" (ebb-screen-cwd screen)))))
+
+(ert-deftest ebb-test-fast-el-error-recovery-keeps-suffix ()
+  "A signaling EL on the fast CSI path advances past K and keeps parsing."
+  (ebb-test-with-screen (:width 20 :height 4)
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'ebb-screen-erase-in-line)
+                 (lambda (&rest _)
+                   (cl-incf calls)
+                   (error "boom"))))
+        (ebb-parse-bytes parser "A\e[0KB"))
+      (should (= calls 1))
+      (should (equal "AB" (ebb-test-display-line screen 0))))))
+
+(ert-deftest ebb-test-reentrant-csi-preserves-outer-params ()
+  "Reentrant CSI parsing inside a mode callback does not clobber outer params."
+  (let* ((screen (ebb-screen-create 20 4))
+         (nested nil)
+         parser)
+    (setq parser
+          (ebb-parse-create
+           screen nil
+           (lambda (type mode _val)
+             (when (and (eq type 'mode-set) (= mode 1006) (not nested))
+               (setq nested t)
+               (ebb-parse-bytes parser "\e[?1;7h")))))
+    (ebb-parse-bytes parser "\e[?1006;1049h")
+    (should (ebb-screen-alt-screen screen))
+    (should (ebb-screen-mouse-sgr screen))))
+
+(ert-deftest ebb-test-lazy-erase-preserves-outside-initialized-bits ()
+  "Partial lazy EL/ECH preserves initialized bits for untouched non-space columns."
+  (dolist (seq '("ABC\e[1;1H\e[1K\e[1;2H "
+                 "ABC\e[1;1H\e[1X\e[1;2H "
+                 "ABC\e[1;3H\e[0K\e[1;2H "))
+    (let ((batched (ebb-screen-create 10 4))
+          (forced (ebb-screen-create 10 4)))
+      ;; Materialize cells up front on FORCED so it takes the cell erase path.
+      (ebb--line-ensure-cells (ebb--line-at forced 0) 10)
+      (setf (ebb-line-text (ebb--line-at forced 0)) nil)
+      (ebb-parse-bytes (ebb-parse-create batched) seq)
+      (ebb-parse-bytes (ebb-parse-create forced) seq)
+      (should (= (ebb-screen-checksum-rect batched 0 0 0 9)
+                 (ebb-screen-checksum-rect forced 0 0 0 9))))))
+
+(ert-deftest ebb-test-alt-resize-remaps-metadata-past-orphan-continuation ()
+  "Alt-screen resize shifts initialized/protection bits when dropping an orphan continuation."
+  (ebb-test-with-screen (:width 4 :height 4)
+    (ebb-test-output parser "\e[?1049h界")
+    ;; Delete lead cell of wide glyph, leaving an orphan continuation at col 0.
+    (ebb-test-output parser "\e[1;1H\e[1P")
+    ;; Erase col 1 so col 1 is initialized, then widen to 5 columns.
+    (ebb-test-output parser "\e[1;2H\e[1X")
+    (ebb-screen-resize screen 5 4)
+    (let ((init (ebb-line-initialized (ebb--line-at screen 0))))
+      (should (aref init 0))
+      (should-not (aref init 1)))))
+
+(ert-deftest ebb-test-bulk-crlf-accepts-fresh-normal-rows ()
+  "Fresh rows with normal rendition qualify for the bulk CRLF path."
+  (ebb-test-with-screen (:width 20 :height 6)
+    (let ((payload "alpha\r\nbeta\r\ngamma\r\n"))
+      (should (= (length payload)
+                 (ebb-screen-write-crlf-block screen payload 0 (length payload))))
+      (should (equal "alpha" (ebb-test-display-line screen 0)))
+      (should (equal "beta" (ebb-test-display-line screen 1)))
+      (should (equal "gamma" (ebb-test-display-line screen 2))))))
 
 (ert-deftest ebb-test-io-time-budget-drains-and-guards ()
   "Deterministic IO draining respects time budget, input, sync, drain-all, and dead buffers."

@@ -288,8 +288,7 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
             (ebb-parse-bytes parser slice 0 (length slice)))
           (- e start))
       (let ((i start)
-            (screen (ebb-parser-screen parser))
-            (case-fold-search nil))
+            (screen (ebb-parser-screen parser)))
         (while (< i e)
       (let ((ch (aref string i)))
         ;; Emacs preserves malformed decoded bytes as internal eight-bit
@@ -355,9 +354,10 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
                       (progn
                         (setq pure-ascii nil)
                         (if multibyte
-                            (let ((mstop (string-match-p
-                                          ebb-parse--non-printable-multibyte-regexp
-                                          string (1+ run-start))))
+                            (let* ((case-fold-search nil)
+                                   (mstop (string-match-p
+                                           ebb-parse--non-printable-multibyte-regexp
+                                           string (1+ run-start))))
                               (setq i (if (and mstop (< mstop e)) mstop e)))
                           (while (and (< i e)
                                       (let ((c (aref string i)))
@@ -365,18 +365,20 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
                                              (/= c ?\x7f)
                                              (not (and (>= c #x80) (<= c #x9f))))))
                             (cl-incf i))))
-                    (let ((stop (string-match-p
-                                 ebb-parse--non-ascii-printable-regexp
-                                 string run-start)))
+                    (let* ((case-fold-search nil)
+                           (stop (string-match-p
+                                  ebb-parse--non-ascii-printable-regexp
+                                  string run-start)))
                       (setq i (if (and stop (< stop e)) stop e)))
                     (when (and multibyte
                                (< i e)
                                (let ((c (aref string i)))
                                  (and (>= c #xa0) (< c #x3fff80))))
                       (setq pure-ascii nil)
-                      (let ((mstop (string-match-p
-                                    ebb-parse--non-printable-multibyte-regexp
-                                    string (1+ i))))
+                      (let* ((case-fold-search nil)
+                             (mstop (string-match-p
+                                     ebb-parse--non-printable-multibyte-regexp
+                                     string (1+ i))))
                         (setq i (if (and mstop (< mstop e)) mstop e)))))
                   (let ((crlf (and (< (1+ i) e)
                                    (= (aref string i) ?\r)
@@ -403,6 +405,7 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
                        (>= ch ?\s) (< ch ?\x7f))
                   (let* ((run-start i)
                          (string-state (ebb-parser-state parser))
+                         (case-fold-search nil)
                          (stop (string-match-p
                                 ebb-parse--non-ascii-printable-regexp
                                 string run-start)))
@@ -523,30 +526,42 @@ than 16 parameters."
           (1+ j))
          ;; Hot-path EL (no private marker).
          ((and (= final ?K) (null private))
-          (ebb-screen-erase-in-line screen
-                                    (if (> count 0) (aref scratch 0) 0))
+          (condition-case err
+              (ebb-screen-erase-in-line screen
+                                        (if (> count 0) (aref scratch 0) 0))
+            (error
+             (ebb-parse--log "CSI dispatch error for K: %S" err)))
           (1+ j))
          ;; Hot-path ED (no private marker).
          ((and (= final ?J) (null private))
-          (ebb-screen-erase-in-display screen
-                                       (if (> count 0) (aref scratch 0) 0))
+          (condition-case err
+              (ebb-screen-erase-in-display screen
+                                           (if (> count 0) (aref scratch 0) 0))
+            (error
+             (ebb-parse--log "CSI dispatch error for J: %S" err)))
           (1+ j))
          ;; Unified zero-allocation dispatch for all other CSI sequences.
          (t
           (let ((handler (aref ebb-parse--csi-dispatch final)))
             (unless (and ebb-parse-debug (eq handler #'ebb-parse--csi-unknown))
-              (let ((vec (aref (ebb-parser-csi-param-pool parser) count))
-                    (k 0))
-                (while (< k count)
-                  (aset vec k (aref scratch k))
-                  (cl-incf k))
-                (setf (ebb-parser-private parser) private
-                      (ebb-parser-intermediates parser) "")
-                (condition-case err
-                    (funcall handler parser vec)
-                  (error
-                   (ebb-parse--log "CSI dispatch error for %c: %S" final err)))
-                (setf (ebb-parser-private parser) nil))
+              (let* ((pool (ebb-parser-csi-param-pool parser))
+                     (pooled (aref pool count))
+                     (vec (or pooled (make-vector count 0)))
+                     (k 0))
+                (when pooled (aset pool count nil))
+                (unwind-protect
+                    (progn
+                      (while (< k count)
+                        (aset vec k (aref scratch k))
+                        (cl-incf k))
+                      (setf (ebb-parser-private parser) private
+                            (ebb-parser-intermediates parser) "")
+                      (condition-case err
+                          (funcall handler parser vec)
+                        (error
+                         (ebb-parse--log "CSI dispatch error for %c: %S" final err)))
+                      (setf (ebb-parser-private parser) nil))
+                  (when pooled (aset pool count vec))))
               (1+ j)))))))))
 
 ;;;; ---- Main Dispatch --------------------------------------------------
