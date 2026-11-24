@@ -21,6 +21,8 @@
 
 ;;;; ---- Data Structure -------------------------------------------------
 
+(cl-declaim (optimize (safety 0)))
+
 (cl-defstruct (ebb-io (:copier nil))
   "Async I/O state for a ebb terminal."
   (process nil)           ; the PTY process
@@ -39,7 +41,7 @@
   (drop-reported nil)     ; non-nil after the drop warning was emitted
   ;; Processing state
   (processing nil)        ; non-nil when parse loop is active
-  (chunk-size 4096)       ; bytes per parse chunk
+  (chunk-size 16384)      ; chars per parse chunk before re-checking budget
   ;; Latency management
   (min-latency 0.008)     ; seconds: min delay before render
   (max-latency 0.033)     ; seconds: max delay (~30fps)
@@ -52,6 +54,8 @@
   ;; Error reporting
   (last-processing-error nil)
   (processing-error-count 0))
+
+(cl-declaim (optimize (safety 1)))
 
 (defvar ebb-io-after-render-functions nil
   "Functions called after terminal output has been rendered.
@@ -68,9 +72,16 @@ Each function receives IO, the error value, and its consecutive count.")
   :type 'natnum
   :group 'ebb)
 
-(defcustom ebb-chunk-size 4096
-  "Number of bytes to parse per chunk before yielding to the event loop."
+(defcustom ebb-chunk-size 16384
+  "Number of characters to parse per chunk before checking time/input budget."
   :type 'integer
+  :group 'ebb)
+
+(defcustom ebb-io-parse-time-budget 0.012
+  "Maximum wall-clock seconds to spend parsing queued output per slice.
+Draining yields early after at least one chunk if user input arrives
+\(`input-pending-p'), keeping typing responsive during bulk output."
+  :type 'number
   :group 'ebb)
 
 (defcustom ebb-io-max-pending-bytes (* 16 1024 1024)
@@ -186,14 +197,19 @@ total uses `string-bytes'."
 
 ;;;; ---- Chunked Processing ---------------------------------------------
 
-(defun ebb-io--schedule-processing (io)
-  "Schedule IO's next parse+render cycle."
-  (let* ((now (float-time))
-         (first (ebb-io-first-chunk-time io))
-         (elapsed (if first (- now first) 0))
-         (time-left (- (ebb-io-max-latency io) elapsed))
-         (delay (if (<= time-left 0) 0
-                  (min time-left (ebb-io-min-latency io)))))
+(defun ebb-io--schedule-processing (io &optional immediate)
+  "Schedule IO's next parse+render cycle.
+When IMMEDIATE is non-nil, yield once to the event loop (delay 0)
+instead of waiting for `min-latency'."
+  (let* ((delay
+          (if immediate
+              0
+            (let* ((now (float-time))
+                   (first (ebb-io-first-chunk-time io))
+                   (elapsed (if first (- now first) 0))
+                   (time-left (- (ebb-io-max-latency io) elapsed)))
+              (if (<= time-left 0) 0
+                (min time-left (ebb-io-min-latency io)))))))
     ;; Cancel existing timer
     (when (ebb-io-render-timer io)
       (cancel-timer (ebb-io-render-timer io)))
@@ -226,85 +242,111 @@ total uses `string-bytes'."
 
 (defun ebb-io--process-pending (io &optional drain-all)
   "Process IO's pending output: parse chunks, then render.
-When DRAIN-ALL is non-nil, ignore chunk budgets."
+When DRAIN-ALL is non-nil, ignore time and input budgets."
   (setf (ebb-io-processing io) t)
   (when (ebb-io-render-timer io)
     (cancel-timer (ebb-io-render-timer io)))
   (setf (ebb-io-render-timer io) nil)
-  (condition-case err
-      (when (buffer-live-p (ebb-io-buffer io))
-        (with-current-buffer (ebb-io-buffer io)
-          (let ((budget (ebb-io-chunk-size io))
-                (total-parsed 0)
-                (max-parsed (if drain-all most-positive-fixnum
-                              (* (ebb-io-chunk-size io) 4)))
-                ;; Bound helper subprocesses spawned by untrusted graphics.
-                (ebb-graphics--subprocess-budget
-                 ebb-kitty-graphics-subprocess-budget))
-            ;; Parse in chunks up to budget
-            (while (and (< total-parsed max-parsed)
-                        (ebb-io--pending-p io))
-              (let ((chunk (car (ebb-io-pending-chunks io))))
-                (if (memq chunk '(:gap :interrupt))
-                    (progn
-                      (setf (ebb-io-pending-chunks io)
-                            (cdr (ebb-io-pending-chunks io)))
-                      (ebb-io--normalize-pending io)
-                      (ebb-io--recover-stream io))
-                  (let* ((offset (ebb-io-pending-offset io))
-                         (chunk-size (min (- (length chunk) offset) budget)))
-                    (cl-incf (ebb-io-pending-offset io)
-                             (ebb-parse-bytes (ebb-io-parser io) chunk
-                                              offset (+ offset chunk-size)))
-                    (cl-incf total-parsed chunk-size)))))
-            (ebb-io--normalize-pending io)
-
-            ;; Render, unless DEC 2026 synchronized output holds the
-            ;; frame; the safety timer bounds how long it can be held.
-            (if (and (null drain-all)
-                     (ebb-screen-sync-output (ebb-io-screen io)))
-                (unless (ebb-io-sync-timer io)
-                  (setf (ebb-io-sync-timer io)
-                        (run-at-time ebb-sync-output-timeout nil
-                                     #'ebb-io--sync-timeout io)))
+  (let ((in-parse nil))
+    (condition-case err
+        (if (not (buffer-live-p (ebb-io-buffer io)))
+            ;; Buffer is dead: drop pending queue and do not rearm timers.
+            (progn
               (ebb-io--cancel-sync-timer io)
-              (ebb-render-refresh (ebb-io-render io))
-              (run-hook-with-args 'ebb-io-after-render-functions
-                                  (ebb-io-render io)))))
+              (setf (ebb-io-pending-chunks io) nil
+                    (ebb-io-pending-tail io) nil
+                    (ebb-io-pending-offset io) 0
+                    (ebb-io-pending-bytes io) 0
+                    (ebb-io-first-chunk-time io) nil
+                    (ebb-io-processing io) nil))
+          (with-current-buffer (ebb-io-buffer io)
+            (let ((budget (max 1 (ebb-io-chunk-size io)))
+                  (chunks-parsed 0)
+                  (deadline (unless drain-all
+                              (+ (float-time) ebb-io-parse-time-budget)))
+                  ;; Bound helper subprocesses spawned by untrusted graphics.
+                  (ebb-graphics--subprocess-budget
+                   ebb-kitty-graphics-subprocess-budget))
+              ;; Parse in chunks up to the wall-clock time budget, stopping
+              ;; early if user input arrives after at least one chunk.
+              (setq in-parse t)
+              (while (and (ebb-io--pending-p io)
+                          (or drain-all
+                              (zerop chunks-parsed)
+                              (and (not (input-pending-p))
+                                   (< (float-time) deadline))))
+                (let ((chunk (car (ebb-io-pending-chunks io))))
+                  (if (memq chunk '(:gap :interrupt))
+                      (progn
+                        (setf (ebb-io-pending-chunks io)
+                              (cdr (ebb-io-pending-chunks io)))
+                        (ebb-io--normalize-pending io)
+                        (ebb-io--recover-stream io))
+                    (let* ((offset (ebb-io-pending-offset io))
+                           (remaining (- (length chunk) offset))
+                           (chunk-size (if drain-all remaining
+                                         (min remaining budget)))
+                           (consumed (ebb-parse-bytes
+                                      (ebb-io-parser io)
+                                      chunk offset (+ offset chunk-size))))
+                      (if (zerop consumed)
+                          ;; Defensive guard: never spin on an unconsumable chunk.
+                          (progn
+                            (setf (ebb-io-pending-offset io) (length chunk))
+                            (ebb-io--recover-stream io)
+                            (setq drain-all nil
+                                  deadline 0))
+                        (cl-incf (ebb-io-pending-offset io) consumed))
+                      (cl-incf chunks-parsed)))))
+              (ebb-io--normalize-pending io)
+              (setq in-parse nil)
 
-        ;; While a backlog remains, keep the original arrival time so the
-        ;; max-latency budget drives back-to-back drains instead of
-        ;; restarting the latency window after every chunk.
-        (setf (ebb-io-processing io) nil)
-        (if (ebb-io--pending-p io)
-            (ebb-io--schedule-processing io)
-          (when (and (> (ebb-io-dropped-bytes io) 0)
-                     (not (ebb-io-drop-reported io)))
-            (setf (ebb-io-drop-reported io) t)
-            (message "[ebb] dropped %d bytes of terminal output (queue limit %d)"
-                     (ebb-io-dropped-bytes io) ebb-io-max-pending-bytes))
-          (setf (ebb-io-first-chunk-time io) nil
-                (ebb-io-last-processing-error io) nil
-                (ebb-io-processing-error-count io) 0
-                (ebb-io-dropped-bytes io) 0
-                (ebb-io-drop-reported io) nil)))
-    (error
-     (setf (ebb-io-processing io) nil)
-     (if (equal err (ebb-io-last-processing-error io))
-         (cl-incf (ebb-io-processing-error-count io))
-       (setf (ebb-io-last-processing-error io) err
-             (ebb-io-processing-error-count io) 1))
-     (run-hook-with-args 'ebb-io-processing-error-functions
-                         io err (ebb-io-processing-error-count io))
-     ;; A parser error must not wedge the terminal: discard the offending
-     ;; chunk, return the parser to ground, and keep draining.
-     (when (stringp (car (ebb-io-pending-chunks io)))
-       (setf (ebb-io-pending-offset io)
-             (length (car (ebb-io-pending-chunks io))))
-       (ebb-io--normalize-pending io)
-       (ebb-io--recover-stream io))
-     (when (ebb-io--pending-p io)
-       (ebb-io--schedule-processing io)))))
+              ;; Render, unless DEC 2026 synchronized output holds the
+              ;; frame; the safety timer bounds how long it can be held.
+              (if (and (null drain-all)
+                       (ebb-screen-sync-output (ebb-io-screen io)))
+                  (unless (ebb-io-sync-timer io)
+                    (setf (ebb-io-sync-timer io)
+                          (run-at-time ebb-sync-output-timeout nil
+                                       #'ebb-io--sync-timeout io)))
+                (ebb-io--cancel-sync-timer io)
+                (ebb-render-refresh (ebb-io-render io))
+                (run-hook-with-args 'ebb-io-after-render-functions
+                                    (ebb-io-render io)))))
+
+          ;; While a backlog remains, yield once to the event loop (delay 0)
+          ;; instead of sleeping for min-latency between drain slices.
+          (setf (ebb-io-processing io) nil)
+          (if (ebb-io--pending-p io)
+              (ebb-io--schedule-processing io t)
+            (when (and (> (ebb-io-dropped-bytes io) 0)
+                       (not (ebb-io-drop-reported io)))
+              (setf (ebb-io-drop-reported io) t)
+              (message "[ebb] dropped %d bytes of terminal output (queue limit %d)"
+                       (ebb-io-dropped-bytes io) ebb-io-max-pending-bytes))
+            (setf (ebb-io-first-chunk-time io) nil
+                  (ebb-io-last-processing-error io) nil
+                  (ebb-io-processing-error-count io) 0
+                  (ebb-io-dropped-bytes io) 0
+                  (ebb-io-drop-reported io) nil)))
+      (error
+       (setf (ebb-io-processing io) nil)
+       (if (equal err (ebb-io-last-processing-error io))
+           (cl-incf (ebb-io-processing-error-count io))
+         (setf (ebb-io-last-processing-error io) err
+               (ebb-io-processing-error-count io) 1))
+       (run-hook-with-args 'ebb-io-processing-error-functions
+                           io err (ebb-io-processing-error-count io))
+       ;; Only discard the offending chunk when parsing itself signaled;
+       ;; a render/hook error must not drop already-queued terminal output.
+       (when (and in-parse (stringp (car (ebb-io-pending-chunks io))))
+         (setf (ebb-io-pending-offset io)
+               (length (car (ebb-io-pending-chunks io))))
+         (ebb-io--normalize-pending io)
+         (ebb-io--recover-stream io))
+       (when (and (buffer-live-p (ebb-io-buffer io))
+                  (ebb-io--pending-p io))
+         (ebb-io--schedule-processing io))))))
 
 (defun ebb-io--report-processing-error (_io error-data count)
   "Report asynchronous ERROR-DATA after COUNT consecutive failures.

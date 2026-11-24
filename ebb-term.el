@@ -29,6 +29,11 @@ Serial buffers enable this so firmware initialization cannot erase logs.")
 
 ;;;; ---- Data Structures ------------------------------------------------
 
+;; Omit runtime struct type checks in compiled hot-path accessors.
+;; Restored to safety 1 immediately after the struct definitions so the
+;; declaration cannot leak into other files compiled in the same session.
+(cl-declaim (optimize (safety 0)))
+
 (cl-defstruct (ebb-cell (:copier nil))
   "A single cell on the terminal screen."
   (char ?\s)
@@ -64,15 +69,27 @@ is never modified and resets can reuse it instead of allocating.")
   (cells nil)       ; vector of ebb-cell
   (cells-valid t)   ; nil when CELLS must be materialized from TEXT
   (text nil)        ; single-width text cache string, or nil
+  (text-end nil)    ; upper bound on non-space columns in TEXT, or nil = width
   (attr-runs nil)   ; list of (START END ATTR) for styled TEXT ranges
+  (attr-runs-tail nil) ; last cons of attr-runs for O(1) append
   (uniform-attr nil) ; non-nil when TEXT has one shared non-default attr
   (rendered nil)    ; cached rendered/propertized string for non-plain lines
+  (rendition 'normal) ; DEC width/height rendition
+  (initialized nil) ; bool-vector distinguishing erased blanks from empty cells
+  (dec-protected nil) ; bool-vector of DEC-protected columns
+  (iso-protected nil) ; bool-vector of ISO-protected columns
+  (wrap-barrier nil) ; non-nil when entered via explicit NEL (mode 45 barrier)
   (prompt-begins nil) ; OSC shell prompt start columns
   (prompt-ends nil)   ; OSC shell prompt end columns
   (wrapped nil)     ; auto-wrapped from previous line?
   (dirty t))
 
-(cl-defstruct (ebb-history-line (:copier nil))
+(cl-defstruct (ebb-history-line
+               (:copier nil)
+               (:constructor make-ebb-history-line)
+               (:constructor ebb--make-history-line
+                             (id cells text text-length attr-runs
+                                 rendition prompt-begins prompt-ends open)))
   "One unwrapped main-screen history line."
   (id 0)
   (cells [])
@@ -178,197 +195,128 @@ length.  FIRST permits bounded trimming without copying the surviving suffix."
   (dirty-map nil)        ; bool vector indexed by row, avoids hot-path `pushnew'
   (dirty-count 0)
   ;; Pending wrap
-  (pending-wrap nil))
+  (pending-wrap nil)
+  ;; Extended terminal state (stored as direct slots for hot-path speed)
+  (viewport-reset nil)
+  (preserved-display-signature nil)
+  (saved-cursor-rendition nil)
+  (alt-saved-cursor-rendition nil)
+  (alt-saved-cursor nil)
+  (alt-saved-grid nil)
+  (column-mode nil)
+  (horizontal-margins nil)
+  (reverse-wrap-mode nil)
+  (dec-protection-mode nil)
+  (iso-protection-mode nil)
+  (protection-used nil))
 
-(defvar ebb--viewport-reset-screens
-  (make-hash-table :test #'eq :weakness 'key)
-  "Screens whose next render should show the live viewport from its top.")
-
-(defvar ebb--preserved-display-signatures
-  (make-hash-table :test #'eq :weakness 'key)
-  "Last main-screen viewport snapshot preserved for each screen.")
-
-(defvar ebb--saved-cursor-renditions
-  (make-hash-table :test #'eq :weakness 'key)
-  "Extended DECSC state keyed by screen without changing the screen layout.")
-
-(defvar ebb--alt-saved-cursor-renditions
-  (make-hash-table :test #'eq :weakness 'key)
-  "Main-screen extended DECSC state saved while an alternate screen is active.")
-
-(defvar ebb--alt-saved-cursors
-  (make-hash-table :test #'eq :weakness 'key)
-  "Alternate-screen DECSC position (X Y ATTR) keyed by terminal screen.")
-
-(defvar ebb--alt-saved-grid
-  (make-hash-table :test #'eq :weakness 'key)
-  "Alternate-screen buffer contents keyed by terminal screen.
-Preserved across a non-clearing buffer switch (DECSET 47/1047).")
+(cl-declaim (optimize (safety 1)))
 
 (defun ebb--swap-saved-renditions (screen)
   "Swap SCREEN's active and alternate DECSC rendition state."
-  (let ((active (gethash screen ebb--saved-cursor-renditions))
-        (alternate (gethash screen ebb--alt-saved-cursor-renditions)))
-    (if alternate
-        (puthash screen alternate ebb--saved-cursor-renditions)
-      (remhash screen ebb--saved-cursor-renditions))
-    (if active
-        (puthash screen active ebb--alt-saved-cursor-renditions)
-      (remhash screen ebb--alt-saved-cursor-renditions))))
-
-(defvar ebb--line-renditions
-  (make-hash-table :test #'eq :weakness 'key)
-  "DEC width/height rendition keyed by screen line.")
-
-(defvar ebb--column-mode-screens
-  (make-hash-table :test #'eq :weakness 'key)
-  "Reload-safe DECCOLM state keyed by terminal screen.")
-
-(defvar ebb--horizontal-margins
-  (make-hash-table :test #'eq :weakness 'key)
-  "Enabled left/right margins keyed by terminal screen.")
-
-(defvar ebb--reverse-wrap-modes
-  (make-hash-table :test #'eq :weakness 'key)
-  "Enabled reverse-wrap modes keyed by screen as (INLINE . EXTENDED).")
+  (let ((active (ebb-screen-saved-cursor-rendition screen))
+        (alternate (ebb-screen-alt-saved-cursor-rendition screen)))
+    (setf (ebb-screen-saved-cursor-rendition screen) alternate
+          (ebb-screen-alt-saved-cursor-rendition screen) active)))
 
 (defun ebb--reverse-wrap-mode (screen)
   "Return SCREEN's effective reverse-wrap mode."
-  (when-let* ((state (gethash screen ebb--reverse-wrap-modes)))
+  (when-let* ((state (ebb-screen-reverse-wrap-mode screen)))
     (cond ((cdr state) 'extended)
           ((car state) 'inline))))
 
 (defun ebb--set-reverse-wrap-mode (screen extended enabled)
   "Set SCREEN's inline or EXTENDED reverse-wrap mode to ENABLED."
-  (let ((state (or (gethash screen ebb--reverse-wrap-modes)
+  (let ((state (or (ebb-screen-reverse-wrap-mode screen)
                    (cons nil nil))))
     (if extended
         (setcdr state (and enabled t))
       (setcar state (and enabled t)))
-    (if (or (car state) (cdr state))
-        (puthash screen state ebb--reverse-wrap-modes)
-      (remhash screen ebb--reverse-wrap-modes))))
-
-(defvar ebb--reverse-wrap-barriers
-  (make-hash-table :test #'eq :weakness 'key)
-  "Lines entered by explicit NEL, which mode 45 must not cross.")
-
-(defvar ebb--initialized-cells
-  (make-hash-table :test #'eq :weakness 'key)
-  "Initialization bits used to distinguish empty cells from erased blanks.")
-
-(defvar ebb--dec-protected-cells
-  (make-hash-table :test #'eq :weakness 'key)
-  "DEC-protected cell bits keyed by terminal line.")
-
-(defvar ebb--iso-protected-cells
-  (make-hash-table :test #'eq :weakness 'key)
-  "ISO-protected cell bits keyed by terminal line.")
-
-(defvar ebb--dec-protection-mode-screens
-  (make-hash-table :test #'eq :weakness 'key)
-  "Screens currently writing DEC-protected cells.")
-
-(defvar ebb--iso-protection-mode-screens
-  (make-hash-table :test #'eq :weakness 'key)
-  "Screens currently writing ISO-protected cells.")
+    (setf (ebb-screen-reverse-wrap-mode screen)
+          (when (or (car state) (cdr state)) state))))
 
 (defsubst ebb--clamp (val lo hi)
   "Clamp VAL to [LO, HI]."
   (min (max val lo) hi))
 
-(defun ebb--line-protection-bits (table line width)
-  "Return LINE's WIDTH protection bit vector from TABLE."
-  (let ((bits (gethash line table)))
+(defsubst ebb--line-protection-slot (kind line)
+  "Return LINE's protection bit vector for KIND (`dec' or `iso')."
+  (if (eq kind 'dec)
+      (ebb-line-dec-protected line)
+    (ebb-line-iso-protected line)))
+
+(defun ebb--resize-bool-vector (bits width)
+  "Return a bool-vector of WIDTH preserving the prefix of BITS."
+  (let ((resized (make-bool-vector width nil)))
+    (when bits
+      (let ((limit (min width (length bits)))
+            (i 0))
+        (while (< i limit)
+          (when (aref bits i)
+            (aset resized i t))
+          (cl-incf i))))
+    resized))
+
+(defun ebb--line-protection-bits (kind line width)
+  "Return LINE's WIDTH protection bit vector for KIND (`dec' or `iso')."
+  (let ((bits (ebb--line-protection-slot kind line)))
     (unless (and bits (= (length bits) width))
-      (setq bits (make-bool-vector width nil))
-      (puthash line bits table))
+      (setq bits (ebb--resize-bool-vector bits width))
+      (if (eq kind 'dec)
+          (setf (ebb-line-dec-protected line) bits)
+        (setf (ebb-line-iso-protected line) bits)))
     bits))
 
-(defun ebb--mark-written-protection (screen line start end)
+(defsubst ebb--mark-written-protection (screen line start end)
   "Record protection modes for cells on SCREEN, in LINE from START through END."
-  (let* ((width (ebb-screen-width screen))
-         (dec (and (gethash screen ebb--dec-protection-mode-screens) t))
-         (iso (and (gethash screen ebb--iso-protection-mode-screens) t))
-         (dec-bits (gethash line ebb--dec-protected-cells))
-         (iso-bits (gethash line ebb--iso-protected-cells)))
-    (when (or dec dec-bits)
-      (setq dec-bits (ebb--line-protection-bits
-                      ebb--dec-protected-cells line width))
-      (cl-loop for column from start below (min end width)
-               do (aset dec-bits column dec)))
-    (when (or iso iso-bits)
-      (setq iso-bits (ebb--line-protection-bits
-                      ebb--iso-protected-cells line width))
-      (cl-loop for column from start below (min end width)
-               do (aset iso-bits column iso)))))
+  (when (ebb-screen-protection-used screen)
+    (let* ((width (ebb-screen-width screen))
+           (dec (and (ebb-screen-dec-protection-mode screen) t))
+           (iso (and (ebb-screen-iso-protection-mode screen) t))
+           (dec-bits (ebb-line-dec-protected line))
+           (iso-bits (ebb-line-iso-protected line)))
+      (when (or dec dec-bits)
+        (setq dec-bits (ebb--line-protection-bits 'dec line width))
+        (cl-loop for column from start below (min end width)
+                 do (aset dec-bits column dec)))
+      (when (or iso iso-bits)
+        (setq iso-bits (ebb--line-protection-bits 'iso line width))
+        (cl-loop for column from start below (min end width)
+                 do (aset iso-bits column iso))))))
 
 (defun ebb-screen-dec-protection-enabled-p (screen)
   "Return non-nil when SCREEN writes DEC-protected cells."
-  (and (gethash screen ebb--dec-protection-mode-screens) t))
+  (and (ebb-screen-dec-protection-mode screen) t))
 
 (defun ebb-screen-set-dec-protection (screen enabled)
   "Set whether subsequent writes on SCREEN are DEC-protected.
 ENABLED non-nil enables protection; nil removes it."
-  (if enabled
-      (puthash screen t ebb--dec-protection-mode-screens)
-    (remhash screen ebb--dec-protection-mode-screens)))
+  (setf (ebb-screen-dec-protection-mode screen) (and enabled t))
+  (when enabled
+    (setf (ebb-screen-protection-used screen) t)))
 
 (defun ebb-screen-set-iso-protection (screen enabled)
   "Set whether subsequent writes on SCREEN are ISO-protected.
 ENABLED non-nil enables protection; nil removes it."
-  (if enabled
-      (puthash screen t ebb--iso-protection-mode-screens)
-    (remhash screen ebb--iso-protection-mode-screens)))
+  (setf (ebb-screen-iso-protection-mode screen) (and enabled t))
+  (when enabled
+    (setf (ebb-screen-protection-used screen) t)))
+
+(defun ebb--line-initialized-bits (line width)
+  "Return LINE's WIDTH initialization bit vector without refreshing from cells."
+  (let ((bits (ebb-line-initialized line)))
+    (unless (and bits (= (length bits) width))
+      (setq bits (ebb--resize-bool-vector bits width))
+      (setf (ebb-line-initialized line) bits))
+    bits))
 
 (defun ebb--line-initialized-cells (line cells width)
   "Return LINE's WIDTH initialization bits, refreshing them from CELLS."
-  (let ((bits (gethash line ebb--initialized-cells)))
-    (unless (and bits (= (length bits) width))
-      (setq bits (make-bool-vector width nil))
-      (puthash line bits ebb--initialized-cells))
+  (let ((bits (ebb--line-initialized-bits line width)))
     (dotimes (column width)
       (unless (= (ebb-cell-char (aref cells column)) ?\s)
         (aset bits column t)))
     bits))
-
-(defun ebb-screen-horizontal-margins-enabled-p (screen)
-  "Return non-nil when SCREEN uses left/right margins (DECLRMM)."
-  (and (gethash screen ebb--horizontal-margins) t))
-
-(defun ebb-screen-left-margin (screen)
-  "Return SCREEN's zero-based left margin."
-  (if-let* ((margins (gethash screen ebb--horizontal-margins)))
-      (car margins)
-    0))
-
-(defun ebb-screen-right-margin (screen &optional row)
-  "Return SCREEN's zero-based right margin at ROW."
-  (let ((line-right (1- (ebb-screen-line-width screen row))))
-    (if-let* ((margins (gethash screen ebb--horizontal-margins)))
-        (min line-right (cdr margins))
-      line-right)))
-
-(defun ebb-screen-set-horizontal-margin-mode (screen enabled)
-  "Enable left/right margin mode on SCREEN when ENABLED is non-nil."
-  (if enabled
-      (puthash screen (cons 0 (1- (ebb-screen-width screen)))
-               ebb--horizontal-margins)
-    (remhash screen ebb--horizontal-margins)))
-
-(defun ebb-screen-set-horizontal-margins (screen left right)
-  "Set SCREEN's inclusive zero-based LEFT and RIGHT margins."
-  (when (ebb-screen-horizontal-margins-enabled-p screen)
-    (let ((max-column (1- (ebb-screen-width screen))))
-      (setq left (ebb--clamp left 0 max-column)
-            right (ebb--clamp right 0 max-column))
-      (when (< left right)
-        (puthash screen (cons left right) ebb--horizontal-margins)
-        (ebb-screen-cursor-goto screen 0 0)))))
-
-(defun ebb-line-rendition (line)
-  "Return LINE's DEC rendition, or `normal'."
-  (or (gethash line ebb--line-renditions) 'normal))
 
 (defsubst ebb--line-index (screen row)
   "Return physical line-vector index for logical ROW on SCREEN."
@@ -387,7 +335,7 @@ ENABLED non-nil enables protection; nil removes it."
       (push row (ebb-screen-dirty-lines screen))
       (cl-incf (ebb-screen-dirty-count screen)))))
 
-(defun ebb-screen-line-width (screen &optional row)
+(defsubst ebb-screen-line-width (screen &optional row)
   "Return the logical column count for SCREEN at ROW.
 ROW defaults to the cursor row.  DEC double-width and double-height lines use
 half of the physical screen columns."
@@ -397,14 +345,43 @@ half of the physical screen columns."
         (ebb-screen-width screen)
       (max 1 (/ (ebb-screen-width screen) 2)))))
 
+(defsubst ebb-screen-horizontal-margins-enabled-p (screen)
+  "Return non-nil when SCREEN uses left/right margins (DECLRMM)."
+  (and (ebb-screen-horizontal-margins screen) t))
+
+(defsubst ebb-screen-left-margin (screen)
+  "Return SCREEN's zero-based left margin."
+  (let ((margins (ebb-screen-horizontal-margins screen)))
+    (if margins (car margins) 0)))
+
+(defsubst ebb-screen-right-margin (screen &optional row)
+  "Return SCREEN's zero-based right margin at ROW."
+  (let ((line-right (1- (ebb-screen-line-width screen row)))
+        (margins (ebb-screen-horizontal-margins screen)))
+    (if margins (min line-right (cdr margins)) line-right)))
+
+(defun ebb-screen-set-horizontal-margin-mode (screen enabled)
+  "Enable left/right margin mode on SCREEN when ENABLED is non-nil."
+  (setf (ebb-screen-horizontal-margins screen)
+        (when enabled
+          (cons 0 (1- (ebb-screen-width screen))))))
+
+(defun ebb-screen-set-horizontal-margins (screen left right)
+  "Set SCREEN's inclusive zero-based LEFT and RIGHT margins."
+  (when (ebb-screen-horizontal-margins screen)
+    (let ((max-column (1- (ebb-screen-width screen))))
+      (setq left (ebb--clamp left 0 max-column)
+            right (ebb--clamp right 0 max-column))
+      (when (< left right)
+        (setf (ebb-screen-horizontal-margins screen) (cons left right))
+        (ebb-screen-cursor-goto screen 0 0)))))
+
 (defun ebb-screen-set-line-rendition (screen rendition)
   "Set SCREEN's current line DEC rendition to RENDITION."
   (let* ((row (ebb-screen-cursor-y screen))
          (line (ebb--line-at screen row)))
-    (if (eq rendition 'normal)
-        (remhash line ebb--line-renditions)
-      (puthash line rendition ebb--line-renditions))
-    (setf (ebb-screen-cursor-x screen)
+    (setf (ebb-line-rendition line) (or rendition 'normal)
+          (ebb-screen-cursor-x screen)
           (min (ebb-screen-cursor-x screen)
                (1- (ebb-screen-line-width screen row)))
           (ebb-screen-pending-wrap screen) nil
@@ -414,21 +391,18 @@ half of the physical screen columns."
 
 (defun ebb-screen-mark-viewport-reset (screen)
   "Request that SCREEN's next render reset its visible viewport."
-  (puthash screen t ebb--viewport-reset-screens))
+  (setf (ebb-screen-viewport-reset screen) t))
 
 (defun ebb-screen-take-viewport-reset (screen)
   "Return and clear SCREEN's pending visible viewport reset."
-  (prog1 (gethash screen ebb--viewport-reset-screens)
-    (remhash screen ebb--viewport-reset-screens)))
+  (prog1 (ebb-screen-viewport-reset screen)
+    (setf (ebb-screen-viewport-reset screen) nil)))
 
 ;;;; ---- Cell copying helper (used by erase) ----------------------------
 
-(defun ebb-cell-copy (cell)
+(defsubst ebb-cell-copy (cell)
   "Return a shallow copy of CELL."
-  (make-ebb-cell :char (ebb-cell-char cell)
-                   :combining (ebb-cell-combining cell)
-                   :width (ebb-cell-width cell)
-                   :attr (ebb-cell-attr cell)))
+  (copy-sequence cell))
 
 ;;;; ---- DEC Special Graphics Character Set ------------------------------
 
@@ -484,6 +458,7 @@ from allocating a full vector of cell structs for every blank bottom row."
   (make-ebb-line :cells nil
                    :cells-valid nil
                    :text (make-string width ?\s)
+                   :text-end 0
                    :dirty t))
 
 (defun ebb--line-ensure-cells (line width)
@@ -508,9 +483,10 @@ from allocating a full vector of cell structs for every blank bottom row."
             (while (< i width)
               (let ((cell (aref cells i)))
                 (setf (ebb-cell-char cell)
-                      (if (< i (length text)) (aref text i) ?\s))
-                (setf (ebb-cell-width cell) 1)
-                (setf (ebb-cell-attr cell) (ebb-line-uniform-attr line)))
+                      (if (< i (length text)) (aref text i) ?\s)
+                      (ebb-cell-combining cell) nil
+                      (ebb-cell-width cell) 1
+                      (ebb-cell-attr cell) (ebb-line-uniform-attr line)))
               (cl-incf i)))
           (dolist (run (ebb-line-attr-runs line))
             (let ((i (nth 0 run))
@@ -525,33 +501,56 @@ from allocating a full vector of cell structs for every blank bottom row."
 (defun ebb--line-set-attr-run (line start end attr)
   "Set LINE's attribute over [START, END) to ATTR in its text run cache."
   (when (< start end)
-    (let ((runs (ebb-line-attr-runs line))
-          (out nil)
-          (inserted nil))
-      (dolist (run runs)
-        (let ((rs (nth 0 run))
-              (re (nth 1 run))
-              (ra (nth 2 run)))
-          (cond
-           ((<= re start)
-            (push run out))
-           ((>= rs end)
-            (unless inserted
-              (when attr (push (list start end attr) out))
-              (setq inserted t))
-            (push run out))
-           (t
-            (when (< rs start)
-              (push (list rs start ra) out))
-            (unless inserted
-              (when attr (push (list start end attr) out))
-              (setq inserted t))
-            (when (> re end)
-              (push (list end re ra) out))))))
-      (unless inserted
-        (when attr (push (list start end attr) out)))
-      (setf (ebb-line-attr-runs line)
-            (ebb--merge-attr-runs (nreverse out))))))
+    (let ((runs (ebb-line-attr-runs line)))
+      (cond
+       ((null runs)
+        (if attr
+            (let ((cell (list (list start end attr))))
+              (setf (ebb-line-attr-runs line) cell
+                    (ebb-line-attr-runs-tail line) cell))
+          (setf (ebb-line-attr-runs-tail line) nil)))
+       (t
+        (let* ((tail (or (ebb-line-attr-runs-tail line) (last runs)))
+               (last-run (car tail))
+               (last-end (nth 1 last-run)))
+          (if (<= last-end start)
+              ;; O(1) append/extend path for left-to-right terminal writes.
+              (when attr
+                (if (and (= last-end start)
+                         (let ((la (nth 2 last-run)))
+                           (or (eq la attr) (equal la attr))))
+                    (setcar (cdr last-run) end)
+                  (let ((cell (list (list start end attr))))
+                    (setcdr tail cell)
+                    (setf (ebb-line-attr-runs-tail line) cell))))
+            ;; General overlap/overwrite path.
+            (let ((out nil)
+                  (inserted nil))
+              (dolist (run runs)
+                (let ((rs (nth 0 run))
+                      (re (nth 1 run))
+                      (ra (nth 2 run)))
+                  (cond
+                   ((<= re start)
+                    (push run out))
+                   ((>= rs end)
+                    (unless inserted
+                      (when attr (push (list start end attr) out))
+                      (setq inserted t))
+                    (push run out))
+                   (t
+                    (when (< rs start)
+                      (push (list rs start ra) out))
+                    (unless inserted
+                      (when attr (push (list start end attr) out))
+                      (setq inserted t))
+                    (when (> re end)
+                      (push (list end re ra) out))))))
+              (unless inserted
+                (when attr (push (list start end attr) out)))
+              (let ((merged (ebb--merge-attr-runs (nreverse out))))
+                (setf (ebb-line-attr-runs line) merged
+                      (ebb-line-attr-runs-tail line) (last merged)))))))))))
 
 (defun ebb--merge-attr-runs (runs)
   "Merge adjacent equal attribute RUNS."
@@ -560,7 +559,9 @@ from allocating a full vector of cell structs for every blank bottom row."
       (let ((prev (car merged)))
         (if (and prev
                  (= (nth 1 prev) (nth 0 run))
-                 (equal (nth 2 prev) (nth 2 run)))
+                 (let ((pa (nth 2 prev))
+                       (ra (nth 2 run)))
+                   (or (eq pa ra) (equal pa ra))))
             (setcar (cdr prev) (nth 1 run))
           (push run merged))))
     (nreverse merged)))
@@ -780,11 +781,14 @@ and where COL is a continuation cell (width = 0)."
 
 (defun ebb--history-entry-row-count (entry width)
   "Return physical rows of WIDTH columns represented by history ENTRY."
-  (if (ebb-history-chunk-p entry)
-      (let* ((map (ebb--history-chunk-row-map entry width))
-             (count (length map)))
-        (if (zerop count) 0 (aref map (1- count))))
-    (ebb-history-line-row-count entry width)))
+  (cond
+   ((ebb-history-chunk-p entry)
+    (let* ((map (ebb--history-chunk-row-map entry width))
+           (count (length map)))
+      (if (zerop count) 0 (aref map (1- count)))))
+   ((ebb-history-line-p entry)
+    (ebb-history-line-row-count entry width))
+   (t (signal 'wrong-type-argument (list 'ebb-history-line entry)))))
 
 (defun ebb--history-chunk-row-map (chunk width)
   "Return CHUNK's cumulative physical-row map at WIDTH."
@@ -879,8 +883,8 @@ KIND may be `append' for ENTRY or `last' for an extended newest line."
   (let ((old-rows (ebb--history-physical-row-count-safe screen)))
     (setf (ebb-screen-scrollback screen) nil
           (ebb-screen-scrollback-length screen) 0
-          (ebb-screen-scrollback-dirty screen) t)
-    (remhash screen ebb--preserved-display-signatures)
+          (ebb-screen-scrollback-dirty screen) t
+          (ebb-screen-preserved-display-signature screen) nil)
     (ebb--history-changed screen)
     (ebb-graphics-trim-history (ebb-screen-graphics screen) old-rows)))
 
@@ -911,7 +915,7 @@ remain logical content; unstyled presentation padding is excluded."
            (end
             (if wrapped
                 width
-              (let ((i width))
+              (let ((i (min width (or (ebb-line-text-end line) width))))
                 (while (and (> i 0) (= (aref text (1- i)) ?\s))
                   (cl-decf i))
                 (dolist (run runs)
@@ -980,7 +984,10 @@ that actually scrolled off the display."
            (last (1- count))
            (limit (+ (aref selected-starts last)
                      (aref selected-lengths last)))
-           (owned-text (substring string base limit))
+           (owned-text (let ((sub (substring string base limit)))
+                         (if (multibyte-string-p sub)
+                             (string-to-unibyte sub)
+                           sub)))
            (i 0)
            (chunk (make-ebb-history-chunk
                    :id-start id-start
@@ -1131,17 +1138,17 @@ that actually scrolled off the display."
             (setf (ebb-screen-scrollback-dirty screen) t)
             (ebb--history-changed screen 'last))
         (let ((logical
-               (make-ebb-history-line
-                :id (prog1 (ebb-screen-history-next-id screen)
-                      (cl-incf (ebb-screen-history-next-id screen)))
-                :cells (if text-info [] (vconcat cells))
-                :text text
-                :text-length text-length
-                :attr-runs attr-runs
-                :rendition rendition
-                :prompt-begins (copy-sequence (ebb-line-prompt-begins line))
-                :prompt-ends (copy-sequence (ebb-line-prompt-ends line))
-                :open wrapped)))
+               (ebb--make-history-line
+                (prog1 (ebb-screen-history-next-id screen)
+                  (cl-incf (ebb-screen-history-next-id screen)))
+                (if text-info [] (vconcat cells))
+                text
+                text-length
+                attr-runs
+                rendition
+                (copy-sequence (ebb-line-prompt-begins line))
+                (copy-sequence (ebb-line-prompt-ends line))
+                wrapped)))
           (push logical (ebb-screen-scrollback screen))
           (cl-incf (ebb-screen-scrollback-length screen))
           (ebb--history-changed screen 'append logical))))))
@@ -1302,8 +1309,7 @@ ordered oldest first.  A plain chunk may represent many logical lines."
                        :cells (ebb--fit-cells-to-width row-cells width)
                        common)))))
       (unless (eq (ebb-history-line-rendition logical) 'normal)
-        (puthash line (ebb-history-line-rendition logical)
-                 ebb--line-renditions))
+        (setf (ebb-line-rendition line) (ebb-history-line-rendition logical)))
       line)))
 
 (defun ebb-history-line-offset-position (line width offset)
@@ -1547,8 +1553,12 @@ only join with a line that was auto-wrapped."
          (line (ebb--line-at screen y)))
     (cond
      ((ebb-screen-pending-wrap screen)
-      (ebb--line-ensure-cells line width)
-      (cons line x))
+      (let* ((cells (ebb--line-ensure-cells line width))
+             (column x))
+        (while (and (> column 0)
+                    (zerop (ebb-cell-width (aref cells column))))
+          (cl-decf column))
+        (cons line column)))
      ((> x 0)
       (let* ((cells (ebb--line-ensure-cells line width))
              (column (1- x)))
@@ -1698,8 +1708,9 @@ instead of moving off the screen."
              (ebb--line-at screen (ebb-screen-cursor-y screen)))
             t)
       (ebb--wrap-to-next-line screen)
-      (remhash (ebb--line-at screen (ebb-screen-cursor-y screen))
-               ebb--reverse-wrap-barriers))))
+      (setf (ebb-line-wrap-barrier
+             (ebb--line-at screen (ebb-screen-cursor-y screen)))
+            nil))))
 
 (defun ebb--write-single-width-char
     (screen translated line cell attr column row screen-width)
@@ -1708,15 +1719,22 @@ instead of moving off the screen."
         (ebb-cell-combining cell) nil
         (ebb-cell-width cell) 1
         (ebb-cell-attr cell) attr)
-  (let ((uniform (ebb-line-uniform-attr line)))
-    (if (and (ebb-line-text line)
+  (let ((uniform (ebb-line-uniform-attr line))
+        (text (ebb-line-text line)))
+    (if (and text
+             (not (multibyte-string-p text))
              (< translated 128)
              (null (ebb-line-attr-runs line))
              (or (and (null attr) (null uniform))
                  (and attr uniform
                       (or (eq attr uniform) (equal attr uniform)))))
-        (aset (ebb-line-text line) column translated)
+        (progn
+          (aset text column translated)
+          (when-let* ((text-end (ebb-line-text-end line)))
+            (when (> (1+ column) text-end)
+              (setf (ebb-line-text-end line) (1+ column)))))
       (setf (ebb-line-text line) nil
+            (ebb-line-text-end line) nil
             (ebb-line-attr-runs line) nil
             (ebb-line-uniform-attr line) nil)))
   (ebb--mark-written-protection screen line column (1+ column))
@@ -1734,6 +1752,7 @@ instead of moving off the screen."
     (screen translated char-width column row line cells attr screen-width)
   "Write TRANSLATED with CHAR-WIDTH through SCREEN's general cell path."
   (setf (ebb-line-text line) nil
+        (ebb-line-text-end line) nil
         (ebb-line-attr-runs line) nil
         (ebb-line-uniform-attr line) nil)
   ;; A double-width character cannot start in the final column.
@@ -1745,8 +1764,9 @@ instead of moving off the screen."
         (progn
           (setf (ebb-line-wrapped line) t)
           (ebb--wrap-to-next-line screen)
-          (remhash (ebb--line-at screen (ebb-screen-cursor-y screen))
-                   ebb--reverse-wrap-barriers)
+          (setf (ebb-line-wrap-barrier
+                 (ebb--line-at screen (ebb-screen-cursor-y screen)))
+                nil)
           (setq column 0
                 row (ebb-screen-cursor-y screen)
                 line (ebb--line-at screen row)
@@ -1756,6 +1776,7 @@ instead of moving off the screen."
           ;; The wrapped-to row now holds cells; drop any stale text cache so
           ;; the renderer does not keep showing its pre-wrap contents.
           (setf (ebb-line-text line) nil
+                (ebb-line-text-end line) nil
                 (ebb-line-attr-runs line) nil
                 (ebb-line-uniform-attr line) nil))
       (setq column (1- screen-width))))
@@ -1827,29 +1848,64 @@ Handles combining and double-width characters."
            screen translated char-width column row line cells attr
            screen-width))))))
 
+(defsubst ebb--previous-cell-zwj-p (screen)
+  "Return non-nil when the cell immediately before SCREEN's cursor ends in ZWJ.
+Bails out in O(1) without materializing cells when the previous row is
+still lazy text-backed (ZWJ always clears `ebb-line-text')."
+  (let* ((y (ebb-screen-cursor-y screen))
+         (x (ebb-screen-cursor-x screen))
+         (pending (ebb-screen-pending-wrap screen))
+         (prev-line (cond
+                     ((or pending (> x 0)) (ebb--line-at screen y))
+                     ((> y 0)
+                      (let ((above (ebb--line-at screen (1- y))))
+                        (when (ebb-line-wrapped above) above))))))
+    (when (and prev-line (null (ebb-line-text prev-line)))
+      (let ((cells (ebb-line-cells prev-line)))
+        (when cells
+          (let ((col (cond
+                      (pending x)
+                      ((> x 0) (1- x))
+                      (t (1- (ebb-screen-width screen))))))
+            (when (< col (length cells))
+              (while (and (> col 0)
+                          (zerop (ebb-cell-width (aref cells col))))
+                (cl-decf col))
+              (let ((comb (ebb-cell-combining (aref cells col))))
+                (and comb
+                     (= (aref comb (1- (length comb))) #x200d))))))))))
+
 (defun ebb-screen-write-string (screen string start end)
-  "Write printable STRING bytes from START to END to SCREEN.
-This is the hot path for ground-state text.  It writes contiguous ASCII
-runs directly into existing cells and falls back to `ebb-screen-write-char'
-for wide/non-ASCII/insert-mode cases."
-  (let ((i start))
+  "Write printable STRING characters from START to END to SCREEN.
+This is the hot path for ground-state text.  It writes contiguous single-width
+runs (both ASCII and width-1 non-combining Unicode) directly into the lazy
+text representation and falls back to `ebb-screen-write-char' for wide,
+combining, ZWJ-joined, raw-byte, non-ASCII-charset, or insert-mode cases."
+  (let ((i start)
+        (multibyte (multibyte-string-p string)))
     (while (< i end)
       (if (or (ebb-screen-insert-mode screen)
               (not (eq (ebb-screen-charset-active screen) 'g0))
               (not (eq (ebb-screen-charset-g0 screen) 'us-ascii))
-              (>= (aref string i) 128))
+              (ebb--previous-cell-zwj-p screen)
+              (let ((ch (aref string i)))
+                (and (>= ch 128)
+                     (or (not multibyte)
+                         (>= ch #x110000)
+                         (/= (char-width ch) 1)))))
           (progn
             (ebb-screen-write-char screen (aref string i))
             (cl-incf i))
-        ;; Honor pending wrap before writing the next byte.
+        ;; Honor pending wrap before writing the next character.
         (when (ebb-screen-pending-wrap screen)
           (setf (ebb-screen-pending-wrap screen) nil)
           (when (ebb-screen-auto-wrap screen)
             (let ((line (ebb--line-at screen (ebb-screen-cursor-y screen))))
               (setf (ebb-line-wrapped line) t))
             (ebb--wrap-to-next-line screen)
-            (remhash (ebb--line-at screen (ebb-screen-cursor-y screen))
-                     ebb--reverse-wrap-barriers)))
+            (setf (ebb-line-wrap-barrier
+                   (ebb--line-at screen (ebb-screen-cursor-y screen)))
+                  nil)))
         (let* ((cx (ebb-screen-cursor-x screen))
                (cy (ebb-screen-cursor-y screen))
                (width (ebb-screen-line-width screen cy))
@@ -1859,39 +1915,63 @@ for wide/non-ASCII/insert-mode cases."
                (line-text (ebb-line-text line))
                (limit (min end (+ i (- width cx))))
                (start-i i)
-               (ascii-end
+               (has-non-ascii nil)
+               (seg-end
                 (let ((j i))
-                  (while (and (< j limit) (< (aref string j) 128))
+                  (while (and (< j limit)
+                              (let ((ch (aref string j)))
+                                (if (< ch 128)
+                                    t
+                                  (and multibyte
+                                       (< ch #x110000)
+                                       (= (char-width ch) 1)
+                                       (setq has-non-ascii t)))))
                     (cl-incf j))
                   j)))
           (cond
-           ;; Text-first hot path: use it only when this row segment is entirely
-           ;; ASCII.  Mixed Unicode lines would otherwise pay to materialize the
-           ;; lazy prefix before every wide/non-ASCII character.
-           ((and default-attr line-text (= ascii-end limit))
-            (store-substring line-text cx (substring string i limit))
-            (when (ebb-line-attr-runs line)
-              (ebb--line-set-attr-run line cx (+ cx (- limit start-i)) nil))
-            (setq i limit)
+           ;; Text-first hot path: stays lazy for both pure ASCII and
+           ;; width-1 non-combining Unicode segments.
+           ((and line-text (= seg-end limit) (> seg-end i))
+            (let ((dst (+ cx (- limit i))))
+              (if (or has-non-ascii (multibyte-string-p line-text))
+                  (let* ((seg (substring string i limit))
+                         (phys-width (length line-text))
+                         (new-text
+                          (cond
+                           ((and (zerop cx) (= dst phys-width)) seg)
+                           ((zerop cx) (concat seg (substring line-text dst)))
+                           ((= dst phys-width)
+                            (concat (substring line-text 0 cx) seg))
+                           (t (concat (substring line-text 0 cx) seg
+                                      (substring line-text dst))))))
+                    (setf (ebb-line-text line) new-text)
+                    (setq i limit))
+                (let ((p cx))
+                  (while (< i limit)
+                    (aset line-text p (aref string i))
+                    (cl-incf p)
+                    (cl-incf i))))
+              (when-let* ((text-end (ebb-line-text-end line)))
+                (when (> dst text-end)
+                  (setf (ebb-line-text-end line) dst)))
+              (if default-attr
+                  (when (ebb-line-attr-runs line)
+                    (ebb--line-set-attr-run line cx dst nil))
+                (ebb--line-set-attr-run line cx dst attr-template)))
             (setf (ebb-line-uniform-attr line) nil)
             (setf (ebb-line-cells-valid line) nil))
-           ((and (not default-attr) line-text (= ascii-end limit))
-            (store-substring line-text cx (substring string i limit))
-            (ebb--line-set-attr-run line cx (+ cx (- limit start-i)) attr-template)
-            (setq i limit)
-            (setf (ebb-line-uniform-attr line) nil)
-            (setf (ebb-line-cells-valid line) nil))
-           (t
+           ((> seg-end i)
+            ;; Materialized-cell path (line already has cells, or a
+            ;; wide/combining char appears later in this row segment).
             (let ((cells (ebb--line-ensure-cells
                           line (ebb-screen-width screen))))
-              (unless default-attr
-                (setf (ebb-line-text line) nil
-                      (ebb-line-attr-runs line) nil
-                      (ebb-line-uniform-attr line) nil))
-              ;; Stop before cells that need wide-char cleanup or non-ASCII chars.
-              ;; The two loops differ only in the attribute stored on each cell.
+              (setf (ebb-line-text line) nil
+                    (ebb-line-text-end line) nil
+                    (ebb-line-attr-runs line) nil
+                    (ebb-line-attr-runs-tail line) nil
+                    (ebb-line-uniform-attr line) nil)
               (let ((cell-attr (if default-attr nil attr-template)))
-                (while (and (< i ascii-end)
+                (while (and (< i seg-end)
                             (= (ebb-cell-width
                                 (aref cells (+ cx (- i start-i))))
                                1))
@@ -1904,7 +1984,7 @@ for wide/non-ASCII/insert-mode cases."
                     (setf (ebb-cell-attr cell) cell-attr))
                   (cl-incf i))))))
           (if (= i start-i)
-              ;; Could not use the fast row writer for this byte.
+              ;; Could not use the fast row writer for this character.
               (progn
                 (ebb-screen-write-char screen (aref string i))
                 (cl-incf i))
@@ -1925,18 +2005,25 @@ for wide/non-ASCII/insert-mode cases."
 (defun ebb--plain-blank-line-p (line width)
   "Return non-nil when LINE is an untouched plain blank row of WIDTH."
   (let ((text (ebb-line-text line))
+        (text-end (ebb-line-text-end line))
         (i 0))
     (and text
          (= (length text) width)
          (not (ebb-line-wrapped line))
+         (null (ebb-line-rendition line))
+         (null (ebb-line-initialized line))
+         (null (ebb-line-dec-protected line))
+         (null (ebb-line-iso-protected line))
+         (null (ebb-line-wrap-barrier line))
          (null (ebb-line-attr-runs line))
          (null (ebb-line-uniform-attr line))
          (null (ebb-line-prompt-begins line))
          (null (ebb-line-prompt-ends line))
-         (progn
-           (while (and (< i width) (= (aref text i) ?\s))
-             (cl-incf i))
-           (= i width)))))
+         (or (eql text-end 0)
+             (let ((limit (min width (or text-end width))))
+               (while (and (< i limit) (= (aref text i) ?\s))
+                 (cl-incf i))
+               (= i limit))))))
 
 (defun ebb--simple-crlf-block-p (screen lengths)
   "Return non-nil when SCREEN can apply plain lines LENGTHS in bulk."
@@ -1948,6 +2035,9 @@ for wide/non-ASCII/insert-mode cases."
     (and (not (ebb-screen-alt-screen screen))
          (zerop (ebb-screen-scroll-top screen))
          (= (ebb-screen-scroll-bottom screen) (1- height))
+         (null (ebb-screen-horizontal-margins screen))
+         (not (ebb-screen-dec-protection-mode screen))
+         (not (ebb-screen-iso-protection-mode screen))
          (zerop (ebb-screen-cursor-x screen))
          (not (ebb-screen-pending-wrap screen))
          (not (ebb-screen-insert-mode screen))
@@ -1979,6 +2069,7 @@ STRING is the pending output; STARTS and LENGTHS delimit its lines."
          (history-lengths (copy-sequence lengths))
          (new-lines (make-vector height nil))
          (destination 0)
+         (multibyte (multibyte-string-p string))
          (i existing-history))
     ;; At most HEIGHT existing rows need ordinary handling; all bulk input
     ;; rows that leave the viewport become one chunk below.
@@ -2008,10 +2099,15 @@ STRING is the pending output; STARTS and LENGTHS delimit its lines."
     (while (< i count)
       (let* ((length (aref lengths i))
              (start (aref starts i))
-             (text (concat (substring string start (+ start length))
+             (part (substring string start (+ start length)))
+             (text (concat (if multibyte (string-to-unibyte part) part)
                            (make-string (- width length) ?\s))))
         (aset new-lines destination
-              (make-ebb-line :cells nil :cells-valid nil :text text :dirty t)))
+              (make-ebb-line :cells nil
+                             :cells-valid nil
+                             :text text
+                             :text-end length
+                             :dirty t)))
       (cl-incf destination)
       (cl-incf i))
     (while (< destination height)
@@ -2034,21 +2130,23 @@ STRING is the pending output; STARTS and LENGTHS delimit its lines."
        screen cursor-y (min bottom (+ cursor-y count -1))))
     (ebb--trim-scrollback screen)))
 
+(defconst ebb--non-printable-ascii-regexp "[^\x20-\x7e]"
+  "Regexp matching any byte/char outside printable ASCII (0x20..0x7E).")
+
 (defun ebb-screen-write-crlf-block (screen string start end)
   "Try to write printable ASCII CRLF lines from STRING START through END on SCREEN.
 Return the first unconsumed index, or nil unless at least two complete lines
 are available.  Simple main-screen output is applied and stored in bulk."
-  (let ((i start)
+  (let ((case-fold-search nil)
+        (i start)
         starts
         lengths
         consumed
         done)
     (while (and (< i end) (not done))
-      (let ((line-start i))
-        (while (and (< i end)
-                    (let ((char (aref string i)))
-                      (and (>= char ?\s) (< char #x7f))))
-          (cl-incf i))
+      (let* ((line-start i)
+             (hit (string-match-p ebb--non-printable-ascii-regexp string i)))
+        (setq i (if (and hit (< hit end)) hit end))
         (if (and (< (1+ i) end)
                  (= (aref string i) ?\r)
                  (= (aref string (1+ i)) ?\n))
@@ -2059,13 +2157,45 @@ are available.  Simple main-screen output is applied and stored in bulk."
               (setq consumed i))
           (setq done t))))
     (when (cdr starts)
-      (let ((starts-vector (vconcat (nreverse starts)))
-            (lengths-vector (vconcat (nreverse lengths))))
-        (if (ebb--simple-crlf-block-p screen lengths-vector)
-            (ebb--apply-simple-crlf-block
-             screen string starts-vector lengths-vector)
+      (let* ((starts-vector (vconcat (nreverse starts)))
+             (lengths-vector (vconcat (nreverse lengths)))
+             (count (length lengths-vector)))
+        (cond
+         ((ebb--simple-crlf-block-p screen lengths-vector)
+          (ebb--apply-simple-crlf-block
+           screen string starts-vector lengths-vector))
+         ;; When a chunk starts mid-line (common across 4 KiB I/O slices),
+         ;; finish line 0 via the ordinary path so cursor-x returns to 0,
+         ;; then retry the bulk path for the remaining lines.
+         ((and (> count 2)
+               (not (zerop (ebb-screen-cursor-x screen))))
+          (let ((line0-start (aref starts-vector 0)))
+            (ebb-screen-write-string
+             screen string line0-start (+ line0-start (aref lengths-vector 0)))
+            (ebb-screen-carriage-return screen)
+            (ebb-screen-index screen))
+          (let ((rest-starts (cl-subseq starts-vector 1))
+                (rest-lengths (cl-subseq lengths-vector 1)))
+            (if (ebb--simple-crlf-block-p screen rest-lengths)
+                (ebb--apply-simple-crlf-block
+                 screen string rest-starts rest-lengths)
+              (let ((line 0)
+                    (rest-count (length rest-lengths))
+                    (ebb--history-batch-screen screen)
+                    (ebb--history-batch-rows nil))
+                (unwind-protect
+                    (while (< line rest-count)
+                      (let ((line-start (aref rest-starts line)))
+                        (ebb-screen-write-string
+                         screen string line-start
+                         (+ line-start (aref rest-lengths line))))
+                      (ebb-screen-carriage-return screen)
+                      (ebb-screen-index screen)
+                      (cl-incf line))
+                  (ebb--history-flush-batch)
+                  (ebb--trim-scrollback screen))))))
+         (t
           (let ((line 0)
-                (count (length lengths-vector))
                 (ebb--history-batch-screen screen)
                 (ebb--history-batch-rows nil))
             (unwind-protect
@@ -2078,7 +2208,7 @@ are available.  Simple main-screen output is applied and stored in bulk."
                   (ebb-screen-index screen)
                   (cl-incf line))
               (ebb--history-flush-batch)
-              (ebb--trim-scrollback screen))))
+              (ebb--trim-scrollback screen)))))
         consumed))))
 
 ;;;; ---- Cursor Movement ------------------------------------------------
@@ -2104,8 +2234,7 @@ are available.  Simple main-screen output is applied and stored in bulk."
         (cl-decf (ebb-screen-cursor-x screen)))
        ((and reverse-mode
              (ebb-screen-auto-wrap screen)
-             (not (gethash (ebb--line-at screen y)
-                           ebb--reverse-wrap-barriers)))
+             (not (ebb-line-wrap-barrier (ebb--line-at screen y))))
         (let* ((top (ebb-screen-scroll-top screen))
                (bottom (ebb-screen-scroll-bottom screen))
                (inside-vertical (<= top y bottom))
@@ -2233,8 +2362,8 @@ Handles LF, VT, FF."
          (ebb-screen--inside-horizontal-margins-p screen)))
     (ebb-screen--index screen horizontal-eligible)
     (ebb-screen-carriage-return screen))
-  (puthash (ebb--line-at screen (ebb-screen-cursor-y screen)) t
-           ebb--reverse-wrap-barriers))
+  (setf (ebb-line-wrap-barrier (ebb--line-at screen (ebb-screen-cursor-y screen)))
+        t))
 
 (defun ebb-screen-carriage-return (screen)
   "Move SCREEN's cursor to the active left edge."
@@ -2297,11 +2426,14 @@ This is the text-form equivalent of every cell satisfying
     (and text
          (null (ebb-line-uniform-attr line))
          (null (ebb-line-attr-runs line))
-         (let ((i 0)
-               (len (length text)))
-           (while (and (< i len) (= (aref text i) ?\s))
-             (cl-incf i))
-           (= i len)))))
+         (let ((text-end (ebb-line-text-end line)))
+           (if (eql text-end 0)
+               t
+             (let ((i 0)
+                   (len (min (length text) (or text-end (length text)))))
+               (while (and (< i len) (= (aref text i) ?\s))
+                 (cl-incf i))
+               (= i len)))))))
 
 (defun ebb--line-empty-for-history-p (line width)
   "Return non-nil when LINE has no content worth preserving in history.
@@ -2413,14 +2545,16 @@ line is in lazy text form or materialized cells."
 
 (defun ebb--viewport-row-has-graphics-p (screen row)
   "Return non-nil when viewport ROW of SCREEN intersects a static placement."
-  (let ((absolute (+ (ebb--history-physical-row-count-safe screen) row)))
-    (cl-some
-     (lambda (placement)
-       (and (not (ebb-graphics-placement-virtual placement))
-            (<= (ebb-graphics-placement-row placement) absolute)
-            (< absolute (+ (ebb-graphics-placement-row placement)
-                           (ebb-graphics-placement-rows placement)))))
-     (ebb-graphics-state-placements (ebb-screen-graphics screen)))))
+  (when-let* ((placements
+               (ebb-graphics-state-placements (ebb-screen-graphics screen))))
+    (let ((absolute (+ (ebb--history-physical-row-count-safe screen) row)))
+      (cl-some
+       (lambda (placement)
+         (and (not (ebb-graphics-placement-virtual placement))
+              (<= (ebb-graphics-placement-row placement) absolute)
+              (< absolute (+ (ebb-graphics-placement-row placement)
+                             (ebb-graphics-placement-rows placement)))))
+       placements))))
 
 (defun ebb--history-preserve-display (screen)
   "Append SCREEN's changed, meaningful main-screen viewport rows to history."
@@ -2441,8 +2575,8 @@ line is in lazy text form or materialized cells."
                             collect (ebb--line-history-signature
                                      (ebb--line-at screen row) width)))))
         (unless (equal signature
-                       (gethash screen ebb--preserved-display-signatures))
-          (puthash screen signature ebb--preserved-display-signatures)
+                       (ebb-screen-preserved-display-signature screen))
+          (setf (ebb-screen-preserved-display-signature screen) signature)
           (when (> end 0)
             (let ((ebb--history-batch-screen screen)
                   (ebb--history-batch-rows nil))
@@ -2476,11 +2610,12 @@ line is in lazy text form or materialized cells."
        (ebb--history-preserve-display screen)
        ;; Preserved placements keep their old absolute rows, which now lie in
        ;; history.  Delete only placements still intersecting the viewport.
-       (let ((base (if (ebb-screen-alt-screen screen)
-                       0
-                     (ebb--history-physical-row-count-safe screen))))
-         (ebb-graphics-clear-row-range
-          (ebb-screen-graphics screen) base (+ base height -1)))
+       (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+         (let ((base (if (ebb-screen-alt-screen screen)
+                         0
+                       (ebb--history-physical-row-count-safe screen))))
+           (ebb-graphics-clear-row-range
+            (ebb-screen-graphics screen) base (+ base height -1))))
        (ebb-screen-mark-viewport-reset screen)
        (let ((bg (and (ebb-screen-current-attr screen)
                       (ebb-attr-bg (ebb-screen-current-attr screen)))))
@@ -2499,57 +2634,116 @@ line is in lazy text form or materialized cells."
       (3 ;; Erase scrollback
        (ebb--history-clear screen)))))
 
+(defun ebb--erase-text-range (line text from to)
+  "Replace columns [FROM, TO) in LINE's TEXT string with spaces."
+  (when (< from to)
+    (if (multibyte-string-p text)
+        (let ((spaces (make-string (- to from) ?\s))
+              (len (length text)))
+          (setf (ebb-line-text line)
+                (cond
+                 ((and (zerop from) (= to len)) spaces)
+                 ((zerop from) (concat spaces (substring text to)))
+                 ((= to len) (concat (substring text 0 from) spaces))
+                 (t (concat (substring text 0 from) spaces
+                            (substring text to))))))
+      (let ((i from))
+        (while (< i to)
+          (aset text i ?\s)
+          (cl-incf i))))))
+
 (defun ebb-screen--erase-in-line-unprotected (screen mode)
   "Erase in line on SCREEN for MODE without preserving protected cells."
   (let* ((cx (ebb-screen-cursor-x screen))
          (cy (ebb-screen-cursor-y screen))
          (width (ebb-screen-width screen))
          (line (ebb--line-at screen cy))
-         (cells (ebb--line-ensure-cells line (ebb-screen-width screen)))
-         (initialized (ebb--line-initialized-cells line cells width))
-         (ecell (ebb--make-erase-cell screen)))
-    (pcase mode
-      (0 ;; cursor to end
-       (cl-loop for i from cx below width
-                do (aset cells i (ebb-cell-copy ecell))
-                and do (aset initialized i t))
-       (if (and (null (ebb-cell-attr ecell))
-                (ebb-line-text line)
-                (null (ebb-line-uniform-attr line)))
-           (progn
-             (cl-loop for i from cx below width
-                      do (aset (ebb-line-text line) i ?\s))
-             (ebb--line-set-attr-run line cx width nil))
-         (setf (ebb-line-text line) nil
-               (ebb-line-attr-runs line) nil
-               (ebb-line-uniform-attr line) nil)))
-      (1 ;; start to cursor
-       (cl-loop for i from 0 to cx
-                do (aset cells i (ebb-cell-copy ecell))
-                and do (aset initialized i t))
-       (if (and (null (ebb-cell-attr ecell))
-                (ebb-line-text line)
-                (null (ebb-line-uniform-attr line)))
-           (progn
-             (cl-loop for i from 0 to cx
-                      do (aset (ebb-line-text line) i ?\s))
-             (ebb--line-set-attr-run line 0 (1+ cx) nil))
-         (setf (ebb-line-text line) nil
-               (ebb-line-attr-runs line) nil
-               (ebb-line-uniform-attr line) nil)))
-      (2 ;; whole line
-       (cl-loop for i from 0 below width
-                do (aset cells i (ebb-cell-copy ecell))
-                and do (aset initialized i t))
-       (setf (ebb-line-prompt-begins line) nil)
-       (setf (ebb-line-prompt-ends line) nil)
-       (if (null (ebb-cell-attr ecell))
-           (progn
-             (setf (ebb-line-text line) (make-string width ?\s))
-             (setf (ebb-line-uniform-attr line) nil))
-         (setf (ebb-line-text line) nil)
-         (setf (ebb-line-uniform-attr line) nil))
-       (setf (ebb-line-attr-runs line) nil)))
+         (bg (and (ebb-screen-current-attr screen)
+                  (ebb-attr-bg (ebb-screen-current-attr screen))))
+         (text (ebb-line-text line)))
+    (if (and (null bg)
+             (or (= mode 2)
+                 (and text
+                      (= (length text) width)
+                      (null (ebb-line-uniform-attr line)))))
+        ;; Lazy-text fast path: update text/runs/initialized without
+        ;; materializing WIDTH cell structs.
+        (pcase mode
+          (0 ;; cursor to end
+           (let* ((text-end (ebb-line-text-end line))
+                  (limit (min width (or text-end width)))
+                  (initialized (ebb--line-initialized-bits line width))
+                  (i cx))
+             (ebb--erase-text-range line text cx limit)
+             (while (< i width)
+               (aset initialized i t)
+               (cl-incf i))
+             (when text-end
+               (setf (ebb-line-text-end line) (min cx limit)))
+             (ebb--line-set-attr-run line cx width nil)
+             (setf (ebb-line-cells-valid line) nil
+                   (ebb-line-rendered line) nil)))
+          (1 ;; start to cursor
+           (let* ((end (min (1+ cx) width))
+                  (text-end (ebb-line-text-end line))
+                  (limit (min end (or text-end width)))
+                  (initialized (ebb--line-initialized-bits line width))
+                  (i 0))
+             (ebb--erase-text-range line text 0 limit)
+             (while (< i end)
+               (aset initialized i t)
+               (cl-incf i))
+             (when (and text-end (>= end text-end))
+               (setf (ebb-line-text-end line) 0))
+             (ebb--line-set-attr-run line 0 end nil)
+             (setf (ebb-line-cells-valid line) nil
+                   (ebb-line-rendered line) nil)))
+          (2 ;; whole line
+           (setf (ebb-line-cells-valid line) nil
+                 (ebb-line-text line) (make-string width ?\s)
+                 (ebb-line-text-end line) 0
+                 (ebb-line-uniform-attr line) nil
+                 (ebb-line-attr-runs line) nil
+                 (ebb-line-attr-runs-tail line) nil
+                 (ebb-line-initialized line) (make-bool-vector width t)
+                 (ebb-line-prompt-begins line) nil
+                 (ebb-line-prompt-ends line) nil
+                 (ebb-line-rendered line) nil)))
+      ;; General materialized-cell path.
+      (let* ((cells (ebb--line-ensure-cells line width))
+             (initialized (ebb--line-initialized-cells line cells width))
+             (ecell (ebb--make-erase-cell screen)))
+        (pcase mode
+          (0
+           (cl-loop for i from cx below width
+                    do (aset cells i (ebb-cell-copy ecell))
+                    and do (aset initialized i t))
+           (setf (ebb-line-text line) nil
+                 (ebb-line-text-end line) nil
+                 (ebb-line-attr-runs line) nil
+                 (ebb-line-attr-runs-tail line) nil
+                 (ebb-line-uniform-attr line) nil))
+          (1
+           (cl-loop for i from 0 to cx
+                    do (aset cells i (ebb-cell-copy ecell))
+                    and do (aset initialized i t))
+           (setf (ebb-line-text line) nil
+                 (ebb-line-text-end line) nil
+                 (ebb-line-attr-runs line) nil
+                 (ebb-line-attr-runs-tail line) nil
+                 (ebb-line-uniform-attr line) nil))
+          (2
+           (cl-loop for i from 0 below width
+                    do (aset cells i (ebb-cell-copy ecell))
+                    and do (aset initialized i t))
+           (setf (ebb-line-prompt-begins line) nil
+                 (ebb-line-prompt-ends line) nil
+                 (ebb-line-text line) nil
+                 (ebb-line-text-end line) nil
+                 (ebb-line-uniform-attr line) nil
+                 (ebb-line-attr-runs line) nil
+                 (ebb-line-attr-runs-tail line) nil)))
+        (setf (ebb-line-rendered line) nil)))
     (setf (ebb-line-dirty line) t)
     (ebb--mark-dirty screen cy)))
 
@@ -2557,22 +2751,35 @@ line is in lazy text form or materialized cells."
   "Erase SCREEN's entire line ROW with BCE."
   (let* ((width (ebb-screen-width screen))
          (line (ebb--line-at screen row))
-         (cells (ebb--line-ensure-cells line (ebb-screen-width screen)))
-         (initialized (ebb--line-initialized-cells line cells width))
-         (ecell (ebb--make-erase-cell screen)))
-    (cl-loop for i from 0 below width
-             do (aset cells i (ebb-cell-copy ecell))
-             and do (aset initialized i t))
-    (if (null (ebb-cell-attr ecell))
-        (progn
-          (setf (ebb-line-text line) (make-string width ?\s))
-          (setf (ebb-line-uniform-attr line) nil))
-      (setf (ebb-line-text line) nil)
-      (setf (ebb-line-uniform-attr line) nil))
-    (setf (ebb-line-attr-runs line) nil)
-    (setf (ebb-line-prompt-begins line) nil)
-    (setf (ebb-line-prompt-ends line) nil)
-    (setf (ebb-line-wrapped line) nil)
+         (bg (and (ebb-screen-current-attr screen)
+                  (ebb-attr-bg (ebb-screen-current-attr screen)))))
+    (if (null bg)
+        (setf (ebb-line-cells-valid line) nil
+              (ebb-line-text line) (make-string width ?\s)
+              (ebb-line-text-end line) 0
+              (ebb-line-uniform-attr line) nil
+              (ebb-line-attr-runs line) nil
+              (ebb-line-attr-runs-tail line) nil
+              (ebb-line-initialized line) (make-bool-vector width t)
+              (ebb-line-prompt-begins line) nil
+              (ebb-line-prompt-ends line) nil
+              (ebb-line-wrapped line) nil
+              (ebb-line-rendered line) nil)
+      (let* ((cells (ebb--line-ensure-cells line width))
+             (initialized (ebb--line-initialized-cells line cells width))
+             (ecell (ebb--make-erase-cell screen)))
+        (cl-loop for i from 0 below width
+                 do (aset cells i (ebb-cell-copy ecell))
+                 and do (aset initialized i t))
+        (setf (ebb-line-text line) nil
+              (ebb-line-text-end line) nil
+              (ebb-line-uniform-attr line) nil
+              (ebb-line-attr-runs line) nil
+              (ebb-line-attr-runs-tail line) nil
+              (ebb-line-prompt-begins line) nil
+              (ebb-line-prompt-ends line) nil
+              (ebb-line-wrapped line) nil
+              (ebb-line-rendered line) nil)))
     (setf (ebb-line-dirty line) t)
     (ebb--mark-dirty screen row)))
 
@@ -2582,34 +2789,48 @@ line is in lazy text form or materialized cells."
          (cy (ebb-screen-cursor-y screen))
          (width (ebb-screen-width screen))
          (line (ebb--line-at screen cy))
-         (cells (ebb--line-ensure-cells line (ebb-screen-width screen)))
-         (initialized (ebb--line-initialized-cells line cells width))
-         (ecell (ebb--make-erase-cell screen))
-         (end (min (+ cx count) width)))
-    (cl-loop for i from cx below end
-             do (aset initialized i t))
-    (cl-loop for i from cx below end
-             do (aset cells i (ebb-cell-copy ecell)))
-    (if (and (null (ebb-cell-attr ecell))
-             (ebb-line-text line)
+         (end (min (+ cx count) width))
+         (bg (and (ebb-screen-current-attr screen)
+                  (ebb-attr-bg (ebb-screen-current-attr screen))))
+         (text (ebb-line-text line)))
+    (if (and (null bg)
+             text
+             (= (length text) width)
              (null (ebb-line-uniform-attr line)))
-        (progn
-          (cl-loop for i from cx below end
-                   do (aset (ebb-line-text line) i ?\s))
-          (ebb--line-set-attr-run line cx end nil))
-      (setf (ebb-line-text line) nil
-            (ebb-line-attr-runs line) nil
-            (ebb-line-uniform-attr line) nil))
+        (let* ((text-end (ebb-line-text-end line))
+               (limit (min end (or text-end width)))
+               (initialized (ebb--line-initialized-bits line width))
+               (i cx))
+          (ebb--erase-text-range line text cx limit)
+          (while (< i end)
+            (aset initialized i t)
+            (cl-incf i))
+          (when (and text-end (>= end text-end))
+            (setf (ebb-line-text-end line) (min cx text-end)))
+          (ebb--line-set-attr-run line cx end nil)
+          (setf (ebb-line-cells-valid line) nil
+                (ebb-line-rendered line) nil))
+      (let* ((cells (ebb--line-ensure-cells line width))
+             (initialized (ebb--line-initialized-cells line cells width))
+             (ecell (ebb--make-erase-cell screen)))
+        (cl-loop for i from cx below end
+                 do (aset initialized i t))
+        (cl-loop for i from cx below end
+                 do (aset cells i (ebb-cell-copy ecell)))
+        (setf (ebb-line-text line) nil
+              (ebb-line-attr-runs line) nil
+              (ebb-line-uniform-attr line) nil
+              (ebb-line-rendered line) nil)))
     (setf (ebb-line-dirty line) t)
     (ebb--mark-dirty screen cy)))
 
-(defun ebb-screen--protected-snapshot (screen table)
-  "Return protected cells from TABLE as coordinate snapshots for SCREEN."
+(defun ebb-screen--protected-snapshot (screen kind)
+  "Return KIND-protected cells as coordinate snapshots for SCREEN."
   (let ((width (ebb-screen-width screen))
         snapshots)
     (dotimes (row (ebb-screen-height screen))
       (let* ((line (ebb--line-at screen row))
-             (bits (gethash line table)))
+             (bits (ebb--line-protection-slot kind line)))
         (when (and bits (cl-loop for bit across bits thereis bit))
           (let* ((cells (ebb--line-ensure-cells line width))
                  (initialized (ebb--line-initialized-cells line cells width)))
@@ -2621,8 +2842,8 @@ line is in lazy text form or materialized cells."
                       snapshots)))))))
     snapshots))
 
-(defun ebb-screen--restore-protected-snapshot (screen table snapshots)
-  "Restore SCREEN cell SNAPSHOTS and their protection bits in TABLE."
+(defun ebb-screen--restore-protected-snapshot (screen kind snapshots)
+  "Restore SCREEN cell SNAPSHOTS and their KIND protection bits."
   (let ((width (ebb-screen-width screen)))
     (dolist (snapshot snapshots)
       (pcase-let ((`(,row ,column ,cell ,initialized-p) snapshot))
@@ -2630,7 +2851,7 @@ line is in lazy text form or materialized cells."
           (let* ((line (ebb--line-at screen row))
                  (cells (ebb--line-ensure-cells line width))
                  (initialized (ebb--line-initialized-cells line cells width))
-                 (bits (ebb--line-protection-bits table line width)))
+                 (bits (ebb--line-protection-bits kind line width)))
             (aset cells column cell)
             (aset initialized column initialized-p)
             (aset bits column t)
@@ -2665,43 +2886,50 @@ line is in lazy text form or materialized cells."
                (bits (ebb--line-initialized-cells line cells width)))
           (aset bits (cdr coordinate) t))))))
 
-(defun ebb-screen--preserving-protection (screen table function &rest args)
-  "Call FUNCTION with ARGS on SCREEN while preserving cells protected in TABLE."
-  (let* ((snapshots (ebb-screen--protected-snapshot screen table))
-         (initialized (and snapshots
-                           (ebb-screen--initialized-snapshot screen))))
-    (apply function screen args)
-    (when initialized
-      (ebb-screen--restore-initialized-snapshot screen initialized))
-    (ebb-screen--restore-protected-snapshot screen table snapshots)))
+(defun ebb-screen--preserving-protection (screen kind function &rest args)
+  "Call FUNCTION with ARGS on SCREEN while preserving KIND-protected cells."
+  (if (not (ebb-screen-protection-used screen))
+      (apply function screen args)
+    (let* ((snapshots (ebb-screen--protected-snapshot screen kind))
+           (initialized (and snapshots
+                             (ebb-screen--initialized-snapshot screen))))
+      (apply function screen args)
+      (when initialized
+        (ebb-screen--restore-initialized-snapshot screen initialized))
+      (ebb-screen--restore-protected-snapshot screen kind snapshots))))
 
 (defun ebb-screen--erase-preserving-dec-and-iso
     (screen function mode)
   "Call erase FUNCTION for MODE on SCREEN, preserving DEC and ISO protected cells."
-  (ebb-screen--preserving-protection
-   screen ebb--dec-protected-cells
-   (lambda (target erase-mode)
-     (ebb-screen--preserving-protection
-      target ebb--iso-protected-cells function erase-mode))
-   mode))
+  (if (not (ebb-screen-protection-used screen))
+      (funcall function screen mode)
+    (ebb-screen--preserving-protection
+     screen 'dec
+     (lambda (target erase-mode)
+       (ebb-screen--preserving-protection
+        target 'iso function erase-mode))
+     mode)))
 
 (defun ebb-screen-erase-in-display (screen mode)
   "Erase SCREEN's display for MODE while preserving ISO-protected cells."
-  (ebb-screen--preserving-protection
-   screen ebb--iso-protected-cells
-   #'ebb-screen--erase-in-display-unprotected mode))
+  (if (ebb-screen-protection-used screen)
+      (ebb-screen--preserving-protection
+       screen 'iso #'ebb-screen--erase-in-display-unprotected mode)
+    (ebb-screen--erase-in-display-unprotected screen mode)))
 
 (defun ebb-screen-erase-in-line (screen mode)
   "Erase SCREEN's line for MODE while preserving ISO-protected cells."
-  (ebb-screen--preserving-protection
-   screen ebb--iso-protected-cells
-   #'ebb-screen--erase-in-line-unprotected mode))
+  (if (ebb-screen-protection-used screen)
+      (ebb-screen--preserving-protection
+       screen 'iso #'ebb-screen--erase-in-line-unprotected mode)
+    (ebb-screen--erase-in-line-unprotected screen mode)))
 
 (defun ebb-screen-erase-chars (screen count)
   "Erase COUNT characters on SCREEN while preserving ISO-protected cells."
-  (ebb-screen--preserving-protection
-   screen ebb--iso-protected-cells
-   #'ebb-screen--erase-chars-unprotected count))
+  (if (ebb-screen-protection-used screen)
+      (ebb-screen--preserving-protection
+       screen 'iso #'ebb-screen--erase-chars-unprotected count)
+    (ebb-screen--erase-chars-unprotected screen count)))
 
 (defun ebb-screen-dec-erase-in-display (screen mode)
   "Selectively erase SCREEN's display for MODE with xterm-compatible protection."
@@ -2748,15 +2976,13 @@ line is in lazy text form or materialized cells."
                        for source-bits = (ebb--line-initialized-cells
                                           source source-cells width)
                        for destination-dec = (ebb--line-protection-bits
-                                              ebb--dec-protected-cells
-                                              destination width)
+                                              'dec destination width)
                        for source-dec = (ebb--line-protection-bits
-                                         ebb--dec-protected-cells source width)
+                                         'dec source width)
                        for destination-iso = (ebb--line-protection-bits
-                                              ebb--iso-protected-cells
-                                              destination width)
+                                              'iso destination width)
                        for source-iso = (ebb--line-protection-bits
-                                         ebb--iso-protected-cells source width)
+                                         'iso source width)
                        do (cl-loop for column from left to right
                                    do (aset destination-cells column
                                             (ebb-cell-copy
@@ -2771,10 +2997,8 @@ line is in lazy text form or materialized cells."
                        for line = (ebb--line-at screen row)
                        for cells = (ebb--line-ensure-cells line width)
                        for bits = (ebb--line-initialized-cells line cells width)
-                       for dec-bits = (ebb--line-protection-bits
-                                       ebb--dec-protected-cells line width)
-                       for iso-bits = (ebb--line-protection-bits
-                                       ebb--iso-protected-cells line width)
+                       for dec-bits = (ebb--line-protection-bits 'dec line width)
+                       for iso-bits = (ebb--line-protection-bits 'iso line width)
                        do (cl-loop for column from left to right
                                    do (aset cells column (make-ebb-cell))
                                    and do (aset bits column nil)
@@ -2790,11 +3014,12 @@ line is in lazy text form or materialized cells."
                    do (ebb--set-line-at screen i (ebb--line-at screen (- i n))))
           (cl-loop for i from cy below (+ cy n)
                    do (ebb--set-line-at screen i (ebb--make-empty-line width)))
-          (let ((base (if (ebb-screen-alt-screen screen)
-                          0
-                        (ebb-screen-history-row-count screen))))
-            (ebb-graphics-scroll (ebb-screen-graphics screen) 'down
-                                 (+ base cy) (+ base bot) n)))
+          (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+            (let ((base (if (ebb-screen-alt-screen screen)
+                            0
+                          (ebb-screen-history-row-count screen))))
+              (ebb-graphics-scroll (ebb-screen-graphics screen) 'down
+                                   (+ base cy) (+ base bot) n))))
         (ebb--mark-region-dirty screen cy bot)))))
 
 (defun ebb-screen-delete-lines (screen count)
@@ -2820,15 +3045,13 @@ line is in lazy text form or materialized cells."
                        for source-bits = (ebb--line-initialized-cells
                                           source source-cells width)
                        for destination-dec = (ebb--line-protection-bits
-                                              ebb--dec-protected-cells
-                                              destination width)
+                                              'dec destination width)
                        for source-dec = (ebb--line-protection-bits
-                                         ebb--dec-protected-cells source width)
+                                         'dec source width)
                        for destination-iso = (ebb--line-protection-bits
-                                              ebb--iso-protected-cells
-                                              destination width)
+                                              'iso destination width)
                        for source-iso = (ebb--line-protection-bits
-                                         ebb--iso-protected-cells source width)
+                                         'iso source width)
                        do (cl-loop for column from left to right
                                    do (aset destination-cells column
                                             (ebb-cell-copy
@@ -2843,10 +3066,8 @@ line is in lazy text form or materialized cells."
                        for line = (ebb--line-at screen row)
                        for cells = (ebb--line-ensure-cells line width)
                        for bits = (ebb--line-initialized-cells line cells width)
-                       for dec-bits = (ebb--line-protection-bits
-                                       ebb--dec-protected-cells line width)
-                       for iso-bits = (ebb--line-protection-bits
-                                       ebb--iso-protected-cells line width)
+                       for dec-bits = (ebb--line-protection-bits 'dec line width)
+                       for iso-bits = (ebb--line-protection-bits 'iso line width)
                        do (cl-loop for column from left to right
                                    do (aset cells column (make-ebb-cell))
                                    and do (aset bits column nil)
@@ -2861,11 +3082,12 @@ line is in lazy text form or materialized cells."
                    do (ebb--set-line-at screen i (ebb--line-at screen (+ i n))))
           (cl-loop for i from (1+ (- bot n)) to bot
                    do (ebb--set-line-at screen i (ebb--make-empty-line width)))
-          (let ((base (if (ebb-screen-alt-screen screen)
-                          0
-                        (ebb-screen-history-row-count screen))))
-            (ebb-graphics-scroll (ebb-screen-graphics screen) 'up
-                                 (+ base cy) (+ base bot) n)))
+          (when (ebb-graphics-state-placements (ebb-screen-graphics screen))
+            (let ((base (if (ebb-screen-alt-screen screen)
+                            0
+                          (ebb-screen-history-row-count screen))))
+              (ebb-graphics-scroll (ebb-screen-graphics screen) 'up
+                                   (+ base cy) (+ base bot) n))))
         (ebb--mark-region-dirty screen cy bot)))))
 
 ;;;; ---- Character Operations -------------------------------------------
@@ -2878,14 +3100,13 @@ line is in lazy text form or materialized cells."
          (right (ebb-screen-right-margin screen))
          (margins (ebb-screen-horizontal-margins-enabled-p screen)))
     (when (or (not margins) (<= left cx right))
-      (let* ((line (ebb--line-at screen cy))
-             (cells (ebb--line-ensure-cells line (ebb-screen-width screen)))
-             (initialized
-              (ebb--line-initialized-cells line cells (ebb-screen-width screen)))
-             (dec-bits (ebb--line-protection-bits
-                        ebb--dec-protected-cells line (ebb-screen-width screen)))
-             (iso-bits (ebb--line-protection-bits
-                        ebb--iso-protected-cells line (ebb-screen-width screen)))
+      (let* ((width (ebb-screen-width screen))
+             (line (ebb--line-at screen cy))
+             (cells (ebb--line-ensure-cells line width))
+             (initialized (ebb--line-initialized-cells line cells width))
+             (protected (ebb-screen-protection-used screen))
+             (dec-bits (and protected (ebb--line-protection-bits 'dec line width)))
+             (iso-bits (and protected (ebb--line-protection-bits 'iso line width)))
              (n (min count (1+ (- right cx)))))
         (setf (ebb-line-text line) nil
               (ebb-line-attr-runs line) nil
@@ -2894,12 +3115,14 @@ line is in lazy text form or materialized cells."
         (cl-loop for i from right downto (+ cx n)
                  do (aset cells i (aref cells (- i n)))
                  and do (aset initialized i (aref initialized (- i n)))
-                 and do (aset dec-bits i (aref dec-bits (- i n)))
+                 and when protected
+                 do (aset dec-bits i (aref dec-bits (- i n)))
                  and do (aset iso-bits i (aref iso-bits (- i n))))
         (cl-loop for i from cx below (+ cx n)
                  do (aset cells i (make-ebb-cell))
                  and do (aset initialized i t)
-                 and do (aset dec-bits i nil)
+                 and when protected
+                 do (aset dec-bits i nil)
                  and do (aset iso-bits i nil))
         (setf (ebb-line-dirty line) t)
         (ebb--mark-dirty screen cy)))))
@@ -2912,14 +3135,13 @@ line is in lazy text form or materialized cells."
          (right (ebb-screen-right-margin screen))
          (margins (ebb-screen-horizontal-margins-enabled-p screen)))
     (when (or (not margins) (<= left cx right))
-      (let* ((line (ebb--line-at screen cy))
-             (cells (ebb--line-ensure-cells line (ebb-screen-width screen)))
-             (initialized
-              (ebb--line-initialized-cells line cells (ebb-screen-width screen)))
-             (dec-bits (ebb--line-protection-bits
-                        ebb--dec-protected-cells line (ebb-screen-width screen)))
-             (iso-bits (ebb--line-protection-bits
-                        ebb--iso-protected-cells line (ebb-screen-width screen)))
+      (let* ((width (ebb-screen-width screen))
+             (line (ebb--line-at screen cy))
+             (cells (ebb--line-ensure-cells line width))
+             (initialized (ebb--line-initialized-cells line cells width))
+             (protected (ebb-screen-protection-used screen))
+             (dec-bits (and protected (ebb--line-protection-bits 'dec line width)))
+             (iso-bits (and protected (ebb--line-protection-bits 'iso line width)))
              (n (min count (1+ (- right cx))))
              (fill-start (1+ (- right n))))
         (setf (ebb-line-text line) nil
@@ -2929,12 +3151,14 @@ line is in lazy text form or materialized cells."
         (cl-loop for i from cx below fill-start
                  do (aset cells i (aref cells (+ i n)))
                  and do (aset initialized i (aref initialized (+ i n)))
-                 and do (aset dec-bits i (aref dec-bits (+ i n)))
+                 and when protected
+                 do (aset dec-bits i (aref dec-bits (+ i n)))
                  and do (aset iso-bits i (aref iso-bits (+ i n))))
         (cl-loop for i from fill-start to right
                  do (aset cells i (make-ebb-cell))
                  and do (aset initialized i t)
-                 and do (aset dec-bits i nil)
+                 and when protected
+                 do (aset dec-bits i nil)
                  and do (aset iso-bits i nil))
         (setf (ebb-line-dirty line) t)
         (ebb--mark-dirty screen cy)))))
@@ -3008,7 +3232,7 @@ line is in lazy text form or materialized cells."
   "Discard incomplete uploads on SCREEN and its saved grids."
   (setf (ebb-graphics-state-upload (ebb-screen-graphics screen)) nil)
   (dolist (saved (list (ebb-screen-alt-screen screen)
-                       (gethash screen ebb--alt-saved-grid)))
+                       (ebb-screen-alt-saved-grid screen)))
     (when-let* ((graphics (and saved (ebb-alt-save-graphics saved))))
       (setf (ebb-graphics-state-upload graphics) nil))))
 
@@ -3091,18 +3315,18 @@ starting blank, as DECSET 47/1047 require."
            :origin-mode (ebb-screen-origin-mode screen)
            :insert-mode (ebb-screen-insert-mode screen)))
     ;; Load the alternate screen's own saved cursor position.
-    (let ((alt-cursor (gethash screen ebb--alt-saved-cursors)))
+    (let ((alt-cursor (ebb-screen-alt-saved-cursor screen)))
       (setf (ebb-screen-cursor-saved-x screen) (or (nth 0 alt-cursor) 0)
             (ebb-screen-cursor-saved-y screen) (or (nth 1 alt-cursor) 0)
             (ebb-screen-cursor-saved-attr screen) (nth 2 alt-cursor)
             (ebb-screen-cursor-saved-p screen) (and alt-cursor t)))
     ;; xterm's resetMargins: a buffer switch clears horizontal margins.
-    (remhash screen ebb--horizontal-margins)
+    (setf (ebb-screen-horizontal-margins screen) nil)
     ;; Restore the alternate grid for a non-clearing switch (47/1047); a
     ;; clearing switch (1049) and a first entry start from a blank grid.
     (let* ((w (ebb-screen-width screen))
            (h (ebb-screen-height screen))
-           (saved (and (not clear) (gethash screen ebb--alt-saved-grid))))
+           (saved (and (not clear) (ebb-screen-alt-saved-grid screen))))
       (if saved
           (setf (ebb-screen-lines screen) (ebb-alt-save-lines saved)
                 (ebb-screen-line-start screen) (ebb-alt-save-line-start saved)
@@ -3135,7 +3359,7 @@ starting blank, as DECSET 47/1047 require."
         (setf (ebb-screen-pending-wrap screen) nil)
         (setf (ebb-screen-scroll-top screen) 0)
         (setf (ebb-screen-scroll-bottom screen) (1- h)))
-      (remhash screen ebb--alt-saved-grid)
+      (setf (ebb-screen-alt-saved-grid screen) nil)
       (setf (ebb-screen-graphics screen)
             (ebb-graphics-create
              (ebb-graphics-state-budget
@@ -3151,24 +3375,23 @@ starting blank, as DECSET 47/1047 require."
   "Leave SCREEN's alternate screen buffer, restoring main screen."
   (when-let* ((saved (ebb-screen-alt-screen screen)))
     ;; Preserve the alternate grid for a later non-clearing switch.
-    (puthash screen
-             (make-ebb-alt-save
-              :lines (ebb-screen-lines screen)
-              :width (ebb-screen-width screen)
-              :height (ebb-screen-height screen)
-              :line-start (ebb-screen-line-start screen)
-              :cursor-x (ebb-screen-cursor-x screen)
-              :cursor-y (ebb-screen-cursor-y screen)
-              :pending-wrap (ebb-screen-pending-wrap screen)
-              :current-attr (ebb-attr-copy (ebb-screen-current-attr screen))
-              :scroll-top (ebb-screen-scroll-top screen)
-              :scroll-bottom (ebb-screen-scroll-bottom screen)
-              :history-next-id (ebb-screen-history-next-id screen)
-              :history-generation (ebb-screen-history-generation screen)
-              :auto-wrap (ebb-screen-auto-wrap screen)
-              :origin-mode (ebb-screen-origin-mode screen)
-              :insert-mode (ebb-screen-insert-mode screen))
-             ebb--alt-saved-grid)
+    (setf (ebb-screen-alt-saved-grid screen)
+          (make-ebb-alt-save
+           :lines (ebb-screen-lines screen)
+           :width (ebb-screen-width screen)
+           :height (ebb-screen-height screen)
+           :line-start (ebb-screen-line-start screen)
+           :cursor-x (ebb-screen-cursor-x screen)
+           :cursor-y (ebb-screen-cursor-y screen)
+           :pending-wrap (ebb-screen-pending-wrap screen)
+           :current-attr (ebb-attr-copy (ebb-screen-current-attr screen))
+           :scroll-top (ebb-screen-scroll-top screen)
+           :scroll-bottom (ebb-screen-scroll-bottom screen)
+           :history-next-id (ebb-screen-history-next-id screen)
+           :history-generation (ebb-screen-history-generation screen)
+           :auto-wrap (ebb-screen-auto-wrap screen)
+           :origin-mode (ebb-screen-origin-mode screen)
+           :insert-mode (ebb-screen-insert-mode screen)))
     ;; Alternate-screen image data is discarded, but its bytes participate in
     ;; the same terminal-wide quota while the alternate screen is active.
     (ebb-graphics-reset (ebb-screen-graphics screen))
@@ -3179,16 +3402,16 @@ starting blank, as DECSET 47/1047 require."
     (setf (ebb-screen-pending-wrap screen) (ebb-alt-save-pending-wrap saved))
     ;; Preserve the alternate screen's DECSC position and rendition state so a
     ;; later visit restores them, then restore the main screen's.
-    (puthash screen (list (ebb-screen-cursor-saved-x screen)
-                          (ebb-screen-cursor-saved-y screen)
-                          (ebb-screen-cursor-saved-attr screen))
-             ebb--alt-saved-cursors)
+    (setf (ebb-screen-alt-saved-cursor screen)
+          (list (ebb-screen-cursor-saved-x screen)
+                (ebb-screen-cursor-saved-y screen)
+                (ebb-screen-cursor-saved-attr screen)))
     (ebb--swap-saved-renditions screen)
     (setf (ebb-screen-cursor-saved-x screen) (ebb-alt-save-cursor-saved-x saved))
     (setf (ebb-screen-cursor-saved-y screen) (ebb-alt-save-cursor-saved-y saved))
     (setf (ebb-screen-cursor-saved-attr screen) (ebb-alt-save-cursor-saved-attr saved))
     (setf (ebb-screen-cursor-saved-p screen) (ebb-alt-save-cursor-saved-p saved))
-    (remhash screen ebb--horizontal-margins)
+    (setf (ebb-screen-horizontal-margins screen) nil)
     (setf (ebb-screen-current-attr screen) (ebb-alt-save-current-attr saved))
     (setf (ebb-screen-scroll-top screen) (ebb-alt-save-scroll-top saved))
     (setf (ebb-screen-scroll-bottom screen) (ebb-alt-save-scroll-bottom saved))
@@ -3221,17 +3444,16 @@ starting blank, as DECSET 47/1047 require."
         (ebb-screen-cursor-saved-y screen) (ebb-screen-cursor-y screen)
         (ebb-screen-cursor-saved-attr screen)
         (ebb-attr-copy (ebb-screen-current-attr screen))
-        (ebb-screen-cursor-saved-p screen) t)
-  (puthash screen
-           (list (ebb-screen-origin-mode screen)
-                 (ebb-screen-auto-wrap screen)
-                 (ebb-screen-charset-g0 screen)
-                 (ebb-screen-charset-g1 screen)
-                 (ebb-screen-charset-g2 screen)
-                 (ebb-screen-charset-g3 screen)
-                 (ebb-screen-charset-active screen)
-                 (gethash screen ebb--dec-protection-mode-screens))
-           ebb--saved-cursor-renditions))
+        (ebb-screen-cursor-saved-p screen) t
+        (ebb-screen-saved-cursor-rendition screen)
+        (list (ebb-screen-origin-mode screen)
+              (ebb-screen-auto-wrap screen)
+              (ebb-screen-charset-g0 screen)
+              (ebb-screen-charset-g1 screen)
+              (ebb-screen-charset-g2 screen)
+              (ebb-screen-charset-g3 screen)
+              (ebb-screen-charset-active screen)
+              (ebb-screen-dec-protection-mode screen))))
 
 (defun ebb-screen-restore-cursor (screen)
   "Restore SCREEN's cursor and rendition state (DECRC)."
@@ -3242,7 +3464,7 @@ starting blank, as DECSET 47/1047 require."
   (setf (ebb-screen-cursor-x screen)
         (ebb--clamp (ebb-screen-cursor-saved-x screen)
                     0 (1- (ebb-screen-line-width screen))))
-  (when-let* ((state (gethash screen ebb--saved-cursor-renditions)))
+  (when-let* ((state (ebb-screen-saved-cursor-rendition screen)))
     (setf (ebb-screen-origin-mode screen) (nth 0 state)
           (ebb-screen-auto-wrap screen) (nth 1 state)
           (ebb-screen-charset-g0 screen) (nth 2 state)
@@ -3272,9 +3494,10 @@ starting blank, as DECSET 47/1047 require."
        (make-ebb-line :cells nil
                       :cells-valid nil
                       :text (make-string width ?E)
+                      :text-end width
                       :dirty t)))
-    (remhash screen ebb--horizontal-margins)
-    (setf (ebb-screen-scroll-top screen) 0
+    (setf (ebb-screen-horizontal-margins screen) nil
+          (ebb-screen-scroll-top screen) 0
           (ebb-screen-scroll-bottom screen) (1- height)
           (ebb-screen-cursor-x screen) 0
           (ebb-screen-cursor-y screen) 0
@@ -3284,13 +3507,13 @@ starting blank, as DECSET 47/1047 require."
 
 (defun ebb-screen-column-mode-enabled-p (screen)
   "Return non-nil when SCREEN is in 132-column mode."
-  (and (gethash screen ebb--column-mode-screens) t))
+  (and (ebb-screen-column-mode screen) t))
 
 (defun ebb-screen-set-column-mode (screen wide)
   "Select 132 columns on SCREEN when WIDE is non-nil, otherwise 80 columns.
 DECCOLM clears the display, restores full-screen margins, and homes the cursor."
-  (puthash screen (and wide t) ebb--column-mode-screens)
-  (remhash screen ebb--horizontal-margins)
+  (setf (ebb-screen-column-mode screen) (and wide t)
+        (ebb-screen-horizontal-margins screen) nil)
   (let ((width (if wide 132 80))
         (height (ebb-screen-height screen)))
     (ebb-screen-resize screen width height)
@@ -3334,7 +3557,7 @@ DECCOLM clears the display, restores full-screen margins, and homes the cursor."
          (ebb-screen-enter-alt screen)
        (when (ebb-screen-alt-screen screen)
          (ebb-screen-leave-alt screen)
-         (remhash screen ebb--alt-saved-grid))))
+         (setf (ebb-screen-alt-saved-grid screen) nil))))
     (1048 ;; Cursor save only
      (if value
          (ebb-screen-save-cursor screen)
@@ -3382,10 +3605,24 @@ NEW-HEIGHT specify the replacement grid."
                         (ebb--fit-cells-to-width normalized new-width)
                         (ebb-line-cells-valid line) t
                         (ebb-line-text line) nil
+                        (ebb-line-text-end line) nil
                         (ebb-line-attr-runs line) nil
+                        (ebb-line-attr-runs-tail line) nil
                         (ebb-line-uniform-attr line) nil
                         (ebb-line-rendered line) nil
                         (ebb-line-dirty line) t)
+                  (when (ebb-line-dec-protected line)
+                    (setf (ebb-line-dec-protected line)
+                          (ebb--resize-bool-vector
+                           (ebb-line-dec-protected line) new-width)))
+                  (when (ebb-line-iso-protected line)
+                    (setf (ebb-line-iso-protected line)
+                          (ebb--resize-bool-vector
+                           (ebb-line-iso-protected line) new-width)))
+                  (when (ebb-line-initialized line)
+                    (setf (ebb-line-initialized line)
+                          (ebb--resize-bool-vector
+                           (ebb-line-initialized line) new-width)))
                   line)
               (ebb--make-empty-line new-width))))
     (setf (ebb-screen-lines screen) lines
@@ -3499,7 +3736,7 @@ Reflow main-screen lines, preserve the logical cursor, and reset the region."
                  (/= new-height (ebb-screen-height screen))))
     (when-let* ((saved (ebb-screen-alt-screen screen)))
       (ebb--resize-alt-save saved new-width new-height))
-    (when-let* ((saved (gethash screen ebb--alt-saved-grid)))
+    (when-let* ((saved (ebb-screen-alt-saved-grid screen)))
       (ebb--resize-alt-save saved new-width new-height t))
     (when (ebb-screen-scrollback screen)
       (setf (ebb-screen-scrollback-dirty screen) t)
@@ -3816,15 +4053,15 @@ Does not clear the display (DECSTR)."
         (ebb-screen-charset-g1 screen) 'us-ascii
         (ebb-screen-charset-g2 screen) 'us-ascii
         (ebb-screen-charset-g3 screen) 'us-ascii
-        (ebb-screen-charset-active screen) 'g0)
-  (remhash screen ebb--saved-cursor-renditions)
-  (remhash screen ebb--alt-saved-cursor-renditions)
-  (remhash screen ebb--alt-saved-cursors)
-  (remhash screen ebb--alt-saved-grid)
-  (remhash screen ebb--horizontal-margins)
-  (remhash screen ebb--reverse-wrap-modes)
-  (remhash screen ebb--dec-protection-mode-screens)
-  (remhash screen ebb--iso-protection-mode-screens))
+        (ebb-screen-charset-active screen) 'g0
+        (ebb-screen-saved-cursor-rendition screen) nil
+        (ebb-screen-alt-saved-cursor-rendition screen) nil
+        (ebb-screen-alt-saved-cursor screen) nil
+        (ebb-screen-alt-saved-grid screen) nil
+        (ebb-screen-horizontal-margins screen) nil
+        (ebb-screen-reverse-wrap-mode screen) nil
+        (ebb-screen-dec-protection-mode screen) nil
+        (ebb-screen-iso-protection-mode screen) nil))
 
 (defun ebb-screen-reset (screen)
   "Full terminal reset of SCREEN (RIS).
@@ -3833,13 +4070,14 @@ Retain main-screen output when `ebb--preserve-history-on-reset' is non-nil."
     (when (ebb-screen-alt-screen screen)
       (ebb-screen-leave-alt screen))
     (ebb--history-preserve-display screen))
-  (when (gethash screen ebb--column-mode-screens)
+  (when (ebb-screen-column-mode screen)
     (ebb-screen-resize screen 80 (ebb-screen-height screen)))
-  (remhash screen ebb--column-mode-screens)
-  (remhash screen ebb--horizontal-margins)
-  (remhash screen ebb--reverse-wrap-modes)
-  (remhash screen ebb--dec-protection-mode-screens)
-  (remhash screen ebb--iso-protection-mode-screens)
+  (setf (ebb-screen-column-mode screen) nil
+        (ebb-screen-horizontal-margins screen) nil
+        (ebb-screen-reverse-wrap-mode screen) nil
+        (ebb-screen-dec-protection-mode screen) nil
+        (ebb-screen-iso-protection-mode screen) nil
+        (ebb-screen-protection-used screen) nil)
   (let ((w (ebb-screen-width screen))
         (h (ebb-screen-height screen)))
     ;; Leave alt screen if active
@@ -3858,10 +4096,10 @@ Retain main-screen output when `ebb--preserve-history-on-reset' is non-nil."
     (setf (ebb-screen-cursor-saved-y screen) 0)
     (setf (ebb-screen-cursor-saved-attr screen) nil)
     (setf (ebb-screen-cursor-saved-p screen) nil)
-    (remhash screen ebb--saved-cursor-renditions)
-    (remhash screen ebb--alt-saved-cursor-renditions)
-    (remhash screen ebb--alt-saved-cursors)
-    (remhash screen ebb--alt-saved-grid)
+    (setf (ebb-screen-saved-cursor-rendition screen) nil
+          (ebb-screen-alt-saved-cursor-rendition screen) nil
+          (ebb-screen-alt-saved-cursor screen) nil
+          (ebb-screen-alt-saved-grid screen) nil)
     (setf (ebb-screen-cursor-style screen) :block)
     (setf (ebb-screen-cursor-visible screen) t)
     (setf (ebb-screen-pending-wrap screen) nil)
@@ -4018,16 +4256,14 @@ clipped, and validated by the caller."
   (let ((width (ebb-screen-width screen))
         (attr (and (ebb-screen-current-attr screen)
                    (ebb-attr-copy (ebb-screen-current-attr screen))))
-        (dec (and (gethash screen ebb--dec-protection-mode-screens) t))
-        (iso (and (gethash screen ebb--iso-protection-mode-screens) t)))
+        (dec (and (ebb-screen-dec-protection-mode screen) t))
+        (iso (and (ebb-screen-iso-protection-mode screen) t)))
     (cl-loop for row from top to bottom
              for line = (ebb--line-at screen row)
              for cells = (ebb--line-ensure-cells line width)
              for initialized = (ebb--line-initialized-cells line cells width)
-             for dec-bits = (ebb--line-protection-bits
-                             ebb--dec-protected-cells line width)
-             for iso-bits = (ebb--line-protection-bits
-                             ebb--iso-protected-cells line width)
+             for dec-bits = (ebb--line-protection-bits 'dec line width)
+             for iso-bits = (ebb--line-protection-bits 'iso line width)
              do (ebb--clear-wide-char-at screen row left)
              and do (ebb--clear-wide-char-at screen row right)
              and do (cl-loop for column from left to right
@@ -4050,10 +4286,8 @@ not affect this operation, matching DECSERA semantics."
              for line = (ebb--line-at screen row)
              for cells = (ebb--line-ensure-cells line width)
              for initialized = (ebb--line-initialized-cells line cells width)
-             for dec-bits = (ebb--line-protection-bits
-                             ebb--dec-protected-cells line width)
-             for iso-bits = (ebb--line-protection-bits
-                             ebb--iso-protected-cells line width)
+             for dec-bits = (ebb--line-protection-bits 'dec line width)
+             for iso-bits = (ebb--line-protection-bits 'iso line width)
              do (ebb--clear-wide-char-at screen row left)
              and do (ebb--clear-wide-char-at screen row right)
              and do (cl-loop for column from left to right
@@ -4078,10 +4312,8 @@ source coordinates, already clipped."
       (let* ((line (ebb--line-at screen (+ source-top row-offset)))
              (cells (ebb--line-ensure-cells line width))
              (initialized (ebb--line-initialized-cells line cells width))
-             (dec-bits (ebb--line-protection-bits
-                        ebb--dec-protected-cells line width))
-             (iso-bits (ebb--line-protection-bits
-                        ebb--iso-protected-cells line width))
+             (dec-bits (ebb--line-protection-bits 'dec line width))
+             (iso-bits (ebb--line-protection-bits 'iso line width))
              row)
         (dotimes (column-offset columns)
           (let ((column (+ source-left column-offset)))
@@ -4100,10 +4332,8 @@ source coordinates, already clipped."
                        (cells (ebb--line-ensure-cells line width))
                        (initialized (ebb--line-initialized-cells
                                      line cells width))
-                       (dec-bits (ebb--line-protection-bits
-                                  ebb--dec-protected-cells line width))
-                       (iso-bits (ebb--line-protection-bits
-                                  ebb--iso-protected-cells line width)))
+                       (dec-bits (ebb--line-protection-bits 'dec line width))
+                       (iso-bits (ebb--line-protection-bits 'iso line width)))
                   (ebb--clear-wide-char-at screen row destination-left)
                   (ebb--clear-wide-char-at
                    screen row (+ destination-left (1- columns)))

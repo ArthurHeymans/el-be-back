@@ -44,6 +44,20 @@ jobs:
         if: matrix.serial
         run: emacs -Q --batch -L . -l ebb-serial-test.el -f ert-run-tests-batch-and-exit
 
+      - name: Run byte-compiled tests
+        run: |
+          COMPILED="$(mktemp -d)"
+          trap 'rm -rf "$COMPILED"' EXIT
+          emacs -Q --batch -L "$COMPILED" -L . --eval "(progn
+            (require 'bytecomp)
+            (dolist (f '(\"ebb-graphics\" \"ebb-term\" \"ebb-parse\" \"ebb-render\" \"ebb-input\" \"ebb-io\" \"ebb-shell\" \"ebb-eshell\" \"ebb-trace\" \"ebb\" \"ebb-compile\" \"ebb-serial-codec\" \"ebb-serial\"))
+              (let ((byte-compile-dest-file-function
+                     (lambda (_) (expand-file-name (concat f \".elc\") \"$COMPILED\"))))
+                (unless (byte-compile-file (expand-file-name (concat f \".el\")))
+                  (error \"Byte-compilation failed for %s.el\" f)))))"
+          emacs -Q --batch -L "$COMPILED" -L . -l ebb-test.el -f ert-run-tests-batch-and-exit
+          emacs -Q --batch -L "$COMPILED" -L . -l ebb-serial-test.el -f ert-run-tests-batch-and-exit
+
       - name: Check out esctest2
         if: matrix.emacs == '30.2'
         run: |

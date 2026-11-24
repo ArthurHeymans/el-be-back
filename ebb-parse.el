@@ -39,6 +39,8 @@ configurable bound improves compatibility with clients that send larger APCs."
 
 ;;;; ---- Data Structures ------------------------------------------------
 
+(cl-declaim (optimize (safety 0)))
+
 (cl-defstruct (ebb-parser (:copier nil))
   "VT escape sequence parser."
   (state :ground)        ; current state keyword
@@ -50,6 +52,12 @@ configurable bound improves compatibility with clients that send larger APCs."
   (param-string "")      ; digits, semicolons, colons
   (private nil)          ; ?/>/= prefix char or nil
   (intermediates "")     ; ESC/CSI intermediate bytes (space etc.)
+  (csi-scratch (make-vector 16 0)) ; reusable param staging buffer
+  (csi-param-pool        ; reusable exact-length param vectors (lengths 0..16)
+   (let ((pool (make-vector 17 nil)))
+     (dotimes (n 17)
+       (aset pool n (make-vector n 0)))
+     pool))
   ;; String collection
   (osc-parts nil)        ; reversed single-char chunks of the OSC payload
   (osc-length 0)
@@ -66,6 +74,8 @@ configurable bound improves compatibility with clients that send larger APCs."
   (string-state nil)     ; :osc, :dcs, :apc, or :ignored after ESC in a string
   ;; Charset
   (charset-slot 0))
+
+(cl-declaim (optimize (safety 1)))
 
 ;;;; ---- Logging / Emit / Respond ---------------------------------------
 
@@ -232,6 +242,19 @@ If the parameter is a sub-parameter list, return the first element."
 
 ;;;; ---- Entry Point ----------------------------------------------------
 
+(defconst ebb-parse--non-ascii-printable-regexp
+  "[^\x20-\x7e]"
+  "Matches any character outside printable ASCII (0x20-0x7E).")
+
+(defconst ebb-parse--non-printable-multibyte-regexp
+  (concat "[\x00-\x1f\x7f"
+          (string #x80) "-" (string #x9f)
+          (string #x3fff80) "-" (string #x3fffff)
+          "]")
+  "Matches any character that terminates a ground-state multibyte printable run.")
+
+(defvar ebb-parse--csi-dispatch)
+
 (defun ebb-parse-bytes (parser string &optional start end)
   "Parse STRING from START to END through PARSER.
 Returns the number of characters consumed.
@@ -240,11 +263,34 @@ STRING must be a decoded multibyte string, as produced by the UTF-8
 process decoder or `ebb-serial-codec-decode'.  Raw unibyte bytes are
 interpreted as Latin-1 text with 8-bit C1 controls, which corrupts
 unibyte UTF-8 whose continuation bytes fall below #xa0."
-  (let ((i (or start 0))
-        (e (or end (length string)))
-        (multibyte (multibyte-string-p string))
-        (screen (ebb-parser-screen parser)))
-    (while (< i e)
+  (let* ((start (or start 0))
+         (e (or end (length string)))
+         (multibyte (multibyte-string-p string)))
+    (when (< e (length string))
+      ;; Bound trailing bytes once so C `string-match-p' scans never run past E.
+      (setq string (substring string start e)
+            e (- e start)
+            start 0))
+    (if (and multibyte
+             (/= (length string) (string-bytes string))
+             (> (- e start) 2048))
+        ;; Emacs caches only one multibyte string's charpos->bytepos hint
+        ;; globally.  Pre-slicing in a single forward pass keeps that hint
+        ;; pinned to STRING (O(N) total) before any per-row multibyte text
+        ;; accesses can evict it, and bounds each recursive slice to 2048 chars.
+        (let ((slices nil)
+              (pos start))
+          (while (< pos e)
+            (let ((next (min e (+ pos 2048))))
+              (push (substring string pos next) slices)
+              (setq pos next)))
+          (dolist (slice (nreverse slices))
+            (ebb-parse-bytes parser slice 0 (length slice)))
+          (- e start))
+      (let ((i start)
+            (screen (ebb-parser-screen parser))
+            (case-fold-search nil))
+        (while (< i e)
       (let ((ch (aref string i)))
         ;; Emacs preserves malformed decoded bytes as internal eight-bit
         ;; characters.  They cannot be stored in normal multibyte render
@@ -303,27 +349,43 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
             (if (and (eq (ebb-parser-state parser) :ground)
                      (>= ch ?\s)
                      (/= ch ?\x7f))
-                (let ((run-start i))
-                  (if multibyte
-                      (while (and (< i e)
-                                  (let ((c (aref string i)))
-                                    (and (< c #x3fff80)
-                                         (not (and (>= c #x80) (<= c #x9f)))
-                                         (>= c ?\s)
-                                         (/= c ?\x7f))))
-                        (cl-incf i))
-                    (while (and (< i e)
-                                (let ((c (aref string i)))
-                                  (and (>= c ?\s) (< c #x7f))))
-                      (cl-incf i)))
+                (let ((run-start i)
+                      (pure-ascii t))
+                  (if (>= ch #xa0)
+                      (progn
+                        (setq pure-ascii nil)
+                        (if multibyte
+                            (let ((mstop (string-match-p
+                                          ebb-parse--non-printable-multibyte-regexp
+                                          string (1+ run-start))))
+                              (setq i (if (and mstop (< mstop e)) mstop e)))
+                          (while (and (< i e)
+                                      (let ((c (aref string i)))
+                                        (and (>= c ?\s)
+                                             (/= c ?\x7f)
+                                             (not (and (>= c #x80) (<= c #x9f))))))
+                            (cl-incf i))))
+                    (let ((stop (string-match-p
+                                 ebb-parse--non-ascii-printable-regexp
+                                 string run-start)))
+                      (setq i (if (and stop (< stop e)) stop e)))
+                    (when (and multibyte
+                               (< i e)
+                               (let ((c (aref string i)))
+                                 (and (>= c #xa0) (< c #x3fff80))))
+                      (setq pure-ascii nil)
+                      (let ((mstop (string-match-p
+                                    ebb-parse--non-printable-multibyte-regexp
+                                    string (1+ i))))
+                        (setq i (if (and mstop (< mstop e)) mstop e)))))
                   (let ((crlf (and (< (1+ i) e)
                                    (= (aref string i) ?\r)
                                    (= (aref string (1+ i)) ?\n)))
                         block-end)
-                    ;; Only probe for a block after the ordinary hot-path scan
-                    ;; has already found a CRLF.  TUI and escape-heavy runs do
-                    ;; not pay for a second failed printable scan.
-                    (when (and crlf (not multibyte))
+                    ;; Probe for a multi-line plain ASCII CRLF block whenever
+                    ;; this run is pure ASCII and ends with CRLF, even inside
+                    ;; a multibyte PTY-decoded string.
+                    (when (and crlf pure-ascii)
                       (setq block-end
                             (ebb-screen-write-crlf-block
                              screen string run-start e)))
@@ -339,12 +401,12 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
               (if (and (memq (ebb-parser-state parser)
                              '(:sos-pm-apc :osc-string :dcs-passthrough))
                        (>= ch ?\s) (< ch ?\x7f))
-                  (let ((run-start i)
-                        (string-state (ebb-parser-state parser)))
-                    (while (and (< i e)
-                                (let ((c (aref string i)))
-                                  (and (>= c ?\s) (< c ?\x7f))))
-                      (cl-incf i))
+                  (let* ((run-start i)
+                         (string-state (ebb-parser-state parser))
+                         (stop (string-match-p
+                                ebb-parse--non-ascii-printable-regexp
+                                string run-start)))
+                    (setq i (if (and stop (< stop e)) stop e))
                     (let ((chunk (substring string run-start i)))
                       (pcase string-state
                         (:sos-pm-apc (ebb-parse--apc-collect parser chunk))
@@ -353,7 +415,7 @@ unibyte UTF-8 whose continuation bytes fall below #xa0."
                          (ebb-parse--dcs-collect parser chunk)))))
                 (ebb-parse--process-char parser ch)
                 (cl-incf i)))))))))
-    (- i (or start 0))))
+        (- i start)))))
 
 (defsubst ebb-parse--cup-coords (string start end)
   "Parse row;col digits in STRING[START, END) as (ROW . COL).
@@ -369,8 +431,11 @@ non-parameter byte."
         (cond
          ((and (>= ch ?0) (<= ch ?9))
           (if in-col
-              (setq col (+ (* col 10) (- ch ?0)))
-            (setq row (+ (* row 10) (- ch ?0)))))
+              (progn
+                (setq col (+ (* col 10) (- ch ?0)))
+                (when (> col 16384) (setq col 16384)))
+            (setq row (+ (* row 10) (- ch ?0)))
+            (when (> row 16384) (setq row 16384))))
          ((= ch ?\;)
           (if in-col (setq ok nil) (setq in-col t)))
          (t (setq ok nil))))
@@ -378,141 +443,111 @@ non-parameter byte."
     (and ok (cons row col))))
 
 (defun ebb-parse--fast-csi-at (parser string start end)
-  "Handle a common CSI in STRING beginning at START, returning the next index.
+  "Handle a complete CSI in STRING beginning at START, returning the next index.
 STRING carries PARSER's pending bytes and END bounds the scan.  START is the
-first byte after ESC [.  Return nil when the sequence is not one
-of the simple forms handled here."
-  (catch 'done
-    (let ((j start)
-          (header-length 0))
-      (while (< j end)
-        (let ((c (aref string j)))
-          (cond
-           ((or (and (>= c ?0) (<= c ?9)) (= c ?\;))
-            (when (= header-length ebb-parse--max-control-header-length)
-              (throw 'done nil))
+first byte after ESC [.  Return nil when the sequence is incomplete, uses
+colon sub-parameters or intermediates, exceeds the header bound, or has more
+than 16 parameters."
+  (let ((j start)
+        (private nil)
+        (header-length 0)
+        (scratch (ebb-parser-csi-scratch parser))
+        (count 0)
+        (value 0)
+        (have-param nil)
+        (final nil)
+        (ok t))
+    ;; Optional leading private marker (? / > / =).
+    (when (< j end)
+      (let ((first (aref string j)))
+        (when (or (= first ??) (= first ?>) (= first ?=))
+          (setq private first)
+          (cl-incf j))))
+    ;; Single-pass scan of numeric parameters separated by semicolons.
+    (while (and ok (< j end) (null final))
+      (let ((c (aref string j)))
+        (cond
+         ((and (>= c ?0) (<= c ?9))
+          (if (= header-length ebb-parse--max-control-header-length)
+              (setq ok nil)
+            (setq value (+ (* value 10) (- c ?0)))
+            (when (> value 16384)
+              (setq value 16384))
+            (setq have-param t)
             (cl-incf header-length)
-            (cl-incf j))
-           ((and (>= c ?@) (<= c ?~))
-            (let ((screen (ebb-parser-screen parser)))
-              (cond
-               ((= c ?H)
-                ;; Malformed parameters (e.g. a second semicolon) fall
-                ;; back to the generic parser; consuming nothing here
-                ;; would leave the scan loop spinning on this byte.
-                (if-let* ((coords (ebb-parse--cup-coords string start j)))
-                    (progn
-                      (ebb-screen-cursor-goto screen
-                                              (1- (if (zerop (car coords))
-                                                      1
-                                                    (car coords)))
-                                              (1- (if (zerop (cdr coords))
-                                                      1
-                                                    (cdr coords))))
-                      (throw 'done (1+ j)))
-                  (throw 'done nil)))
-               ((and (= c ?J)
-                     (= (- j start) 1)
-                     (= (aref string start) ?2))
-                (ebb-screen-erase-in-display screen 2)
-                (throw 'done (1+ j)))
-               ((= c ?m)
-                (if (ebb-parse--fast-sgr-at parser string start j)
-                    (throw 'done (1+ j))
-                  (throw 'done nil)))
-               (t (throw 'done nil)))))
-           (t (throw 'done nil))))))))
-
-(defun ebb-parse--fast-sgr-at (parser string start end)
-  "Apply simple SGR params from STRING[START, END) for PARSER;
-return non-nil if handled.
-This avoids the allocation-heavy generic `split-string' parameter parser for
-common color-heavy output.  The caller has already verified that the bytes are
-only digits and semicolons."
-  (let ((screen (ebb-parser-screen parser)))
-    (if (= start end)
-        (progn
-          (ebb-screen-reset-attr screen)
-          t)
-      (or (ebb-parse--fast-simple-sgr-at screen string start end)
-          (catch 'fallback
-        ;; Most SGR sequences are very short.  Keep the vector stack-local and
-        ;; fall back for unusually long forms rather than growing structures in
-        ;; the hot path.
-        (let ((params (make-vector 16 0))
-              (count 0)
-              (value 0)
-              (have-value nil)
-              (i start))
-          (while (<= i end)
-            (if (or (= i end) (= (aref string i) ?\;))
-                (progn
-                  (when (= count (length params))
-                    (throw 'fallback nil))
-                  (aset params count (if have-value value 0))
-                  (cl-incf count)
-                  (setq value 0)
-                  (setq have-value nil))
-              (setq value (+ (* value 10) (- (aref string i) ?0)))
-              (setq have-value t))
-            (cl-incf i))
-          (let ((idx 0))
-            (while (< idx count)
-              (setq idx (+ idx (ebb-parse--sgr-step
-                                screen params idx count))))
-            t)))))))
-
-(defun ebb-parse--fast-indexed-sgr-at (screen string start end)
-  "Handle an indexed-color SGR (38;5;N / 48;5;N / 58;5;N) on SCREEN.
-STRING[START, END) holds only digits and semicolons (verified by the
-caller).  Return non-nil when the whole parameter string is exactly
-one indexed-color form; the effect is identical to the generic
-parameter-vector path, without allocating the vector.  The 38/48/58
-target mapping below mirrors `ebb-parse--sgr-step'; keep them in
-sync -- a duplicated SGR table here once drifted from the generic
-one (see commit 62d9d02)."
-  (let ((attr (cond ((and (= (aref string start) ?3)
-                          (= (aref string (1+ start)) ?8)) :fg)
-                    ((and (= (aref string start) ?4)
-                          (= (aref string (1+ start)) ?8)) :bg)
-                    ((and (= (aref string start) ?5)
-                          (= (aref string (1+ start)) ?8)) :ul-color))))
-    (and attr
-         (= (aref string (+ start 2)) ?\;)
-         (= (aref string (+ start 3)) ?5)
-         (= (aref string (+ start 4)) ?\;)
-         (let ((value 0)
-               (digits 0)
-               (i (+ start 5)))
-           (while (and (< i end)
-                       (<= ?0 (aref string i)) (<= (aref string i) ?9))
-             (setq value (+ (* value 10) (- (aref string i) ?0)))
-             (cl-incf digits)
-             (cl-incf i))
-           (and (= i end) (> digits 0)
-                (progn (ebb-screen-set-attr screen attr value) t))))))
-
-(defun ebb-parse--fast-simple-sgr-at (screen string start end)
-  "Handle the shortest and most frequent SGR forms on SCREEN in STRING[START, END)."
-  (let ((len (- end start)))
-    (cond
-     ((and (= len 1) (= (aref string start) ?0))
-      (ebb-screen-reset-attr screen)
-      t)
-     ((and (>= len 6) (= (aref string (+ start 2)) ?\;))
-      (ebb-parse--fast-indexed-sgr-at screen string start end))
-     ((and (= len 2)
-           (= (aref string start) ?3)
-           (<= ?0 (aref string (1+ start)))
-           (<= (aref string (1+ start)) ?7))
-      (ebb-screen-set-attr screen :fg (- (aref string (1+ start)) ?0))
-      t)
-     ((and (= len 2)
-           (= (aref string start) ?4)
-           (<= ?0 (aref string (1+ start)))
-           (<= (aref string (1+ start)) ?7))
-      (ebb-screen-set-attr screen :bg (- (aref string (1+ start)) ?0))
-      t))))
+            (cl-incf j)))
+         ((= c ?\;)
+          (if (or (= header-length ebb-parse--max-control-header-length)
+                  (>= count 16))
+              (setq ok nil)
+            (aset scratch count value)
+            (cl-incf count)
+            (setq value 0
+                  have-param t)
+            (cl-incf header-length)
+            (cl-incf j)))
+         ((and (>= c ?@) (<= c ?~))
+          (if have-param
+              (if (>= count 16)
+                  (setq ok nil)
+                (aset scratch count value)
+                (cl-incf count)
+                (setq final c))
+            (setq final c)))
+         (t
+          (setq ok nil)))))
+    (when (and ok final)
+      (let ((screen (ebb-parser-screen parser)))
+        (cond
+         ;; Hot-path SGR (no private marker).
+         ((and (= final ?m) (null private))
+          (cond
+           ((or (zerop count)
+                (and (= count 1) (zerop (aref scratch 0))))
+            (ebb-screen-reset-attr screen))
+           ((= count 1)
+            (ebb-parse--apply-simple-sgr screen (aref scratch 0)))
+           (t
+            (let ((idx 0))
+              (while (< idx count)
+                (setq idx (+ idx (ebb-parse--sgr-step
+                                  screen scratch idx count)))))))
+          (1+ j))
+         ;; Hot-path CUP (no private marker).
+         ((and (= final ?H) (null private))
+          (let ((row (if (> count 0) (aref scratch 0) 0))
+                (col (if (> count 1) (aref scratch 1) 0)))
+            (ebb-screen-cursor-goto screen
+                                    (1- (if (zerop row) 1 row))
+                                    (1- (if (zerop col) 1 col))))
+          (1+ j))
+         ;; Hot-path EL (no private marker).
+         ((and (= final ?K) (null private))
+          (ebb-screen-erase-in-line screen
+                                    (if (> count 0) (aref scratch 0) 0))
+          (1+ j))
+         ;; Hot-path ED (no private marker).
+         ((and (= final ?J) (null private))
+          (ebb-screen-erase-in-display screen
+                                       (if (> count 0) (aref scratch 0) 0))
+          (1+ j))
+         ;; Unified zero-allocation dispatch for all other CSI sequences.
+         (t
+          (let ((handler (aref ebb-parse--csi-dispatch final)))
+            (unless (and ebb-parse-debug (eq handler #'ebb-parse--csi-unknown))
+              (let ((vec (aref (ebb-parser-csi-param-pool parser) count))
+                    (k 0))
+                (while (< k count)
+                  (aset vec k (aref scratch k))
+                  (cl-incf k))
+                (setf (ebb-parser-private parser) private
+                      (ebb-parser-intermediates parser) "")
+                (condition-case err
+                    (funcall handler parser vec)
+                  (error
+                   (ebb-parse--log "CSI dispatch error for %c: %S" final err)))
+                (setf (ebb-parser-private parser) nil))
+              (1+ j)))))))))
 
 ;;;; ---- Main Dispatch --------------------------------------------------
 

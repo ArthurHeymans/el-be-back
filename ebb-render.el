@@ -201,8 +201,19 @@ adjustment is actually needed."
 (defvar ebb-render--attr-face-cache (make-hash-table :test #'equal)
   "Cache from immutable `ebb-attr' values to rendered face plists.")
 
+(defvar ebb-render--attr-face-eq-cache
+  (make-hash-table :test #'eq :weakness 'key)
+  "Weak `eq' fast-path cache from `ebb-attr' identity to rendered face plists.")
+
+(defconst ebb-render--face-miss (make-symbol "ebb-render--face-miss")
+  "Sentinel representing a cache miss in attribute face tables.")
+
 (defconst ebb-render--attr-face-cache-limit 4096
   "Maximum number of cached attribute face specs before clearing the cache.")
+
+(defconst ebb-render--raw-byte-regexp
+  (concat "[" (string #x3fff80) "-" (string #x3fffff) "]")
+  "Regexp matching internal Emacs raw eight-bit characters in multibyte strings.")
 
 (defvar ebb-render-after-refresh-hook nil
   "Hook run after refreshing an Ebb buffer, with the render state.")
@@ -352,6 +363,8 @@ RGBA graphics.  PNG and RGB images are unaffected."
 
 ;;;; ---- Render State ---------------------------------------------------
 
+(cl-declaim (optimize (safety 0)))
+
 (cl-defstruct (ebb-render-state (:copier nil))
   "State for the buffer renderer."
   (screen nil)           ; ebb-screen
@@ -378,6 +391,8 @@ RGBA graphics.  PNG and RGB images are unaffected."
   (placeholder-row-cache nil)
   (placeholder-history-row-cache nil)
   (placeholder-history-key nil))
+
+(cl-declaim (optimize (safety 1)))
 
 ;;;; ---- Constructor ----------------------------------------------------
 
@@ -1932,17 +1947,17 @@ empty padding significant."
 (defun ebb-render--safe-string (string)
   "Return STRING with internal raw bytes replaced by Unicode characters.
 Clean unibyte ASCII is returned unchanged."
-  (let ((length (length string))
-        (index 0))
-    (while (and (< index length) (<= (aref string index) #x10ffff))
-      (cl-incf index))
-    (if (= index length)
-        ;; Keep clean ASCII strings unibyte.  The model writes them far more
-        ;; often than the bounded renderer inserts them into an Emacs buffer.
-        string
-      (apply #'string
-             (cl-loop for position below length
-                      collect (ebb-render--safe-char (aref string position)))))))
+  (if (not (multibyte-string-p string))
+      ;; Unibyte strings contain only bytes 0-255, never internal raw chars.
+      string
+    (let ((case-fold-search nil))
+      (if (not (string-match-p ebb-render--raw-byte-regexp string))
+          string
+        (let ((length (length string)))
+          (apply #'string
+                 (cl-loop for position below length
+                          collect (ebb-render--safe-char
+                                   (aref string position)))))))))
 
 (defun ebb-render--cells-to-string (cells width)
   "Convert CELLS, a vector of ebb-cells, to a propertized string.
@@ -2094,74 +2109,83 @@ WIDTH bounds the scan."
 (defun ebb-render--attr-to-face (attr)
   "Convert ebb-attr ATTR to an Emacs face spec (plist or list)."
   (when (and attr (ebb--attr-non-default-p attr))
-    (or (gethash attr ebb-render--attr-face-cache)
-        (let ((face nil)
-              (fg (ebb-attr-fg attr))
-              (bg (ebb-attr-bg attr))
-              (inv (ebb-attr-inverse attr)))
-      ;; Handle inverse: swap fg/bg, using actual Emacs default colors
-      ;; when fg or bg is nil (matches eat's behavior)
-      (when inv
-        (let* ((default-fg (or (ebb-render--color-to-string fg)
-                               (face-foreground 'ebb-default nil t)
-                               (face-foreground 'default nil t)
-                               "#ffffff"))
-               (default-bg (or (ebb-render--color-to-string bg)
-                               (face-background 'ebb-default nil t)
-                               (face-background 'default nil t)
-                               "#000000")))
-          ;; Swap: what was foreground becomes background and vice versa
-          (setq face (plist-put face :foreground default-bg))
-          (setq face (plist-put face :background default-fg))))
-      ;; Foreground (non-inverse)
-      (unless inv
-        (when-let* ((fg-str (ebb-render--color-to-string fg)))
-          (setq face (plist-put face :foreground fg-str))))
-      ;; Background (non-inverse)
-      (unless inv
-        (when-let* ((bg-str (ebb-render--color-to-string bg)))
-          (setq face (plist-put face :background bg-str))))
-      ;; Underline
-      (when-let* ((ul (ebb-attr-underline attr)))
-        (let ((ul-color (ebb-render--color-to-string
-                         (ebb-attr-ul-color attr))))
-          (setq face
-                (plist-put
-                 face :underline
-                 (let ((style (pcase ul
-                                ('double 'double-line)
-                                ('curly  'wave)
-                                ('dotted 'dots)
-                                ('dashed 'dashes)
-                                (_ 'line))))
-                   (if (and (eq style 'line) (null ul-color))
-                       t
-                     `(:style ,style ,@(and ul-color `(:color ,ul-color)))))))))
-      ;; Strikethrough
-      (when (ebb-attr-crossed attr)
-        (setq face (plist-put face :strike-through t)))
-      ;; Conceal (make invisible by setting fg = bg)
-      (when (ebb-attr-conceal attr)
-        (let ((bg-str (or (plist-get face :background) "black")))
-          (setq face (plist-put face :foreground bg-str))))
-      ;; Bold/faint/italic/font via named faces so users can customize them.
-      ;; Font 0 is the default face; only alternate fonts (1-9) need inherit.
-      (let* ((font (ebb-attr-font attr))
-             (inherit (delq nil
-                            (list (and (ebb-attr-bold attr) 'ebb-bold)
-                                  (and (ebb-attr-faint attr) 'ebb-faint)
-                                  (and (ebb-attr-italic attr) 'ebb-italic)
-                                  (and (integerp font) (<= 1 font 9)
-                                       (aref ebb-render--font-faces font))))))
-        (when inherit
-          (setq face (plist-put face :inherit inherit))))
-      ;; Return as anonymous face (a plist), caching because styled terminal
-      ;; output tends to reuse a small set of attributes across many cells.
-      (when (> (hash-table-count ebb-render--attr-face-cache)
-               ebb-render--attr-face-cache-limit)
-        (clrhash ebb-render--attr-face-cache))
-      (puthash attr face ebb-render--attr-face-cache)
-      face))))
+    (let ((cached (gethash attr ebb-render--attr-face-eq-cache
+                           ebb-render--face-miss)))
+      (if (not (eq cached ebb-render--face-miss))
+          cached
+        (let ((eq-cached (gethash attr ebb-render--attr-face-cache
+                                  ebb-render--face-miss)))
+          (if (not (eq eq-cached ebb-render--face-miss))
+              (puthash attr eq-cached ebb-render--attr-face-eq-cache)
+            (let ((face nil)
+                  (fg (ebb-attr-fg attr))
+                  (bg (ebb-attr-bg attr))
+                  (inv (ebb-attr-inverse attr)))
+              ;; Handle inverse: swap fg/bg, using actual Emacs default colors
+              ;; when fg or bg is nil (matches eat's behavior)
+              (when inv
+                (let* ((default-fg (or (ebb-render--color-to-string fg)
+                                       (face-foreground 'ebb-default nil t)
+                                       (face-foreground 'default nil t)
+                                       "#ffffff"))
+                       (default-bg (or (ebb-render--color-to-string bg)
+                                       (face-background 'ebb-default nil t)
+                                       (face-background 'default nil t)
+                                       "#000000")))
+                  ;; Swap: what was foreground becomes background and vice versa
+                  (setq face (plist-put face :foreground default-bg))
+                  (setq face (plist-put face :background default-fg))))
+              ;; Foreground (non-inverse)
+              (unless inv
+                (when-let* ((fg-str (ebb-render--color-to-string fg)))
+                  (setq face (plist-put face :foreground fg-str))))
+              ;; Background (non-inverse)
+              (unless inv
+                (when-let* ((bg-str (ebb-render--color-to-string bg)))
+                  (setq face (plist-put face :background bg-str))))
+              ;; Underline
+              (when-let* ((ul (ebb-attr-underline attr)))
+                (let ((ul-color (ebb-render--color-to-string
+                                 (ebb-attr-ul-color attr))))
+                  (setq face
+                        (plist-put
+                         face :underline
+                         (let ((style (pcase ul
+                                        ('double 'double-line)
+                                        ('curly  'wave)
+                                        ('dotted 'dots)
+                                        ('dashed 'dashes)
+                                        (_ 'line))))
+                           (if (and (eq style 'line) (null ul-color))
+                               t
+                             `(:style ,style
+                               ,@(and ul-color `(:color ,ul-color)))))))))
+              ;; Strikethrough
+              (when (ebb-attr-crossed attr)
+                (setq face (plist-put face :strike-through t)))
+              ;; Conceal (make invisible by setting fg = bg)
+              (when (ebb-attr-conceal attr)
+                (let ((bg-str (or (plist-get face :background) "black")))
+                  (setq face (plist-put face :foreground bg-str))))
+              ;; Bold/faint/italic/font via named faces so users can customize them.
+              ;; Font 0 is the default face; only alternate fonts (1-9) need inherit.
+              (let* ((font (ebb-attr-font attr))
+                     (inherit (delq nil
+                                    (list (and (ebb-attr-bold attr) 'ebb-bold)
+                                          (and (ebb-attr-faint attr) 'ebb-faint)
+                                          (and (ebb-attr-italic attr) 'ebb-italic)
+                                          (and (integerp font) (<= 1 font 9)
+                                               (aref ebb-render--font-faces font))))))
+                (when inherit
+                  (setq face (plist-put face :inherit inherit))))
+              ;; Return as anonymous face (a plist), caching because styled terminal
+              ;; output tends to reuse a small set of attributes across many cells.
+              (when (> (hash-table-count ebb-render--attr-face-cache)
+                       ebb-render--attr-face-cache-limit)
+                (clrhash ebb-render--attr-face-cache)
+                (clrhash ebb-render--attr-face-eq-cache))
+              (puthash attr face ebb-render--attr-face-cache)
+              (puthash attr face ebb-render--attr-face-eq-cache))))))))
 
 ;;;; ---- Cursor Rendering -----------------------------------------------
 
@@ -2278,6 +2302,7 @@ visibility."
   "Clear theme-derived caches and fully redraw live Ebb render states."
   (fillarray ebb-render--indexed-color-cache nil)
   (clrhash ebb-render--attr-face-cache)
+  (clrhash ebb-render--attr-face-eq-cache)
   (setq ebb-render--graphics-background-cache nil)
   (when (boundp 'ebb--render)
     (dolist (buffer (buffer-list))
@@ -2384,7 +2409,7 @@ Used after resize when the display area size has changed."
             (set-marker-insertion-type m nil))
           ;; Insert display lines
           (dotimes (i h)
-            (let ((line (ebb-screen-get-line screen i)))
+            (let ((line (ebb--line-at screen i)))
               (insert (if line
                           (ebb-render--trim-trailing
                            (ebb-render--apply-graphics
@@ -2476,7 +2501,7 @@ Used after resize when the display area size has changed."
             (delete-region (point) (ebb-render-state-region-end render))
             (set-marker-insertion-type display-begin nil)
             (dotimes (row height)
-              (let ((line (ebb-screen-get-line screen row)))
+              (let ((line (ebb--line-at screen row)))
                 (insert (if line
                             (ebb-render--trim-trailing
                              (ebb-render--apply-graphics
